@@ -46,12 +46,10 @@ pub fn load_config(config_dir: &Path) -> Result<NodeConfig, String> {
 }
 
 pub fn save_config(config_dir: &Path, config: &NodeConfig) -> Result<(), String> {
-    std::fs::create_dir_all(config_dir)
-        .map_err(|e| format!("Failed to create config directory: {e}"))?;
+    crate::crypto::create_dir_0700(config_dir)?;
 
     let contents = serde_json::to_string_pretty(config)
         .map_err(|e| format!("Failed to serialize config: {e}"))?;
 
-    std::fs::write(config_path(config_dir), contents)
-        .map_err(|e| format!("Failed to write config: {e}"))
+    crate::crypto::write_file_0600(&config_path(config_dir), contents.as_bytes())
 }

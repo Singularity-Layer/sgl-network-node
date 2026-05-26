@@ -232,14 +232,16 @@ pub async fn attest(config_dir: &Path, orchestrator_url: &str) -> Result<(), Str
 
     tracing::info!("Requesting attestation challenge...");
     let challenge = client.request_challenge(&cfg.node_id).await?;
-    let expiry = challenge.expires_at.as_deref()
-        .unwrap_or_else(|| {
-            if let Some(secs) = challenge.expires_in_seconds {
-                Box::leak(format!("{secs}s").into_boxed_str())
-            } else {
-                "unknown"
-            }
-        });
+    let expiry_owned;
+    let expiry = match challenge.expires_at.as_deref() {
+        Some(at) => at,
+        None => {
+            expiry_owned = challenge.expires_in_seconds
+                .map(|s| format!("{s}s"))
+                .unwrap_or_else(|| "unknown".to_string());
+            &expiry_owned
+        }
+    };
     tracing::info!("Challenge received (expires: {expiry})");
 
     let signature = keypair.sign_message(challenge.challenge.as_bytes());
@@ -310,11 +312,13 @@ async fn execute_inference(
 
     let temperature = payload.get("temperature")
         .and_then(|t| t.as_f64())
-        .unwrap_or(0.7);
+        .unwrap_or(0.7)
+        .clamp(0.0, 2.0);
 
     let max_tokens = payload.get("max_tokens")
         .and_then(|t| t.as_i64())
-        .unwrap_or(2048) as i32;
+        .unwrap_or(2048)
+        .clamp(1, 8192) as i32;
 
     let result = engine.chat_completion(messages, temperature, max_tokens).await?;
 

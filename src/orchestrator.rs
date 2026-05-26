@@ -1,5 +1,6 @@
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 
 use crate::tee::TeeCapabilities;
 
@@ -99,8 +100,13 @@ struct ErrorBody {
 
 impl OrchestratorClient {
     pub fn new(base_url: &str, auth_token: Option<String>) -> Self {
+        let client = Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(30))
+            .build()
+            .expect("Failed to build HTTP client");
         Self {
-            client: Client::new(),
+            client,
             base_url: base_url.trim_end_matches('/').to_string(),
             auth_token,
         }
