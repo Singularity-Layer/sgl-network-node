@@ -1,0 +1,275 @@
+use std::path::{Path, PathBuf};
+
+use crate::config::{self, NodeConfig};
+use crate::crypto::NodeKeypair;
+use crate::inference::{ChatMessage, InferenceEngine};
+use crate::orchestrator::OrchestratorClient;
+use crate::tee;
+
+const HEARTBEAT_INTERVAL_SECS: u64 = 30;
+
+pub async fn init(
+    config_dir: &Path,
+    orchestrator_url: &str,
+    wallet: &str,
+    tee_type: &str,
+    models: &[String],
+) -> Result<(), String> {
+    let cfg_path = config::config_path(config_dir);
+    if cfg_path.exists() {
+        return Err(format!(
+            "Node already initialized. Config at: {}\nTo reinitialize, delete the config directory first.",
+            cfg_path.display()
+        ));
+    }
+
+    let caps = tee::detect();
+    tee::print_capabilities(&caps);
+    println!();
+
+    tracing::info!("Generating ed25519 keypair...");
+    let keypair = NodeKeypair::generate();
+    let kp_path = config::keypair_path(config_dir);
+    keypair.save(&kp_path)?;
+    tracing::info!("Keypair saved to {}", kp_path.display());
+
+    let public_key = keypair.public_key_bs58();
+    tracing::info!("Public key: {public_key}");
+
+    tracing::info!("Registering with orchestrator at {orchestrator_url}...");
+    let client = OrchestratorClient::new(orchestrator_url, None);
+    let registration = client
+        .register(wallet, tee_type, models, &public_key, &caps)
+        .await?;
+
+    tracing::info!("Registered! Node ID: {}", registration.node_id);
+
+    let node_config = NodeConfig {
+        node_id: registration.node_id,
+        auth_token: registration.auth_token,
+        wallet_address: wallet.to_string(),
+        tee_type: tee_type.to_string(),
+        orchestrator_url: orchestrator_url.to_string(),
+        keypair_path: kp_path.to_string_lossy().to_string(),
+    };
+
+    config::save_config(config_dir, &node_config)?;
+    tracing::info!("Config saved to {}", cfg_path.display());
+    tracing::info!("Node initialized. Run `sgl-node start` to begin processing jobs.");
+    tracing::info!("Run `sgl-node attest` to verify wallet ownership before receiving jobs.");
+
+    Ok(())
+}
+
+pub async fn start(
+    config_dir: &Path,
+    orchestrator_url: &str,
+    model_path: Option<&str>,
+    model_name: Option<&str>,
+    inference_port: u16,
+    resource_percent: u8,
+) -> Result<(), String> {
+    let cfg = config::load_config(config_dir)?;
+    let keypair = NodeKeypair::load(&config::keypair_path(config_dir))?;
+
+    let client = OrchestratorClient::new(orchestrator_url, Some(cfg.auth_token.clone()));
+
+    let total_cpus = std::thread::available_parallelism()
+        .map(|p| p.get() as u32)
+        .unwrap_or(4);
+    let threads = ((total_cpus as f64 * resource_percent as f64 / 100.0).ceil() as u32).max(1);
+    let load_reserved = 1.0 - (resource_percent as f64 / 100.0);
+
+    tracing::info!("Starting node {} (wallet: {})", cfg.node_id, cfg.wallet_address);
+    tracing::info!("Public key: {}", keypair.public_key_bs58());
+    tracing::info!("Resource allocation: {}% ({}/{} threads)", resource_percent, threads, total_cpus);
+
+    let mut engine: Option<InferenceEngine> = None;
+    let mut models: Vec<String> = vec![];
+
+    if let Some(path) = model_path {
+        let name = model_name
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| {
+                Path::new(path)
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "unknown".to_string())
+            });
+
+        tracing::info!("Loading model: {name} from {path}");
+        let mut eng = InferenceEngine::new(PathBuf::from(path), name.clone(), inference_port, threads);
+        eng.start().await?;
+        models.push(name);
+        engine = Some(eng);
+        tracing::info!("Inference engine ready on port {inference_port}");
+    } else {
+        tracing::warn!("No model specified — node will register but cannot process inference jobs");
+        tracing::warn!("Use --model-path <path.gguf> --model-name <name> to enable inference");
+    }
+
+    tracing::info!("Heartbeat interval: {HEARTBEAT_INTERVAL_SECS}s");
+
+    loop {
+        match client.heartbeat(&cfg.node_id, &models, load_reserved).await {
+            Ok(resp) => {
+                tracing::debug!("Heartbeat OK — status: {}", resp.status);
+
+                for job in &resp.pending_jobs {
+                    tracing::info!("Received job: {} (type: {})", job.id, job.job_type);
+                    process_job(&client, &engine, job).await;
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Heartbeat failed: {e}");
+            }
+        }
+
+        tokio::time::sleep(std::time::Duration::from_secs(HEARTBEAT_INTERVAL_SECS)).await;
+    }
+}
+
+pub async fn status(config_dir: &Path, orchestrator_url: &str) -> Result<(), String> {
+    let cfg = config::load_config(config_dir)?;
+    let keypair = NodeKeypair::load(&config::keypair_path(config_dir))?;
+
+    println!("=== SGL Node Status ===");
+    println!("Node ID:    {}", cfg.node_id);
+    println!("Wallet:     {}", cfg.wallet_address);
+    println!("TEE type:   {}", cfg.tee_type);
+    println!("Public key: {}", keypair.public_key_bs58());
+    println!("Config:     {}", config::config_path(config_dir).display());
+    println!();
+
+    let caps = tee::detect();
+    tee::print_capabilities(&caps);
+    println!();
+
+    let client = OrchestratorClient::new(orchestrator_url, Some(cfg.auth_token.clone()));
+    match client.get_node_status(&cfg.node_id).await {
+        Ok(info) => {
+            println!("--- Orchestrator ---");
+            println!("Status:       {}", info.status);
+            println!("Attested:     {}", info.attestation_verified);
+            if let Some(score) = info.reputation_score {
+                println!("Reputation:   {:.1}", score);
+            }
+            if let Some(completed) = info.jobs_completed {
+                println!("Jobs done:    {completed}");
+            }
+            if let Some(failed) = info.jobs_failed {
+                println!("Jobs failed:  {failed}");
+            }
+        }
+        Err(e) => {
+            println!("Could not reach orchestrator: {e}");
+        }
+    }
+
+    Ok(())
+}
+
+pub async fn attest(config_dir: &Path, orchestrator_url: &str) -> Result<(), String> {
+    let cfg = config::load_config(config_dir)?;
+    let keypair = NodeKeypair::load(&config::keypair_path(config_dir))?;
+
+    let client = OrchestratorClient::new(orchestrator_url, Some(cfg.auth_token.clone()));
+
+    tracing::info!("Requesting attestation challenge...");
+    let challenge = client.request_challenge(&cfg.node_id).await?;
+    let expiry = challenge.expires_at.as_deref()
+        .unwrap_or_else(|| {
+            if let Some(secs) = challenge.expires_in_seconds {
+                Box::leak(format!("{secs}s").into_boxed_str())
+            } else {
+                "unknown"
+            }
+        });
+    tracing::info!("Challenge received (expires: {expiry})");
+
+    let signature = keypair.sign_message(challenge.challenge.as_bytes());
+    tracing::info!("Challenge signed, submitting...");
+
+    let result = client
+        .verify_attestation(&cfg.node_id, &signature)
+        .await?;
+
+    if result.verified {
+        tracing::info!("Attestation verified! Node status: {}", result.status);
+    } else {
+        return Err("Attestation verification failed".to_string());
+    }
+
+    Ok(())
+}
+
+async fn process_job(
+    client: &OrchestratorClient,
+    engine: &Option<InferenceEngine>,
+    job: &crate::orchestrator::PendingJob,
+) {
+    tracing::info!("Processing job {} (type: {})", job.id, job.job_type);
+
+    let result = match job.job_type.as_str() {
+        "inference" => execute_inference(engine, job).await,
+        _ => {
+            tracing::warn!("Unsupported job type: {}", job.job_type);
+            Err(format!("Unsupported job type: {}", job.job_type))
+        }
+    };
+
+    match result {
+        Ok(output) => {
+            if let Err(e) = client.complete_job(&job.id, &output).await {
+                tracing::error!("Failed to report job completion: {e}");
+            } else {
+                tracing::info!("Job {} completed", job.id);
+            }
+        }
+        Err(reason) => {
+            if let Err(e) = client.fail_job(&job.id, &reason).await {
+                tracing::error!("Failed to report job failure: {e}");
+            } else {
+                tracing::warn!("Job {} failed: {reason}", job.id);
+            }
+        }
+    }
+}
+
+async fn execute_inference(
+    engine: &Option<InferenceEngine>,
+    job: &crate::orchestrator::PendingJob,
+) -> Result<serde_json::Value, String> {
+    let engine = engine.as_ref().ok_or("No inference engine configured — start with --model-path")?;
+
+    let payload = job.input_payload.as_ref().ok_or("Job has no input payload")?;
+
+    let messages: Vec<ChatMessage> = if let Some(msgs) = payload.get("messages") {
+        serde_json::from_value(msgs.clone())
+            .map_err(|e| format!("Invalid messages format: {e}"))?
+    } else if let Some(prompt) = payload.get("prompt").and_then(|p| p.as_str()) {
+        vec![ChatMessage { role: "user".to_string(), content: prompt.to_string() }]
+    } else {
+        return Err("Payload must contain 'messages' array or 'prompt' string".to_string());
+    };
+
+    let temperature = payload.get("temperature")
+        .and_then(|t| t.as_f64())
+        .unwrap_or(0.7);
+
+    let max_tokens = payload.get("max_tokens")
+        .and_then(|t| t.as_i64())
+        .unwrap_or(2048) as i32;
+
+    let result = engine.chat_completion(messages, temperature, max_tokens).await?;
+
+    Ok(serde_json::json!({
+        "content": result.content,
+        "model": result.model,
+        "usage": {
+            "prompt_tokens": result.prompt_tokens,
+            "completion_tokens": result.completion_tokens,
+            "total_tokens": result.prompt_tokens + result.completion_tokens,
+        }
+    }))
+}
