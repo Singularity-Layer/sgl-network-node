@@ -24,6 +24,11 @@ impl NodeKeypair {
     }
 
     pub fn save(&self, path: &Path) -> Result<(), String> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("Failed to create config directory: {e}"))?;
+        }
+
         let bytes: Vec<u8> = self.signing_key.to_bytes()
             .iter()
             .chain(self.public_key.as_bytes().iter())
