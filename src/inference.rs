@@ -4,13 +4,22 @@ use std::path::PathBuf;
 use std::process::{Child, Command};
 use tokio::time::{sleep, Duration};
 
+pub struct InferenceEngineConfig {
+    pub model_path: PathBuf,
+    pub model_name: String,
+    pub port: u16,
+    pub threads: u32,
+    pub gpu_layers: u32,
+    pub context_size: u32,
+    pub batch_size: u32,
+    pub parallel_slots: u32,
+}
+
 pub struct InferenceEngine {
     server_process: Option<Child>,
     client: Client,
     base_url: String,
-    model_path: PathBuf,
-    model_name: String,
-    threads: u32,
+    config: InferenceEngineConfig,
 }
 
 #[derive(Serialize)]
@@ -68,42 +77,41 @@ struct HealthResponse {
 }
 
 impl InferenceEngine {
-    pub fn new(model_path: PathBuf, model_name: String, port: u16, threads: u32) -> Self {
+    pub fn new(config: InferenceEngineConfig) -> Self {
+        let base_url = format!("http://127.0.0.1:{}", config.port);
         Self {
             server_process: None,
             client: Client::new(),
-            base_url: format!("http://127.0.0.1:{port}"),
-            model_path,
-            model_name,
-            threads,
+            base_url,
+            config,
         }
-    }
-
-    pub fn model_name(&self) -> &str {
-        &self.model_name
     }
 
     pub async fn start(&mut self) -> Result<(), String> {
-        if !self.model_path.exists() {
-            return Err(format!("Model file not found: {}", self.model_path.display()));
+        if !self.config.model_path.exists() {
+            return Err(format!("Model file not found: {}", self.config.model_path.display()));
         }
 
         let llama_server = find_llama_server()?;
-        tracing::info!("Starting llama-server with model: {}", self.model_path.display());
+        tracing::info!("Starting llama-server with model: {}", self.config.model_path.display());
 
-        let port_str = self.base_url
-            .rsplit(':')
-            .next()
-            .unwrap_or("8081");
+        let port_str = self.config.port.to_string();
+        let threads_str = self.config.threads.to_string();
+        let gpu_layers_str = self.config.gpu_layers.to_string();
+        let ctx_str = self.config.context_size.to_string();
+        let batch_str = self.config.batch_size.to_string();
+        let parallel_str = self.config.parallel_slots.to_string();
 
         let child = Command::new(&llama_server)
             .args([
-                "-m", &self.model_path.to_string_lossy(),
+                "-m", &self.config.model_path.to_string_lossy(),
                 "--host", "127.0.0.1",
-                "--port", port_str,
-                "-ngl", "99",      // offload all layers to GPU (Metal)
-                "-c", "4096",      // context size
-                "-t", &self.threads.to_string(),
+                "--port", &port_str,
+                "-ngl", &gpu_layers_str,
+                "-c", &ctx_str,
+                "-t", &threads_str,
+                "-b", &batch_str,
+                "--parallel", &parallel_str,
             ])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::piped())
@@ -182,7 +190,7 @@ impl InferenceEngine {
 
         Ok(InferenceResult {
             content: choice.message.content.clone(),
-            model: self.model_name.clone(),
+            model: self.config.model_name.clone(),
             prompt_tokens: result.usage.as_ref().and_then(|u| u.prompt_tokens).unwrap_or(0),
             completion_tokens: result.usage.as_ref().and_then(|u| u.completion_tokens).unwrap_or(0),
         })
@@ -221,7 +229,7 @@ impl InferenceEngine {
 
         Ok(InferenceResult {
             content: result.content,
-            model: self.model_name.clone(),
+            model: self.config.model_name.clone(),
             prompt_tokens: result.tokens_evaluated.unwrap_or(0),
             completion_tokens: result.tokens_predicted.unwrap_or(0),
         })

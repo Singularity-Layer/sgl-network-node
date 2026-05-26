@@ -54,9 +54,35 @@ enum Commands {
         #[arg(long, default_value = "8081")]
         inference_port: u16,
 
-        /// Percentage of system resources to dedicate (1-100, default: 100)
+        /// Quick preset: percentage of system resources to dedicate (1-100).
+        /// Sets threads, GPU layers, and concurrent jobs proportionally.
+        /// Individual flags below override the preset values.
         #[arg(long, default_value = "100", value_parser = clap::value_parser!(u8).range(1..=100))]
         resource_percent: u8,
+
+        /// CPU threads for inference (overrides --resource-percent calculation)
+        #[arg(long)]
+        threads: Option<u32>,
+
+        /// GPU layers to offload to Metal (0 = CPU only, 99 = all layers)
+        #[arg(long)]
+        gpu_layers: Option<u32>,
+
+        /// Context window size in tokens
+        #[arg(long, default_value = "4096")]
+        context_size: u32,
+
+        /// Max concurrent jobs this node will accept
+        #[arg(long, default_value = "1")]
+        max_jobs: u32,
+
+        /// Prompt batch size for processing
+        #[arg(long, default_value = "512")]
+        batch_size: u32,
+
+        /// Heartbeat interval in seconds
+        #[arg(long, default_value = "30")]
+        heartbeat_interval: u64,
     },
 
     /// Show node status, hardware capabilities, and orchestrator info
@@ -89,14 +115,22 @@ async fn main() {
                 std::process::exit(1);
             }
         }
-        Commands::Start { model_path, model_name, inference_port, resource_percent } => {
+        Commands::Start {
+            model_path, model_name, inference_port,
+            resource_percent, threads, gpu_layers, context_size,
+            max_jobs, batch_size, heartbeat_interval,
+        } => {
+            let rc = node::ResourceConfig::from_args(
+                resource_percent, threads, gpu_layers,
+                context_size, max_jobs, batch_size, heartbeat_interval,
+            );
             if let Err(e) = node::start(
                 &config_dir,
                 &cli.orchestrator_url,
                 model_path.as_deref(),
                 model_name.as_deref(),
                 inference_port,
-                resource_percent,
+                &rc,
             ).await {
                 tracing::error!("Node stopped: {e}");
                 std::process::exit(1);

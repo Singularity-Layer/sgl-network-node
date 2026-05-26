@@ -2,11 +2,52 @@ use std::path::{Path, PathBuf};
 
 use crate::config::{self, NodeConfig};
 use crate::crypto::NodeKeypair;
-use crate::inference::{ChatMessage, InferenceEngine};
+use crate::inference::{ChatMessage, InferenceEngine, InferenceEngineConfig};
 use crate::orchestrator::OrchestratorClient;
 use crate::tee;
 
-const HEARTBEAT_INTERVAL_SECS: u64 = 30;
+pub struct ResourceConfig {
+    pub threads: u32,
+    pub gpu_layers: u32,
+    pub context_size: u32,
+    pub max_jobs: u32,
+    pub batch_size: u32,
+    pub heartbeat_interval: u64,
+    pub resource_percent: u8,
+}
+
+impl ResourceConfig {
+    pub fn from_args(
+        resource_percent: u8,
+        threads: Option<u32>,
+        gpu_layers: Option<u32>,
+        context_size: u32,
+        max_jobs: u32,
+        batch_size: u32,
+        heartbeat_interval: u64,
+    ) -> Self {
+        let total_cpus = std::thread::available_parallelism()
+            .map(|p| p.get() as u32)
+            .unwrap_or(4);
+
+        let computed_threads = ((total_cpus as f64 * resource_percent as f64 / 100.0).ceil() as u32).max(1);
+        let computed_gpu_layers = if resource_percent >= 50 { 99 } else { (99.0 * resource_percent as f64 / 100.0).round() as u32 };
+
+        Self {
+            threads: threads.unwrap_or(computed_threads),
+            gpu_layers: gpu_layers.unwrap_or(computed_gpu_layers),
+            context_size,
+            max_jobs,
+            batch_size,
+            heartbeat_interval,
+            resource_percent,
+        }
+    }
+
+    pub fn load_factor(&self) -> f64 {
+        1.0 - (self.resource_percent as f64 / 100.0)
+    }
+}
 
 pub async fn init(
     config_dir: &Path,
@@ -67,7 +108,7 @@ pub async fn start(
     model_path: Option<&str>,
     model_name: Option<&str>,
     inference_port: u16,
-    resource_percent: u8,
+    rc: &ResourceConfig,
 ) -> Result<(), String> {
     let cfg = config::load_config(config_dir)?;
     let keypair = NodeKeypair::load(&config::keypair_path(config_dir))?;
@@ -77,12 +118,16 @@ pub async fn start(
     let total_cpus = std::thread::available_parallelism()
         .map(|p| p.get() as u32)
         .unwrap_or(4);
-    let threads = ((total_cpus as f64 * resource_percent as f64 / 100.0).ceil() as u32).max(1);
-    let load_reserved = 1.0 - (resource_percent as f64 / 100.0);
 
     tracing::info!("Starting node {} (wallet: {})", cfg.node_id, cfg.wallet_address);
     tracing::info!("Public key: {}", keypair.public_key_bs58());
-    tracing::info!("Resource allocation: {}% ({}/{} threads)", resource_percent, threads, total_cpus);
+    tracing::info!("Resource config:");
+    tracing::info!("  Preset:       {}%", rc.resource_percent);
+    tracing::info!("  Threads:      {}/{}", rc.threads, total_cpus);
+    tracing::info!("  GPU layers:   {}", rc.gpu_layers);
+    tracing::info!("  Context:      {} tokens", rc.context_size);
+    tracing::info!("  Batch size:   {}", rc.batch_size);
+    tracing::info!("  Max jobs:     {}", rc.max_jobs);
 
     let mut engine: Option<InferenceEngine> = None;
     let mut models: Vec<String> = vec![];
@@ -98,7 +143,17 @@ pub async fn start(
             });
 
         tracing::info!("Loading model: {name} from {path}");
-        let mut eng = InferenceEngine::new(PathBuf::from(path), name.clone(), inference_port, threads);
+        let eng_config = InferenceEngineConfig {
+            model_path: PathBuf::from(path),
+            model_name: name.clone(),
+            port: inference_port,
+            threads: rc.threads,
+            gpu_layers: rc.gpu_layers,
+            context_size: rc.context_size,
+            batch_size: rc.batch_size,
+            parallel_slots: rc.max_jobs,
+        };
+        let mut eng = InferenceEngine::new(eng_config);
         eng.start().await?;
         models.push(name);
         engine = Some(eng);
@@ -108,10 +163,10 @@ pub async fn start(
         tracing::warn!("Use --model-path <path.gguf> --model-name <name> to enable inference");
     }
 
-    tracing::info!("Heartbeat interval: {HEARTBEAT_INTERVAL_SECS}s");
+    tracing::info!("Heartbeat interval: {}s", rc.heartbeat_interval);
 
     loop {
-        match client.heartbeat(&cfg.node_id, &models, load_reserved).await {
+        match client.heartbeat(&cfg.node_id, &models, rc.load_factor()).await {
             Ok(resp) => {
                 tracing::debug!("Heartbeat OK — status: {}", resp.status);
 
@@ -125,7 +180,7 @@ pub async fn start(
             }
         }
 
-        tokio::time::sleep(std::time::Duration::from_secs(HEARTBEAT_INTERVAL_SECS)).await;
+        tokio::time::sleep(std::time::Duration::from_secs(rc.heartbeat_interval)).await;
     }
 }
 
