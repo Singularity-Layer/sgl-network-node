@@ -1,9 +1,10 @@
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::config::{self, NodeConfig};
 use crate::crypto::NodeKeypair;
 use crate::inference::{ChatMessage, InferenceEngine, InferenceEngineConfig};
-use crate::orchestrator::OrchestratorClient;
+use crate::orchestrator::{OrchestratorClient, PendingJob};
 use crate::tee;
 
 pub struct ResourceConfig {
@@ -113,7 +114,7 @@ pub async fn start(
     let cfg = config::load_config(config_dir)?;
     let keypair = NodeKeypair::load(&config::keypair_path(config_dir))?;
 
-    let client = OrchestratorClient::new(orchestrator_url, Some(cfg.auth_token.clone()));
+    let client = Arc::new(OrchestratorClient::new(orchestrator_url, Some(cfg.auth_token.clone())));
 
     let total_cpus = std::thread::available_parallelism()
         .map(|p| p.get() as u32)
@@ -129,7 +130,7 @@ pub async fn start(
     tracing::info!("  Batch size:   {}", rc.batch_size);
     tracing::info!("  Max jobs:     {}", rc.max_jobs);
 
-    let mut engine: Option<InferenceEngine> = None;
+    let mut engine: Option<Arc<InferenceEngine>> = None;
     let mut models: Vec<String> = vec![];
 
     if let Some(path) = model_path {
@@ -156,7 +157,7 @@ pub async fn start(
         let mut eng = InferenceEngine::new(eng_config);
         eng.start().await?;
         models.push(name);
-        engine = Some(eng);
+        engine = Some(Arc::new(eng));
         tracing::info!("Inference engine ready on port {inference_port}");
     } else {
         tracing::warn!("No model specified — node will register but cannot process inference jobs");
@@ -165,14 +166,46 @@ pub async fn start(
 
     tracing::info!("Heartbeat interval: {}s", rc.heartbeat_interval);
 
+    let active_jobs = Arc::new(std::sync::atomic::AtomicU32::new(0));
+
     loop {
         match client.heartbeat(&cfg.node_id, &models, rc.load_factor()).await {
             Ok(resp) => {
                 tracing::debug!("Heartbeat OK — status: {}", resp.status);
 
-                for job in &resp.pending_jobs {
+                // Handle token rotation
+                if let Some(new_token) = &resp.new_auth_token {
+                    tracing::info!("Auth token rotated by orchestrator, saving new token...");
+                    let mut updated_cfg = cfg.clone();
+                    updated_cfg.auth_token = new_token.clone();
+                    if let Err(e) = config::save_config(config_dir, &updated_cfg) {
+                        tracing::error!("Failed to save rotated token: {e}");
+                    } else {
+                        client.update_auth_token(new_token.clone());
+                        tracing::info!("New token saved (expires: {})",
+                            resp.token_expires_at.as_deref().unwrap_or("unknown"));
+                    }
+                }
+
+                // Process jobs concurrently
+                for job in resp.pending_jobs {
+                    let current = active_jobs.load(std::sync::atomic::Ordering::Relaxed);
+                    if current >= rc.max_jobs {
+                        tracing::warn!("At max concurrent jobs ({}/{}), deferring job {}", current, rc.max_jobs, job.id);
+                        break;
+                    }
+
                     tracing::info!("Received job: {} (type: {})", job.id, job.job_type);
-                    process_job(&client, &engine, job).await;
+                    let client_clone = Arc::clone(&client);
+                    let engine_clone = engine.clone();
+                    let jobs_counter = Arc::clone(&active_jobs);
+
+                    jobs_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+                    tokio::spawn(async move {
+                        process_job(&client_clone, &engine_clone, &job).await;
+                        jobs_counter.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                    });
                 }
             }
             Err(e) => {
@@ -262,8 +295,8 @@ pub async fn attest(config_dir: &Path, orchestrator_url: &str) -> Result<(), Str
 
 async fn process_job(
     client: &OrchestratorClient,
-    engine: &Option<InferenceEngine>,
-    job: &crate::orchestrator::PendingJob,
+    engine: &Option<Arc<InferenceEngine>>,
+    job: &PendingJob,
 ) {
     tracing::info!("Processing job {} (type: {})", job.id, job.job_type);
 
@@ -294,8 +327,8 @@ async fn process_job(
 }
 
 async fn execute_inference(
-    engine: &Option<InferenceEngine>,
-    job: &crate::orchestrator::PendingJob,
+    engine: &Option<Arc<InferenceEngine>>,
+    job: &PendingJob,
 ) -> Result<serde_json::Value, String> {
     let engine = engine.as_ref().ok_or("No inference engine configured — start with --model-path")?;
 

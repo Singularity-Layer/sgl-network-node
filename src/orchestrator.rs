@@ -1,5 +1,6 @@
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use std::sync::RwLock;
 use std::time::Duration;
 
 use crate::tee::TeeCapabilities;
@@ -7,7 +8,7 @@ use crate::tee::TeeCapabilities;
 pub struct OrchestratorClient {
     client: Client,
     base_url: String,
-    auth_token: Option<String>,
+    auth_token: RwLock<Option<String>>,
 }
 
 #[derive(Serialize)]
@@ -39,6 +40,8 @@ pub struct HeartbeatResponse {
     pub status: String,
     #[serde(default)]
     pub pending_jobs: Vec<PendingJob>,
+    pub new_auth_token: Option<String>,
+    pub token_expires_at: Option<String>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -108,8 +111,18 @@ impl OrchestratorClient {
         Self {
             client,
             base_url: base_url.trim_end_matches('/').to_string(),
-            auth_token,
+            auth_token: RwLock::new(auth_token),
         }
+    }
+
+    pub fn update_auth_token(&self, token: String) {
+        let mut guard = self.auth_token.write().unwrap();
+        *guard = Some(token);
+    }
+
+    fn get_token(&self) -> Result<String, String> {
+        let guard = self.auth_token.read().unwrap();
+        guard.clone().ok_or_else(|| "No auth token configured".to_string())
     }
 
     pub async fn register(
@@ -162,7 +175,7 @@ impl OrchestratorClient {
         current_load: f64,
     ) -> Result<HeartbeatResponse, String> {
         let url = format!("{}/grid/nodes/heartbeat", self.base_url);
-        let token = self.auth_token.as_deref().ok_or("No auth token configured")?;
+        let token = self.get_token()?;
 
         let body = HeartbeatRequest {
             current_load,
@@ -192,7 +205,7 @@ impl OrchestratorClient {
 
     pub async fn request_challenge(&self, node_id: &str) -> Result<ChallengeResponse, String> {
         let url = format!("{}/grid/nodes/{}/challenge", self.base_url, node_id);
-        let token = self.auth_token.as_deref().ok_or("No auth token configured")?;
+        let token = self.get_token()?;
 
         let resp = self
             .client
@@ -222,7 +235,7 @@ impl OrchestratorClient {
             "{}/grid/nodes/{}/verify-attestation",
             self.base_url, node_id
         );
-        let token = self.auth_token.as_deref().ok_or("No auth token configured")?;
+        let token = self.get_token()?;
 
         let body = VerifyAttestationRequest {
             signature: signature.to_string(),
@@ -253,7 +266,7 @@ impl OrchestratorClient {
         node_id: &str,
     ) -> Result<NodeStatusResponse, String> {
         let url = format!("{}/grid/nodes/{}", self.base_url, node_id);
-        let token = self.auth_token.as_deref().ok_or("No auth token configured")?;
+        let token = self.get_token()?;
 
         let resp = self
             .client
@@ -280,7 +293,7 @@ impl OrchestratorClient {
         result: &serde_json::Value,
     ) -> Result<(), String> {
         let url = format!("{}/grid/jobs/{}/complete", self.base_url, job_id);
-        let token = self.auth_token.as_deref().ok_or("No auth token configured")?;
+        let token = self.get_token()?;
 
         let body = serde_json::json!({ "encrypted_result": result.to_string() });
 
@@ -304,7 +317,7 @@ impl OrchestratorClient {
 
     pub async fn fail_job(&self, job_id: &str, reason: &str) -> Result<(), String> {
         let url = format!("{}/grid/jobs/{}/fail", self.base_url, job_id);
-        let token = self.auth_token.as_deref().ok_or("No auth token configured")?;
+        let token = self.get_token()?;
 
         let body = serde_json::json!({ "reason": reason });
 
