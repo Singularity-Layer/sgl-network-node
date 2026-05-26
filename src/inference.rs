@@ -77,8 +77,10 @@ struct HealthResponse {
 }
 
 impl InferenceEngine {
-    pub fn new(config: InferenceEngineConfig) -> Self {
-        let base_url = format!("http://127.0.0.1:{}", config.port);
+    pub fn new(mut config: InferenceEngineConfig) -> Self {
+        let port = find_available_port(config.port);
+        config.port = port;
+        let base_url = format!("http://127.0.0.1:{}", port);
         Self {
             server_process: None,
             client: Client::new(),
@@ -247,6 +249,19 @@ pub struct InferenceResult {
     pub model: String,
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
+}
+
+pub fn find_available_port(preferred: u16) -> u16 {
+    if preferred != 0 {
+        if let Ok(listener) = std::net::TcpListener::bind(("127.0.0.1", preferred)) {
+            drop(listener);
+            return preferred;
+        }
+    }
+    // Bind to port 0 to let the OS assign a random available port
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")
+        .expect("Failed to bind to any port");
+    listener.local_addr().unwrap().port()
 }
 
 fn find_llama_server() -> Result<String, String> {
