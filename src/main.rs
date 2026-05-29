@@ -1,9 +1,12 @@
 mod config;
 mod crypto;
+mod encryption;
 mod inference;
 mod node;
 mod orchestrator;
+mod runtime_hardening;
 mod tee;
+mod websocket;
 
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
@@ -27,7 +30,7 @@ struct Cli {
 enum Commands {
     /// Initialize the node: generate keys and register with the orchestrator
     Init {
-        /// Solana wallet address (provider's payout wallet)
+        /// Staked Solana wallet address this node operates under
         #[arg(long)]
         wallet: String,
 
@@ -80,8 +83,8 @@ enum Commands {
         #[arg(long, default_value = "512")]
         batch_size: u32,
 
-        /// Heartbeat interval in seconds
-        #[arg(long, default_value = "30")]
+        /// Heartbeat interval in seconds (lower = faster job pickup, more network traffic)
+        #[arg(long, default_value = "5")]
         heartbeat_interval: u64,
     },
 
@@ -100,6 +103,8 @@ async fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env().add_directive("sgl_node=info".parse().unwrap()))
         .init();
+
+    runtime_hardening::deny_debugger_attach();
 
     let cli = Cli::parse();
     let config_dir = config::resolve_config_dir(cli.config_dir.as_deref());
