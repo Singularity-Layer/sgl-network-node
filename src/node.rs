@@ -81,7 +81,7 @@ pub async fn init(
     tracing::info!("Registering with orchestrator at {orchestrator_url}...");
     let client = OrchestratorClient::new(orchestrator_url, None);
     let registration = client
-        .register(wallet, tee_type, models, &public_key, &caps)
+        .register(wallet, None, tee_type, models, &public_key, &caps)
         .await?;
 
     tracing::info!("Registered! Node ID: {}", registration.node_id);
@@ -97,9 +97,74 @@ pub async fn init(
 
     config::save_config(config_dir, &node_config)?;
     tracing::info!("Config saved to {}", cfg_path.display());
-    tracing::info!("Node initialized. Run `sgl-node start` to begin processing jobs.");
-    tracing::info!("Run `sgl-node attest` to verify wallet ownership before receiving jobs.");
+    tracing::info!("Node initialized. Run `sgl start` to begin processing jobs.");
+    tracing::info!("Run `sgl attest` to verify identity before receiving jobs.");
 
+    Ok(())
+}
+
+/// `sgl login` — browser device-authorization flow.
+pub async fn login(
+    config_dir: &Path,
+    orchestrator_url: &str,
+    tee_type: &str,
+    models: &[String],
+) -> Result<(), String> {
+    let cfg_path = config::config_path(config_dir);
+    if cfg_path.exists() {
+        return Err(format!("Node already initialized. Config at: {}", cfg_path.display()));
+    }
+
+    let caps = tee::detect();
+    tee::print_capabilities(&caps);
+    println!();
+
+    let keypair = NodeKeypair::generate();
+    let kp_path = config::keypair_path(config_dir);
+    keypair.save(&kp_path)?;
+    let public_key = keypair.public_key_bs58();
+
+    let client = OrchestratorClient::new(orchestrator_url, None);
+    let session = client.device_start().await?;
+
+    println!("\n  Open to link this node:\n      {}\n  Approve with your staked Solana wallet (code: {}).\n", session.verify_url, session.user_code);
+    let opener = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
+    let _ = std::process::Command::new(opener).arg(&session.verify_url).spawn();
+
+    let interval = session.interval.max(2);
+    let max_polls = if session.expires_in > 0 { (session.expires_in / interval) + 2 } else { 200 };
+    tracing::info!("Waiting for approval in the browser...");
+
+    let mut reg_code: Option<String> = None;
+    let mut wallet: Option<String> = None;
+    for _ in 0..max_polls {
+        tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
+        match client.device_poll(&session.device_code).await {
+            Ok(p) if p.status == "approved" => { reg_code = p.registration_code; wallet = p.wallet_address; break; }
+            Ok(p) if p.status == "expired" => return Err("Login session expired. Run `sgl login` again.".to_string()),
+            Ok(_) => {}
+            Err(e) => tracing::warn!("poll error (retrying): {e}"),
+        }
+    }
+
+    let reg_code = reg_code.ok_or("Login timed out waiting for approval.")?;
+    let wallet = wallet.unwrap_or_default();
+    tracing::info!("Approved by wallet {wallet}. Registering node...");
+
+    let registration = client
+        .register(&wallet, Some(&reg_code), tee_type, models, &public_key, &caps)
+        .await?;
+
+    let node_config = NodeConfig {
+        node_id: registration.node_id,
+        auth_token: registration.auth_token,
+        wallet_address: wallet,
+        tee_type: tee_type.to_string(),
+        orchestrator_url: orchestrator_url.to_string(),
+        keypair_path: kp_path.to_string_lossy().to_string(),
+    };
+    config::save_config(config_dir, &node_config)?;
+    tracing::info!("Linked! Node ID: {}. Run `sgl attest`, then `sgl start --model-path <model.gguf>`.", node_config.node_id);
     Ok(())
 }
 
