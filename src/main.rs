@@ -43,6 +43,17 @@ enum Commands {
         models: Option<String>,
     },
 
+    /// Log in via browser and register this node (recommended)
+    Login {
+        /// TEE type on this machine
+        #[arg(long, default_value = "apple_se")]
+        tee_type: String,
+
+        /// Available models (comma-separated)
+        #[arg(long)]
+        models: Option<String>,
+    },
+
     /// Start the node: begin heartbeating and processing jobs
     Start {
         /// Path to GGUF model file for inference
@@ -117,6 +128,16 @@ async fn main() {
 
             if let Err(e) = node::init(&config_dir, &cli.orchestrator_url, &wallet, &tee_type, &models_vec).await {
                 tracing::error!("Init failed: {e}");
+                std::process::exit(1);
+            }
+        }
+        Commands::Login { tee_type, models } => {
+            let models_vec: Vec<String> = models
+                .map(|m| m.split(',').map(|s| s.trim().to_string()).collect())
+                .unwrap_or_default();
+
+            if let Err(e) = node::login(&config_dir, &cli.orchestrator_url, &tee_type, &models_vec).await {
+                tracing::error!("Login failed: {e}");
                 std::process::exit(1);
             }
         }

@@ -14,6 +14,8 @@ pub struct OrchestratorClient {
 #[derive(Serialize)]
 struct RegisterRequest {
     wallet_address: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    registration_code: Option<String>,
     tee_type: String,
     available_models: Vec<String>,
     public_key: String,
@@ -21,6 +23,36 @@ struct RegisterRequest {
     ram_gb: f64,
     gpu_model: String,
     supported_runtimes: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct DeviceStartRequest {}
+
+#[derive(Deserialize)]
+pub struct DeviceStartResponse {
+    pub device_code: String,
+    pub user_code: String,
+    pub verify_url: String,
+    #[serde(default = "default_interval")]
+    pub interval: u64,
+    #[serde(default)]
+    pub expires_in: u64,
+}
+
+fn default_interval() -> u64 { 3 }
+
+#[derive(Serialize)]
+struct DevicePollRequest {
+    device_code: String,
+}
+
+#[derive(Deserialize)]
+pub struct DevicePollResponse {
+    pub status: String,
+    #[serde(default)]
+    pub registration_code: Option<String>,
+    #[serde(default)]
+    pub wallet_address: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -128,6 +160,7 @@ impl OrchestratorClient {
     pub async fn register(
         &self,
         wallet: &str,
+        code: Option<&str>,
         tee_type: &str,
         models: &[String],
         public_key: &str,
@@ -137,6 +170,7 @@ impl OrchestratorClient {
 
         let body = RegisterRequest {
             wallet_address: wallet.to_string(),
+            registration_code: code.map(|s| s.to_string()),
             tee_type: tee_type.to_string(),
             available_models: models.to_vec(),
             public_key: public_key.to_string(),
@@ -166,6 +200,40 @@ impl OrchestratorClient {
         resp.json::<RegisterResponse>()
             .await
             .map_err(|e| format!("Failed to parse registration response: {e}"))
+    }
+
+    /// Start a device-authorization session for `sgl login`.
+    pub async fn device_start(&self) -> Result<DeviceStartResponse, String> {
+        let url = format!("{}/grid/auth/device/start", self.base_url);
+        let resp = self
+            .client
+            .post(&url)
+            .json(&DeviceStartRequest {})
+            .send()
+            .await
+            .map_err(|e| format!("device/start failed: {e}"))?;
+        if !resp.status().is_success() {
+            let s = resp.status();
+            return Err(format!("device/start failed ({s}): {}", resp.text().await.unwrap_or_default()));
+        }
+        resp.json::<DeviceStartResponse>().await.map_err(|e| format!("Failed to parse device/start: {e}"))
+    }
+
+    /// Poll a device-authorization session for approval.
+    pub async fn device_poll(&self, device_code: &str) -> Result<DevicePollResponse, String> {
+        let url = format!("{}/grid/auth/device/poll", self.base_url);
+        let resp = self
+            .client
+            .post(&url)
+            .json(&DevicePollRequest { device_code: device_code.to_string() })
+            .send()
+            .await
+            .map_err(|e| format!("device/poll failed: {e}"))?;
+        if !resp.status().is_success() {
+            let s = resp.status();
+            return Err(format!("device/poll failed ({s}): {}", resp.text().await.unwrap_or_default()));
+        }
+        resp.json::<DevicePollResponse>().await.map_err(|e| format!("Failed to parse device/poll: {e}"))
     }
 
     pub async fn heartbeat(
