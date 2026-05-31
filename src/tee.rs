@@ -1,4 +1,5 @@
 use serde::Serialize;
+use sha2::{Sha256, Digest};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct TeeCapabilities {
@@ -9,6 +10,39 @@ pub struct TeeCapabilities {
     pub memory_gb: f64,
     pub gpu: String,
     pub metal_support: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct HardwareAttestationReport {
+    pub tee_type: String,
+    pub chip_model: String,
+    pub cpu_cores: u32,
+    pub memory_gb: f64,
+    pub secure_enclave: bool,
+    pub sip_enabled: bool,
+    pub os_version: String,
+    pub kernel_version: String,
+    pub boot_uuid: String,
+    pub hardware_uuid: String,
+    pub firmware_version: String,
+    pub serial_hash: String,
+    pub report_hash: String,
+}
+
+impl HardwareAttestationReport {
+    pub fn compute_hash(&self) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(self.tee_type.as_bytes());
+        hasher.update(self.chip_model.as_bytes());
+        hasher.update(self.cpu_cores.to_le_bytes());
+        hasher.update(self.hardware_uuid.as_bytes());
+        hasher.update(self.firmware_version.as_bytes());
+        hasher.update(self.boot_uuid.as_bytes());
+        hasher.update(self.kernel_version.as_bytes());
+        hasher.update(if self.secure_enclave { &[1u8] } else { &[0u8] });
+        hasher.update(if self.sip_enabled { &[1u8] } else { &[0u8] });
+        hex::encode(hasher.finalize())
+    }
 }
 
 pub fn detect() -> TeeCapabilities {
@@ -32,59 +66,146 @@ pub fn detect() -> TeeCapabilities {
     }
 }
 
-fn detect_memory_gb() -> f64 {
-    let output = std::process::Command::new("sysctl")
-        .args(["-n", "hw.memsize"])
-        .output();
+pub fn generate_attestation_report() -> HardwareAttestationReport {
+    let caps = detect();
+    let sip = detect_sip_status();
+    let os_version = run_cmd("sw_vers", &["-productVersion"]);
+    let kernel_version = run_cmd("uname", &["-r"]);
+    let boot_uuid = detect_boot_uuid();
+    let hw_uuid = detect_hardware_uuid();
+    let firmware = detect_firmware_version();
+    let serial_hash = detect_serial_hash();
 
-    match output {
-        Ok(out) => {
-            let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            s.parse::<u64>().map(|b| b as f64 / (1024.0 * 1024.0 * 1024.0)).unwrap_or(16.0)
-        }
-        Err(_) => 16.0,
-    }
+    let mut report = HardwareAttestationReport {
+        tee_type: caps.tee_type,
+        chip_model: caps.chip,
+        cpu_cores: caps.cpu_cores,
+        memory_gb: caps.memory_gb,
+        secure_enclave: caps.secure_enclave_available,
+        sip_enabled: sip,
+        os_version,
+        kernel_version,
+        boot_uuid,
+        hardware_uuid: hw_uuid,
+        firmware_version: firmware,
+        serial_hash,
+        report_hash: String::new(),
+    };
+    report.report_hash = report.compute_hash();
+    report
+}
+
+fn detect_memory_gb() -> f64 {
+    let s = run_cmd("sysctl", &["-n", "hw.memsize"]);
+    s.parse::<u64>().map(|b| b as f64 / (1024.0 * 1024.0 * 1024.0)).unwrap_or(16.0)
 }
 
 fn detect_chip_name() -> String {
-    let output = std::process::Command::new("sysctl")
-        .args(["-n", "machdep.cpu.brand_string"])
-        .output();
-
-    match output {
-        Ok(out) => String::from_utf8_lossy(&out.stdout).trim().to_string(),
-        Err(_) => "Apple Silicon".to_string(),
-    }
+    let s = run_cmd("sysctl", &["-n", "machdep.cpu.brand_string"]);
+    if s.is_empty() { "Apple Silicon".to_string() } else { s }
 }
 
 fn detect_secure_enclave() -> bool {
     #[cfg(target_os = "macos")]
     {
-        let output = std::process::Command::new("ioreg")
-            .args(["-l", "-p", "IODeviceTree"])
-            .output();
-
-        if let Ok(out) = output {
-            let text = String::from_utf8_lossy(&out.stdout);
-            return text.contains("AppleSEP") || text.contains("sep");
-        }
+        let text = run_cmd("ioreg", &["-l", "-p", "IODeviceTree"]);
+        return text.contains("AppleSEP") || text.contains("sep");
     }
+    #[cfg(not(target_os = "macos"))]
     false
 }
 
 fn detect_metal() -> bool {
     #[cfg(target_os = "macos")]
     {
-        let output = std::process::Command::new("system_profiler")
-            .args(["SPDisplaysDataType"])
-            .output();
-
-        if let Ok(out) = output {
-            let text = String::from_utf8_lossy(&out.stdout);
-            return text.contains("Metal");
-        }
+        let text = run_cmd("system_profiler", &["SPDisplaysDataType"]);
+        return text.contains("Metal");
     }
+    #[cfg(not(target_os = "macos"))]
     false
+}
+
+fn detect_sip_status() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        let text = run_cmd("csrutil", &["status"]);
+        return text.contains("enabled");
+    }
+    #[cfg(not(target_os = "macos"))]
+    false
+}
+
+fn detect_boot_uuid() -> String {
+    #[cfg(target_os = "macos")]
+    {
+        return run_cmd("sysctl", &["-n", "kern.bootsessionuuid"]);
+    }
+    #[cfg(not(target_os = "macos"))]
+    String::new()
+}
+
+fn detect_hardware_uuid() -> String {
+    #[cfg(target_os = "macos")]
+    {
+        let text = run_cmd("system_profiler", &["SPHardwareDataType"]);
+        for line in text.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("Hardware UUID:") || trimmed.starts_with("Provisioning UDID:") {
+                if let Some(val) = trimmed.split(':').nth(1) {
+                    return val.trim().to_string();
+                }
+            }
+        }
+        return String::new();
+    }
+    #[cfg(not(target_os = "macos"))]
+    String::new()
+}
+
+fn detect_firmware_version() -> String {
+    #[cfg(target_os = "macos")]
+    {
+        let text = run_cmd("system_profiler", &["SPHardwareDataType"]);
+        for line in text.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("System Firmware Version:") || trimmed.starts_with("OS Loader Version:") {
+                if let Some(val) = trimmed.split(':').nth(1) {
+                    return val.trim().to_string();
+                }
+            }
+        }
+        return run_cmd("sysctl", &["-n", "kern.osversion"]);
+    }
+    #[cfg(not(target_os = "macos"))]
+    String::new()
+}
+
+fn detect_serial_hash() -> String {
+    #[cfg(target_os = "macos")]
+    {
+        let text = run_cmd("system_profiler", &["SPHardwareDataType"]);
+        for line in text.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("Serial Number") {
+                if let Some(val) = trimmed.split(':').nth(1) {
+                    let serial = val.trim();
+                    let mut hasher = Sha256::new();
+                    hasher.update(serial.as_bytes());
+                    return hex::encode(hasher.finalize());
+                }
+            }
+        }
+        return String::new();
+    }
+    #[cfg(not(target_os = "macos"))]
+    String::new()
+}
+
+fn run_cmd(cmd: &str, args: &[&str]) -> String {
+    match std::process::Command::new(cmd).args(args).output() {
+        Ok(out) => String::from_utf8_lossy(&out.stdout).trim().to_string(),
+        Err(_) => String::new(),
+    }
 }
 
 pub fn print_capabilities(caps: &TeeCapabilities) {

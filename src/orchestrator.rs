@@ -80,7 +80,7 @@ pub struct HeartbeatResponse {
     pub token_expires_at: Option<String>,
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, Clone)]
 pub struct PendingJob {
     pub id: String,
     pub job_type: String,
@@ -370,10 +370,27 @@ impl OrchestratorClient {
         job_id: &str,
         result: &serde_json::Value,
     ) -> Result<(), String> {
+        let body = serde_json::json!({ "encrypted_result": result.to_string() });
+        self.post_complete(job_id, body).await
+    }
+
+    /// Complete a sealed (E2E) job: result sealed to caller's key, usage cleartext.
+    pub async fn complete_job_sealed(
+        &self,
+        job_id: &str,
+        sealed_result: serde_json::Value,
+        usage: Option<serde_json::Value>,
+        result_signature: Option<String>,
+    ) -> Result<(), String> {
+        let mut body = serde_json::json!({ "sealed_result": sealed_result });
+        if let Some(u) = usage { body["usage"] = u; }
+        if let Some(sig) = result_signature { body["result_signature"] = serde_json::Value::String(sig); }
+        self.post_complete(job_id, body).await
+    }
+
+    async fn post_complete(&self, job_id: &str, body: serde_json::Value) -> Result<(), String> {
         let url = format!("{}/grid/jobs/{}/complete", self.base_url, job_id);
         let token = self.get_token()?;
-
-        let body = serde_json::json!({ "encrypted_result": result.to_string() });
 
         let resp = self
             .client

@@ -272,11 +272,12 @@ pub async fn start(
                     let client_clone = Arc::clone(&client);
                     let engine_clone = engine.clone();
                     let jobs_counter = Arc::clone(&active_jobs);
+                    let secret_clone = node_secret;
 
                     jobs_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
                     tokio::spawn(async move {
-                        process_job(&client_clone, &engine_clone, &job).await;
+                        process_job(&client_clone, &engine_clone, &job, &secret_clone).await;
                         jobs_counter.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                     });
                 }
