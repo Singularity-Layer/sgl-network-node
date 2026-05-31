@@ -138,11 +138,15 @@ pub async fn run_websocket(
                     engine.clone(),
                 ));
 
+                let hb_enc_key = encryption::EncryptionKeypair::from_ed25519_seed(
+                    &keypair.signing_key.to_bytes(),
+                ).public_key_bs58();
                 let heartbeat_handle = tokio::spawn(heartbeat_loop(
                     tx.clone(),
                     models.clone(),
                     load_factor,
                     heartbeat_interval,
+                    hb_enc_key,
                 ));
 
                 tokio::select! {
