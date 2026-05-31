@@ -234,7 +234,7 @@ pub async fn start(
     let active_jobs = Arc::new(std::sync::atomic::AtomicU32::new(0));
 
     loop {
-        match client.heartbeat(&cfg.node_id, &models, rc.load_factor()).await {
+        match client.heartbeat(&cfg.node_id, &models, rc.load_factor(), Some(&node_enc_pubkey)).await {
             Ok(resp) => {
                 tracing::debug!("Heartbeat OK — status: {}", resp.status);
 

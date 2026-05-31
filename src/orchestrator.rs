@@ -65,6 +65,10 @@ pub struct RegisterResponse {
 struct HeartbeatRequest {
     current_load: f64,
     available_models: Vec<String>,
+    // Node's X25519 key for E2E-encrypted prompts (sent every heartbeat so the
+    // orchestrator always has the current key without a separate attest step).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    encryption_public_key: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -243,6 +247,7 @@ impl OrchestratorClient {
         node_id: &str,
         models: &[String],
         current_load: f64,
+        encryption_public_key: Option<&str>,
     ) -> Result<HeartbeatResponse, String> {
         let url = format!("{}/grid/nodes/heartbeat", self.base_url);
         let token = self.get_token()?;
@@ -250,6 +255,7 @@ impl OrchestratorClient {
         let body = HeartbeatRequest {
             current_load,
             available_models: models.to_vec(),
+            encryption_public_key: encryption_public_key.map(|s| s.to_string()),
         };
 
         let resp = self
