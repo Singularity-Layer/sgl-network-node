@@ -96,6 +96,8 @@ pub struct ChallengeResponse {
 #[derive(Serialize)]
 struct VerifyAttestationRequest {
     signature: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    encryption_public_key: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -298,6 +300,7 @@ impl OrchestratorClient {
         &self,
         node_id: &str,
         signature: &str,
+        encryption_public_key: Option<String>,
     ) -> Result<AttestationResponse, String> {
         let url = format!(
             "{}/grid/nodes/{}/verify-attestation",
@@ -307,6 +310,7 @@ impl OrchestratorClient {
 
         let body = VerifyAttestationRequest {
             signature: signature.to_string(),
+            encryption_public_key,
         };
 
         let resp = self

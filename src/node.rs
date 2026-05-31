@@ -345,8 +345,17 @@ pub async fn attest(config_dir: &Path, orchestrator_url: &str) -> Result<(), Str
     let signature = keypair.sign_message(challenge.challenge.as_bytes());
     tracing::info!("Challenge signed, submitting...");
 
+    // Derive the node's X25519 encryption key (for E2E-encrypted prompts) from
+    // the same ed25519 seed and publish it during attestation. Clients encrypt
+    // prompts to this key so they only decrypt inside this process.
+    let enc_keypair = crate::encryption::EncryptionKeypair::from_ed25519_seed(
+        &keypair.signing_key.to_bytes(),
+    );
+    let encryption_public_key = enc_keypair.public_key_bs58();
+    tracing::info!("Publishing X25519 encryption key: {encryption_public_key}");
+
     let result = client
-        .verify_attestation(&cfg.node_id, &signature)
+        .verify_attestation(&cfg.node_id, &signature, Some(encryption_public_key))
         .await?;
 
     if result.verified {
