@@ -231,6 +231,13 @@ pub async fn start(
 
     tracing::info!("Heartbeat interval: {}s", rc.heartbeat_interval);
 
+    // Node's X25519 encryption key (derived from its ed25519 seed). Published on
+    // every REST heartbeat so the orchestrator can seal prompts to it (E2E).
+    let node_enc_pubkey = crate::encryption::EncryptionKeypair::from_ed25519_seed(
+        &keypair.signing_key.to_bytes(),
+    ).public_key_bs58();
+    tracing::info!("X25519 encryption key: {node_enc_pubkey}");
+
     let active_jobs = Arc::new(std::sync::atomic::AtomicU32::new(0));
 
     loop {
