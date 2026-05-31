@@ -5,6 +5,7 @@ mod inference;
 mod node;
 mod orchestrator;
 mod runtime_hardening;
+mod service;
 mod tee;
 mod websocket;
 
@@ -107,6 +108,49 @@ enum Commands {
 
     /// Detect hardware capabilities (TEE, GPU, memory)
     Detect,
+
+    /// Install/manage the node as a background OS service (launchd/systemd).
+    /// Keeps the node serving across reboots, logout, crashes, and idle sleep.
+    Service {
+        #[command(subcommand)]
+        action: ServiceAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum ServiceAction {
+    /// Install and start the node as a managed background service.
+    Install {
+        /// Path to GGUF model file for inference
+        #[arg(long)]
+        model_path: Option<String>,
+
+        /// Model name to advertise (e.g. "llama-3.2-3b")
+        #[arg(long)]
+        model_name: Option<String>,
+
+        /// Percentage of system resources to dedicate (1-100)
+        #[arg(long, default_value = "50", value_parser = clap::value_parser!(u8).range(1..=100))]
+        resource_percent: u8,
+
+        /// Port for local llama-server
+        #[arg(long, default_value = "8081")]
+        inference_port: u16,
+
+        /// Max concurrent jobs this node will accept
+        #[arg(long, default_value = "1")]
+        max_jobs: u32,
+
+        /// Heartbeat interval in seconds
+        #[arg(long, default_value = "5")]
+        heartbeat_interval: u64,
+    },
+
+    /// Stop and remove the background service.
+    Uninstall,
+
+    /// Show whether the background service is installed and running.
+    Status,
 }
 
 #[tokio::main]
@@ -177,6 +221,31 @@ async fn main() {
         Commands::Detect => {
             let caps = tee::detect();
             tee::print_capabilities(&caps);
+        }
+        Commands::Service { action } => {
+            let result = match action {
+                ServiceAction::Install {
+                    model_path, model_name, resource_percent,
+                    inference_port, max_jobs, heartbeat_interval,
+                } => {
+                    let opts = service::ServiceStartOptions {
+                        model_path,
+                        model_name,
+                        orchestrator_url: cli.orchestrator_url.clone(),
+                        resource_percent,
+                        inference_port,
+                        max_jobs,
+                        heartbeat_interval,
+                    };
+                    service::install(&opts)
+                }
+                ServiceAction::Uninstall => service::uninstall(),
+                ServiceAction::Status => service::status(),
+            };
+            if let Err(e) = result {
+                tracing::error!("Service command failed: {e}");
+                std::process::exit(1);
+            }
         }
     }
 }
