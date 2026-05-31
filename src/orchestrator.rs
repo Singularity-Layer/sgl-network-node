@@ -102,6 +102,8 @@ struct VerifyAttestationRequest {
     signature: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     encryption_public_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hardware_report: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -307,6 +309,7 @@ impl OrchestratorClient {
         node_id: &str,
         signature: &str,
         encryption_public_key: Option<String>,
+        hardware_report: Option<serde_json::Value>,
     ) -> Result<AttestationResponse, String> {
         let url = format!(
             "{}/grid/nodes/{}/verify-attestation",
@@ -317,6 +320,7 @@ impl OrchestratorClient {
         let body = VerifyAttestationRequest {
             signature: signature.to_string(),
             encryption_public_key,
+            hardware_report,
         };
 
         let resp = self

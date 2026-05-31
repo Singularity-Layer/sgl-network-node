@@ -26,6 +26,9 @@ pub struct HardwareAttestationReport {
     pub hardware_uuid: String,
     pub firmware_version: String,
     pub serial_hash: String,
+    /// sha256 of the running sgl binary — lets the orchestrator gate on a known,
+    /// hardened build (allowlist) so a tampered binary can't serve.
+    pub binary_hash: String,
     pub report_hash: String,
 }
 
@@ -41,6 +44,7 @@ impl HardwareAttestationReport {
         hasher.update(self.kernel_version.as_bytes());
         hasher.update(if self.secure_enclave { &[1u8] } else { &[0u8] });
         hasher.update(if self.sip_enabled { &[1u8] } else { &[0u8] });
+        hasher.update(self.binary_hash.as_bytes());
         hex::encode(hasher.finalize())
     }
 }
@@ -75,6 +79,7 @@ pub fn generate_attestation_report() -> HardwareAttestationReport {
     let hw_uuid = detect_hardware_uuid();
     let firmware = detect_firmware_version();
     let serial_hash = detect_serial_hash();
+    let binary_hash = detect_binary_hash();
 
     let mut report = HardwareAttestationReport {
         tee_type: caps.tee_type,
@@ -89,10 +94,24 @@ pub fn generate_attestation_report() -> HardwareAttestationReport {
         hardware_uuid: hw_uuid,
         firmware_version: firmware,
         serial_hash,
+        binary_hash,
         report_hash: String::new(),
     };
     report.report_hash = report.compute_hash();
     report
+}
+
+/// sha256 of the currently-running sgl binary. The orchestrator can require
+/// this to be on an allowlist of known-hardened builds.
+fn detect_binary_hash() -> String {
+    match std::env::current_exe().ok().and_then(|p| std::fs::read(p).ok()) {
+        Some(bytes) => {
+            let mut hasher = Sha256::new();
+            hasher.update(&bytes);
+            hex::encode(hasher.finalize())
+        }
+        None => String::new(),
+    }
 }
 
 fn detect_memory_gb() -> f64 {

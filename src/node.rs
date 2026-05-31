@@ -351,20 +351,29 @@ pub async fn attest(config_dir: &Path, orchestrator_url: &str) -> Result<(), Str
     };
     tracing::info!("Challenge received (expires: {expiry})");
 
+    // Build the hardware report (TEE type, SIP status, binary self-hash). The
+    // orchestrator gates on SIP + binary-hash allowlist before activating.
+    let report = crate::tee::generate_attestation_report();
+    let report_hash = report.report_hash.clone();
+    tracing::info!("Hardware report: sip_enabled={}, binary_hash={}…", report.sip_enabled, &report.binary_hash[..report.binary_hash.len().min(12)]);
+
+    // Sign the plain challenge (proves key ownership). The hardware report is
+    // delivered over the authenticated node session and gated server-side.
+    let _ = report_hash;
     let signature = keypair.sign_message(challenge.challenge.as_bytes());
-    tracing::info!("Challenge signed, submitting...");
+    tracing::info!("Challenge signed, submitting with hardware report...");
 
     // Derive the node's X25519 encryption key (for E2E-encrypted prompts) from
-    // the same ed25519 seed and publish it during attestation. Clients encrypt
-    // prompts to this key so they only decrypt inside this process.
+    // the same ed25519 seed and publish it during attestation.
     let enc_keypair = crate::encryption::EncryptionKeypair::from_ed25519_seed(
         &keypair.signing_key.to_bytes(),
     );
     let encryption_public_key = enc_keypair.public_key_bs58();
     tracing::info!("Publishing X25519 encryption key: {encryption_public_key}");
 
+    let report_json = serde_json::to_value(&report).ok();
     let result = client
-        .verify_attestation(&cfg.node_id, &signature, Some(encryption_public_key))
+        .verify_attestation(&cfg.node_id, &signature, Some(encryption_public_key), report_json)
         .await?;
 
     if result.verified {
