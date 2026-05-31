@@ -34,6 +34,9 @@ struct WSHeartbeat {
     msg_type: &'static str,
     current_load: f64,
     available_models: Vec<String>,
+    // Deterministic X25519 key clients/orchestrator encrypt prompts to. Published
+    // on every heartbeat so it's always current without a separate attest step.
+    encryption_public_key: String,
 }
 
 #[derive(serde::Serialize)]
@@ -267,6 +270,7 @@ async fn heartbeat_loop(
     models: Vec<String>,
     load_factor: f64,
     interval_secs: u64,
+    encryption_public_key: String,
 ) {
     let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
     loop {
@@ -275,6 +279,7 @@ async fn heartbeat_loop(
             msg_type: "heartbeat",
             current_load: load_factor,
             available_models: models.clone(),
+            encryption_public_key: encryption_public_key.clone(),
         };
         let msg = serde_json::to_string(&hb).unwrap();
         if tx.send(Message::Text(msg)).await.is_err() {
