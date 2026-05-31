@@ -56,48 +56,6 @@ struct WSJobComplete {
     usage: Option<serde_json::Value>,
 }
 
-fn bs58_to_32(s: &str) -> Result<[u8; 32], String> {
-    let v = bs58::decode(s).into_vec().map_err(|e| format!("bad base58: {e}"))?;
-    if v.len() != 32 {
-        return Err(format!("expected 32 bytes, got {}", v.len()));
-    }
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&v);
-    Ok(out)
-}
-
-/// If the job payload is sealed (`enc` object present), decrypt it with the
-/// node's X25519 key and return (plaintext_payload, response_pubkey). Otherwise
-/// return the payload unchanged with no response key (the plaintext path).
-fn unseal_input(
-    payload: &serde_json::Value,
-    node_ed25519_secret: &[u8; 32],
-) -> Result<(serde_json::Value, Option<[u8; 32]>), String> {
-    let enc = match payload.get("enc") {
-        Some(e) if e.is_object() => e,
-        _ => return Ok((payload.clone(), None)), // plaintext path — unchanged
-    };
-
-    let ciphertext_b58 = enc.get("ciphertext").and_then(|v| v.as_str())
-        .ok_or("enc.ciphertext missing")?;
-    let ephemeral_b58 = enc.get("client_ephemeral_pubkey").and_then(|v| v.as_str())
-        .ok_or("enc.client_ephemeral_pubkey missing")?;
-    let response_b58 = enc.get("client_response_pubkey").and_then(|v| v.as_str())
-        .ok_or("enc.client_response_pubkey missing")?;
-
-    let ciphertext = bs58::decode(ciphertext_b58).into_vec()
-        .map_err(|e| format!("bad ciphertext base58: {e}"))?;
-    let ephemeral = bs58_to_32(ephemeral_b58)?;
-    let response_pub = bs58_to_32(response_b58)?;
-
-    let kp = encryption::EncryptionKeypair::from_ed25519_seed(node_ed25519_secret);
-    let plaintext = kp.decrypt(&ephemeral, &ciphertext)?;
-    let inner: serde_json::Value = serde_json::from_slice(&plaintext)
-        .map_err(|e| format!("decrypted payload is not valid JSON: {e}"))?;
-
-    Ok((inner, Some(response_pub)))
-}
-
 #[derive(serde::Serialize)]
 struct WSJobFailed {
     #[serde(rename = "type")]
@@ -302,7 +260,7 @@ async fn handle_ws_job(
     // unchanged so existing dispatch keeps working exactly as before.
     let node_secret = keypair.signing_key.to_bytes();
     let (effective_payload, response_pubkey) = match ws_job.input_payload.as_ref() {
-        Some(p) => match unseal_input(p, &node_secret) {
+        Some(p) => match encryption::unseal_input(p, &node_secret) {
             Ok(v) => v,
             Err(e) => {
                 tracing::error!("Failed to unseal job {}: {e}", ws_job.id);

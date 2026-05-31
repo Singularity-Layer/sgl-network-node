@@ -233,8 +233,9 @@ pub async fn start(
 
     // Node's X25519 encryption key (derived from its ed25519 seed). Published on
     // every REST heartbeat so the orchestrator can seal prompts to it (E2E).
+    let node_secret = keypair.signing_key.to_bytes();
     let node_enc_pubkey = crate::encryption::EncryptionKeypair::from_ed25519_seed(
-        &keypair.signing_key.to_bytes(),
+        &node_secret,
     ).public_key_bs58();
     tracing::info!("X25519 encryption key: {node_enc_pubkey}");
 
@@ -378,20 +379,63 @@ async fn process_job(
     client: &OrchestratorClient,
     engine: &Option<Arc<InferenceEngine>>,
     job: &PendingJob,
+    node_secret: &[u8; 32],
 ) {
     tracing::info!("Processing job {} (type: {})", job.id, job.job_type);
 
-    let result = match job.job_type.as_str() {
-        "inference" => execute_inference(engine, job).await,
+    // If the prompt is sealed (E2E), decrypt it with the node's X25519 key and
+    // remember the caller's response key so we can seal the reply back.
+    let mut response_pubkey: Option<[u8; 32]> = None;
+    let mut effective_job = job.clone();
+    if let Some(payload) = &job.input_payload {
+        match crate::encryption::unseal_input(payload, node_secret) {
+            Ok((inner, resp)) => {
+                response_pubkey = resp;
+                if resp.is_some() {
+                    effective_job.input_payload = Some(inner);
+                }
+            }
+            Err(e) => {
+                tracing::error!("Failed to unseal job {}: {e}", job.id);
+                let _ = client.fail_job(&job.id, &format!("decrypt failed: {e}")).await;
+                return;
+            }
+        }
+    }
+
+    let result = match effective_job.job_type.as_str() {
+        "inference" => execute_inference(engine, &effective_job).await,
         _ => {
-            tracing::warn!("Unsupported job type: {}", job.job_type);
-            Err(format!("Unsupported job type: {}", job.job_type))
+            tracing::warn!("Unsupported job type: {}", effective_job.job_type);
+            Err(format!("Unsupported job type: {}", effective_job.job_type))
         }
     };
 
     match result {
         Ok(output) => {
-            if let Err(e) = client.complete_job(&job.id, &output).await {
+            if let Some(resp_pub) = response_pubkey {
+                // ── E2E: seal the result to the caller's response key ──
+                let result_bytes = output.to_string();
+                let usage = output.get("usage").cloned();
+                match crate::encryption::encrypt_for_recipient(&resp_pub, result_bytes.as_bytes()) {
+                    Ok((sealed, ephemeral_pub)) => {
+                        let sealed_result = serde_json::json!({
+                            "ciphertext": bs58::encode(&sealed).into_string(),
+                            "ephemeral_public_key": bs58::encode(ephemeral_pub).into_string(),
+                            "algorithm": "x25519-xchacha20poly1305",
+                        });
+                        if let Err(e) = client.complete_job_sealed(&job.id, sealed_result, usage, None).await {
+                            tracing::error!("Failed to report sealed completion: {e}");
+                        } else {
+                            tracing::info!("Job {} completed (E2E sealed, REST)", job.id);
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!("Failed to seal result for job {}: {e}", job.id);
+                        let _ = client.fail_job(&job.id, &format!("seal failed: {e}")).await;
+                    }
+                }
+            } else if let Err(e) = client.complete_job(&job.id, &output).await {
                 tracing::error!("Failed to report job completion: {e}");
             } else {
                 tracing::info!("Job {} completed", job.id);
