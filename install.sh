@@ -3,7 +3,8 @@
 # Usage: curl -sSf https://grid.x402compute.cc/install.sh | sh
 set -e
 
-BINARY_NAME="sgl-node"
+BINARY_NAME="sgl"                       # installed command + built binary name
+ASSET_NAME="sgl-darwin-arm64"           # release asset filename
 INSTALL_DIR="/usr/local/bin"
 REPO="Singularity-Layer/sgl-network-node"
 RELEASES_URL="https://github.com/${REPO}/releases"
@@ -63,12 +64,15 @@ check_dependencies() {
         echo "Error: curl is required. Install it with: brew install curl"
         exit 1
     fi
+    if ! command -v shasum >/dev/null 2>&1 && ! command -v sha256sum >/dev/null 2>&1; then
+        echo "Error: shasum or sha256sum is required to verify the download."
+        exit 1
+    fi
 }
 
 detect_latest_version() {
     echo "  Checking latest version..."
 
-    # Try GitHub API first
     LATEST_VERSION=$(curl -sSf "https://api.github.com/repos/${REPO}/releases/latest" 2>/dev/null \
         | grep '"tag_name"' \
         | head -1 \
@@ -82,11 +86,21 @@ detect_latest_version() {
     fi
 }
 
-download_binary() {
-    DOWNLOAD_URL="${RELEASES_URL}/download/${LATEST_VERSION}/${BINARY_NAME}-darwin-arm64"
-    TEMP_FILE=$(mktemp)
+sha256_of() {
+    if command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$1" | awk '{print $1}'
+    else
+        sha256sum "$1" | awk '{print $1}'
+    fi
+}
 
-    echo "  Downloading ${BINARY_NAME}..."
+download_binary() {
+    DOWNLOAD_URL="${RELEASES_URL}/download/${LATEST_VERSION}/${ASSET_NAME}"
+    CHECKSUM_URL="${DOWNLOAD_URL}.sha256"
+    TEMP_FILE=$(mktemp)
+    TEMP_SUM=$(mktemp)
+
+    echo "  Downloading ${ASSET_NAME}..."
 
     HTTP_CODE=$(curl -sSL -w "%{http_code}" -o "$TEMP_FILE" "$DOWNLOAD_URL" 2>/dev/null || echo "000")
 
@@ -97,13 +111,35 @@ download_binary() {
         echo "  To install from source instead:"
         echo ""
         echo "    git clone https://github.com/${REPO}.git"
-        echo "    cd sgl-node"
+        echo "    cd sgl-network-node"
         echo "    cargo build --release"
-        echo "    sudo cp target/release/sgl-node /usr/local/bin/"
+        echo "    sudo cp target/release/${BINARY_NAME} ${INSTALL_DIR}/"
         echo ""
-        rm -f "$TEMP_FILE"
+        rm -f "$TEMP_FILE" "$TEMP_SUM"
         exit 0
     fi
+
+    # Verify the published checksum. Fail closed — never install an unverified
+    # binary. The orchestrator additionally gates on a binary-hash allowlist, but
+    # we refuse to install tampered bits in the first place.
+    SUM_CODE=$(curl -sSL -w "%{http_code}" -o "$TEMP_SUM" "$CHECKSUM_URL" 2>/dev/null || echo "000")
+    if [ "$SUM_CODE" != "200" ]; then
+        echo "  Error: checksum file not found at ${CHECKSUM_URL}."
+        echo "  Refusing to install an unverified binary."
+        rm -f "$TEMP_FILE" "$TEMP_SUM"
+        exit 1
+    fi
+
+    EXPECTED=$(awk '{print $1}' "$TEMP_SUM")
+    ACTUAL=$(sha256_of "$TEMP_FILE")
+    if [ -z "$EXPECTED" ] || [ "$EXPECTED" != "$ACTUAL" ]; then
+        echo "  Error: checksum mismatch — refusing to install."
+        echo "    expected: ${EXPECTED}"
+        echo "    actual:   ${ACTUAL}"
+        rm -f "$TEMP_FILE" "$TEMP_SUM"
+        exit 1
+    fi
+    echo "  Checksum verified ✓"
 
     chmod +x "$TEMP_FILE"
 
@@ -113,6 +149,7 @@ download_binary() {
         echo "  Installing to ${INSTALL_DIR} (requires sudo)..."
         sudo mv "$TEMP_FILE" "${INSTALL_DIR}/${BINARY_NAME}"
     fi
+    rm -f "$TEMP_SUM"
 
     echo "  Installed: ${INSTALL_DIR}/${BINARY_NAME} ✓"
 }
@@ -134,19 +171,16 @@ print_next_steps() {
     echo "  └─────────────────────────────────────────────┘"
     echo ""
     echo "  1. Detect your hardware:"
-    echo "     $ sgl-node detect"
+    echo "     $ sgl detect"
     echo ""
-    echo "  2. Initialize your node:"
-    echo "     $ sgl-node init --wallet <YOUR_SOLANA_ADDRESS>"
+    echo "  2. Log in and register this node (browser):"
+    echo "     $ sgl login"
     echo ""
-    echo "  3. Verify wallet ownership:"
-    echo "     $ sgl-node attest"
-    echo ""
-    echo "  4. Download a model (e.g., Llama 3.2 3B):"
+    echo "  3. Download a model (e.g., Llama 3.2 3B):"
     echo "     $ curl -L -o model.gguf <model-download-url>"
     echo ""
-    echo "  5. Start earning:"
-    echo "     $ sgl-node start --model-path ./model.gguf --model-name llama-3.2-3b"
+    echo "  4. Start earning:"
+    echo "     $ sgl start --model-path ./model.gguf --model-name llama-3.2-3b"
     echo ""
     echo "  Docs: https://sgl.network/docs"
     echo "  Discord: https://discord.gg/singularity"

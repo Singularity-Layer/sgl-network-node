@@ -23,23 +23,6 @@ pub struct InferenceEngine {
 }
 
 #[derive(Serialize)]
-struct CompletionRequest {
-    prompt: String,
-    n_predict: i32,
-    temperature: f64,
-    stop: Vec<String>,
-    stream: bool,
-}
-
-#[derive(Deserialize)]
-struct CompletionResponse {
-    content: String,
-    tokens_predicted: Option<u32>,
-    tokens_evaluated: Option<u32>,
-    generation_settings: Option<serde_json::Value>,
-}
-
-#[derive(Serialize)]
 struct ChatCompletionRequest {
     messages: Vec<ChatMessage>,
     temperature: f64,
@@ -65,6 +48,7 @@ struct ChatChoice {
 }
 
 #[derive(Deserialize)]
+#[allow(dead_code)] // total_tokens is part of the llama.cpp response shape
 struct UsageInfo {
     prompt_tokens: Option<u32>,
     completion_tokens: Option<u32>,
@@ -91,11 +75,17 @@ impl InferenceEngine {
 
     pub async fn start(&mut self) -> Result<(), String> {
         if !self.config.model_path.exists() {
-            return Err(format!("Model file not found: {}", self.config.model_path.display()));
+            return Err(format!(
+                "Model file not found: {}",
+                self.config.model_path.display()
+            ));
         }
 
         let llama_server = find_llama_server()?;
-        tracing::info!("Starting llama-server with model: {}", self.config.model_path.display());
+        tracing::info!(
+            "Starting llama-server with model: {}",
+            self.config.model_path.display()
+        );
 
         let port_str = self.config.port.to_string();
         let threads_str = self.config.threads.to_string();
@@ -106,14 +96,22 @@ impl InferenceEngine {
 
         let child = Command::new(&llama_server)
             .args([
-                "-m", &self.config.model_path.to_string_lossy(),
-                "--host", "127.0.0.1",
-                "--port", &port_str,
-                "-ngl", &gpu_layers_str,
-                "-c", &ctx_str,
-                "-t", &threads_str,
-                "-b", &batch_str,
-                "--parallel", &parallel_str,
+                "-m",
+                &self.config.model_path.to_string_lossy(),
+                "--host",
+                "127.0.0.1",
+                "--port",
+                &port_str,
+                "-ngl",
+                &gpu_layers_str,
+                "-c",
+                &ctx_str,
+                "-t",
+                &threads_str,
+                "-b",
+                &batch_str,
+                "--parallel",
+                &parallel_str,
             ])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::piped())
@@ -172,7 +170,8 @@ impl InferenceEngine {
             stream: false,
         };
 
-        let resp = self.client
+        let resp = self
+            .client
             .post(&url)
             .json(&body)
             .send()
@@ -184,56 +183,26 @@ impl InferenceEngine {
             return Err(format!("Inference failed: {text}"));
         }
 
-        let result: ChatCompletionResponse = resp.json().await
+        let result: ChatCompletionResponse = resp
+            .json()
+            .await
             .map_err(|e| format!("Failed to parse inference response: {e}"))?;
 
-        let choice = result.choices.first()
-            .ok_or("No completion returned")?;
+        let choice = result.choices.first().ok_or("No completion returned")?;
 
         Ok(InferenceResult {
             content: choice.message.content.clone(),
             model: self.config.model_name.clone(),
-            prompt_tokens: result.usage.as_ref().and_then(|u| u.prompt_tokens).unwrap_or(0),
-            completion_tokens: result.usage.as_ref().and_then(|u| u.completion_tokens).unwrap_or(0),
-        })
-    }
-
-    pub async fn completion(
-        &self,
-        prompt: &str,
-        max_tokens: i32,
-        temperature: f64,
-    ) -> Result<InferenceResult, String> {
-        let url = format!("{}/completion", self.base_url);
-
-        let body = CompletionRequest {
-            prompt: prompt.to_string(),
-            n_predict: max_tokens,
-            temperature,
-            stop: vec!["</s>".to_string(), "<|eot_id|>".to_string()],
-            stream: false,
-        };
-
-        let resp = self.client
-            .post(&url)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| format!("Inference request failed: {e}"))?;
-
-        if !resp.status().is_success() {
-            let text = resp.text().await.unwrap_or_default();
-            return Err(format!("Inference failed: {text}"));
-        }
-
-        let result: CompletionResponse = resp.json().await
-            .map_err(|e| format!("Failed to parse response: {e}"))?;
-
-        Ok(InferenceResult {
-            content: result.content,
-            model: self.config.model_name.clone(),
-            prompt_tokens: result.tokens_evaluated.unwrap_or(0),
-            completion_tokens: result.tokens_predicted.unwrap_or(0),
+            prompt_tokens: result
+                .usage
+                .as_ref()
+                .and_then(|u| u.prompt_tokens)
+                .unwrap_or(0),
+            completion_tokens: result
+                .usage
+                .as_ref()
+                .and_then(|u| u.completion_tokens)
+                .unwrap_or(0),
         })
     }
 }
@@ -259,8 +228,7 @@ pub fn find_available_port(preferred: u16) -> u16 {
         }
     }
     // Bind to port 0 to let the OS assign a random available port
-    let listener = std::net::TcpListener::bind("127.0.0.1:0")
-        .expect("Failed to bind to any port");
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("Failed to bind to any port");
     listener.local_addr().unwrap().port()
 }
 
@@ -282,4 +250,3 @@ fn find_llama_server() -> Result<String, String> {
         "llama-server not found. Install llama.cpp:\n  brew install llama.cpp\n  # or build from source: https://github.com/ggerganov/llama.cpp".to_string()
     )
 }
-

@@ -33,16 +33,18 @@ pub fn load_config(config_dir: &Path) -> Result<NodeConfig, String> {
     let path = config_path(config_dir);
     if !path.exists() {
         return Err(format!(
-            "Node not initialized. Run `sgl-node init` first.\nExpected config at: {}",
+            "Node not initialized. Run `sgl init` first.\nExpected config at: {}",
             path.display()
         ));
     }
 
-    let contents = std::fs::read_to_string(&path)
-        .map_err(|e| format!("Failed to read config: {e}"))?;
+    // node.json holds the auth_token — keep it owner-only (tighten if loosened).
+    crate::crypto::check_file_permissions(&path)?;
 
-    serde_json::from_str(&contents)
-        .map_err(|e| format!("Failed to parse config: {e}"))
+    let contents =
+        std::fs::read_to_string(&path).map_err(|e| format!("Failed to read config: {e}"))?;
+
+    serde_json::from_str(&contents).map_err(|e| format!("Failed to parse config: {e}"))
 }
 
 pub fn save_config(config_dir: &Path, config: &NodeConfig) -> Result<(), String> {

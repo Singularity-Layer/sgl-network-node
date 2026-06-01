@@ -5,6 +5,42 @@ use std::time::Duration;
 
 use crate::tee::TeeCapabilities;
 
+/// Percent-encode a value used as a single URL path segment. node_id/job_id come
+/// from the orchestrator, but we never want a stray '/', '?', or '#' to silently
+/// reshape the request path.
+/// True only if the URL's HOST (not a substring) is loopback. Parses the authority
+/// so `http://localhost.evil.test` or `http://x/?u=localhost` are NOT treated as local.
+fn is_loopback_url(url: &str) -> bool {
+    let after = match url.split_once("://") {
+        Some((_, rest)) => rest,
+        None => return false,
+    };
+    // authority = up to the first '/', '?', or '#'
+    let authority = after.split(['/', '?', '#']).next().unwrap_or("");
+    // strip any userinfo ("user:pass@")
+    let host_port = authority.rsplit('@').next().unwrap_or(authority);
+    // strip port, handling bracketed IPv6 ([::1]:port)
+    let host = if let Some(rest) = host_port.strip_prefix('[') {
+        rest.split(']').next().unwrap_or("")
+    } else {
+        host_port.split(':').next().unwrap_or("")
+    };
+    host == "localhost" || host == "127.0.0.1" || host == "::1"
+}
+
+fn enc_seg(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for &b in s.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
 pub struct OrchestratorClient {
     client: Client,
     base_url: String,
@@ -39,7 +75,9 @@ pub struct DeviceStartResponse {
     pub expires_in: u64,
 }
 
-fn default_interval() -> u64 { 3 }
+fn default_interval() -> u64 {
+    3
+}
 
 #[derive(Serialize)]
 struct DevicePollRequest {
@@ -84,6 +122,7 @@ pub struct HeartbeatResponse {
 pub struct PendingJob {
     pub id: String,
     pub job_type: String,
+    #[allow(dead_code)] // part of the dispatch payload; model selection is server-side
     pub model: Option<String>,
     pub input_payload: Option<serde_json::Value>,
 }
@@ -143,6 +182,14 @@ struct ErrorBody {
 
 impl OrchestratorClient {
     pub fn new(base_url: &str, auth_token: Option<String>) -> Self {
+        // Refuse to send the node auth token over plaintext: require https except
+        // for an explicit loopback HOST (local dev). Fail fast on a misconfigured URL.
+        if !base_url.starts_with("https://") && !is_loopback_url(base_url) {
+            panic!(
+                "Refusing insecure orchestrator URL '{base_url}': use https:// \
+                 (only http://localhost is allowed for local dev)."
+            );
+        }
         let client = Client::builder()
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(30))
@@ -155,6 +202,30 @@ impl OrchestratorClient {
         }
     }
 
+    /// Read a response body with a hard byte cap, streaming chunk-by-chunk so an
+    /// unbounded/chunked (no Content-Length) hostile response can't exhaust memory.
+    async fn read_body_capped(mut resp: reqwest::Response) -> Result<Vec<u8>, String> {
+        const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024; // 8 MiB
+                                                           // Reject early if the advertised length is already too large.
+        if let Some(len) = resp.content_length() {
+            if len as usize > MAX_RESPONSE_BYTES {
+                return Err(format!("orchestrator response too large ({len} bytes)"));
+            }
+        }
+        let mut buf: Vec<u8> = Vec::new();
+        while let Some(chunk) = resp
+            .chunk()
+            .await
+            .map_err(|e| format!("response read failed: {e}"))?
+        {
+            if buf.len() + chunk.len() > MAX_RESPONSE_BYTES {
+                return Err("orchestrator response exceeded maximum size".to_string());
+            }
+            buf.extend_from_slice(&chunk);
+        }
+        Ok(buf)
+    }
+
     pub fn update_auth_token(&self, token: String) {
         let mut guard = self.auth_token.write().unwrap();
         *guard = Some(token);
@@ -162,7 +233,9 @@ impl OrchestratorClient {
 
     fn get_token(&self) -> Result<String, String> {
         let guard = self.auth_token.read().unwrap();
-        guard.clone().ok_or_else(|| "No auth token configured".to_string())
+        guard
+            .clone()
+            .ok_or_else(|| "No auth token configured".to_string())
     }
 
     pub async fn register(
@@ -222,9 +295,14 @@ impl OrchestratorClient {
             .map_err(|e| format!("device/start failed: {e}"))?;
         if !resp.status().is_success() {
             let s = resp.status();
-            return Err(format!("device/start failed ({s}): {}", resp.text().await.unwrap_or_default()));
+            return Err(format!(
+                "device/start failed ({s}): {}",
+                resp.text().await.unwrap_or_default()
+            ));
         }
-        resp.json::<DeviceStartResponse>().await.map_err(|e| format!("Failed to parse device/start: {e}"))
+        resp.json::<DeviceStartResponse>()
+            .await
+            .map_err(|e| format!("Failed to parse device/start: {e}"))
     }
 
     /// Poll a device-authorization session for approval.
@@ -233,15 +311,22 @@ impl OrchestratorClient {
         let resp = self
             .client
             .post(&url)
-            .json(&DevicePollRequest { device_code: device_code.to_string() })
+            .json(&DevicePollRequest {
+                device_code: device_code.to_string(),
+            })
             .send()
             .await
             .map_err(|e| format!("device/poll failed: {e}"))?;
         if !resp.status().is_success() {
             let s = resp.status();
-            return Err(format!("device/poll failed ({s}): {}", resp.text().await.unwrap_or_default()));
+            return Err(format!(
+                "device/poll failed ({s}): {}",
+                resp.text().await.unwrap_or_default()
+            ));
         }
-        resp.json::<DevicePollResponse>().await.map_err(|e| format!("Failed to parse device/poll: {e}"))
+        resp.json::<DevicePollResponse>()
+            .await
+            .map_err(|e| format!("Failed to parse device/poll: {e}"))
     }
 
     pub async fn heartbeat(
@@ -276,13 +361,17 @@ impl OrchestratorClient {
             return Err(format!("Heartbeat failed ({status}): {text}"));
         }
 
-        resp.json::<HeartbeatResponse>()
-            .await
+        let body = Self::read_body_capped(resp).await?;
+        serde_json::from_slice::<HeartbeatResponse>(&body)
             .map_err(|e| format!("Failed to parse heartbeat response: {e}"))
     }
 
     pub async fn request_challenge(&self, node_id: &str) -> Result<ChallengeResponse, String> {
-        let url = format!("{}/grid/nodes/{}/challenge", self.base_url, node_id);
+        let url = format!(
+            "{}/grid/nodes/{}/challenge",
+            self.base_url,
+            enc_seg(node_id)
+        );
         let token = self.get_token()?;
 
         let resp = self
@@ -313,7 +402,8 @@ impl OrchestratorClient {
     ) -> Result<AttestationResponse, String> {
         let url = format!(
             "{}/grid/nodes/{}/verify-attestation",
-            self.base_url, node_id
+            self.base_url,
+            enc_seg(node_id)
         );
         let token = self.get_token()?;
 
@@ -343,11 +433,8 @@ impl OrchestratorClient {
             .map_err(|e| format!("Failed to parse attestation response: {e}"))
     }
 
-    pub async fn get_node_status(
-        &self,
-        node_id: &str,
-    ) -> Result<NodeStatusResponse, String> {
-        let url = format!("{}/grid/nodes/{}", self.base_url, node_id);
+    pub async fn get_node_status(&self, node_id: &str) -> Result<NodeStatusResponse, String> {
+        let url = format!("{}/grid/nodes/{}", self.base_url, enc_seg(node_id));
         let token = self.get_token()?;
 
         let resp = self
@@ -373,8 +460,13 @@ impl OrchestratorClient {
         &self,
         job_id: &str,
         result: &serde_json::Value,
+        envelope_signature: Option<String>,
     ) -> Result<(), String> {
-        let body = serde_json::json!({ "encrypted_result": result.to_string() });
+        let mut body = serde_json::json!({ "encrypted_result": result.to_string() });
+        if let Some(sig) = envelope_signature {
+            body["result_envelope_signature"] = serde_json::Value::String(sig);
+            body["result_envelope_version"] = serde_json::Value::String("v1".to_string());
+        }
         self.post_complete(job_id, body).await
     }
 
@@ -384,16 +476,21 @@ impl OrchestratorClient {
         job_id: &str,
         sealed_result: serde_json::Value,
         usage: Option<serde_json::Value>,
-        result_signature: Option<String>,
+        envelope_signature: Option<String>,
     ) -> Result<(), String> {
         let mut body = serde_json::json!({ "sealed_result": sealed_result });
-        if let Some(u) = usage { body["usage"] = u; }
-        if let Some(sig) = result_signature { body["result_signature"] = serde_json::Value::String(sig); }
+        if let Some(u) = usage {
+            body["usage"] = u;
+        }
+        if let Some(sig) = envelope_signature {
+            body["result_envelope_signature"] = serde_json::Value::String(sig);
+            body["result_envelope_version"] = serde_json::Value::String("v1".to_string());
+        }
         self.post_complete(job_id, body).await
     }
 
     async fn post_complete(&self, job_id: &str, body: serde_json::Value) -> Result<(), String> {
-        let url = format!("{}/grid/jobs/{}/complete", self.base_url, job_id);
+        let url = format!("{}/grid/jobs/{}/complete", self.base_url, enc_seg(job_id));
         let token = self.get_token()?;
 
         let resp = self
@@ -415,7 +512,7 @@ impl OrchestratorClient {
     }
 
     pub async fn fail_job(&self, job_id: &str, reason: &str) -> Result<(), String> {
-        let url = format!("{}/grid/jobs/{}/fail", self.base_url, job_id);
+        let url = format!("{}/grid/jobs/{}/fail", self.base_url, enc_seg(job_id));
         let token = self.get_token()?;
 
         let body = serde_json::json!({ "reason": reason });

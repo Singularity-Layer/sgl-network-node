@@ -31,8 +31,13 @@ impl ResourceConfig {
             .map(|p| p.get() as u32)
             .unwrap_or(4);
 
-        let computed_threads = ((total_cpus as f64 * resource_percent as f64 / 100.0).ceil() as u32).max(1);
-        let computed_gpu_layers = if resource_percent >= 50 { 99 } else { (99.0 * resource_percent as f64 / 100.0).round() as u32 };
+        let computed_threads =
+            ((total_cpus as f64 * resource_percent as f64 / 100.0).ceil() as u32).max(1);
+        let computed_gpu_layers = if resource_percent >= 50 {
+            99
+        } else {
+            (99.0 * resource_percent as f64 / 100.0).round() as u32
+        };
 
         Self {
             threads: threads.unwrap_or(computed_threads),
@@ -112,7 +117,10 @@ pub async fn login(
 ) -> Result<(), String> {
     let cfg_path = config::config_path(config_dir);
     if cfg_path.exists() {
-        return Err(format!("Node already initialized. Config at: {}", cfg_path.display()));
+        return Err(format!(
+            "Node already initialized. Config at: {}",
+            cfg_path.display()
+        ));
     }
 
     let caps = tee::detect();
@@ -128,11 +136,21 @@ pub async fn login(
     let session = client.device_start().await?;
 
     println!("\n  Open to link this node:\n      {}\n  Approve with your staked Solana wallet (code: {}).\n", session.verify_url, session.user_code);
-    let opener = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
-    let _ = std::process::Command::new(opener).arg(&session.verify_url).spawn();
+    let opener = if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    };
+    let _ = std::process::Command::new(opener)
+        .arg(&session.verify_url)
+        .spawn();
 
     let interval = session.interval.max(2);
-    let max_polls = if session.expires_in > 0 { (session.expires_in / interval) + 2 } else { 200 };
+    let max_polls = if session.expires_in > 0 {
+        (session.expires_in / interval) + 2
+    } else {
+        200
+    };
     tracing::info!("Waiting for approval in the browser...");
 
     let mut reg_code: Option<String> = None;
@@ -140,8 +158,14 @@ pub async fn login(
     for _ in 0..max_polls {
         tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
         match client.device_poll(&session.device_code).await {
-            Ok(p) if p.status == "approved" => { reg_code = p.registration_code; wallet = p.wallet_address; break; }
-            Ok(p) if p.status == "expired" => return Err("Login session expired. Run `sgl login` again.".to_string()),
+            Ok(p) if p.status == "approved" => {
+                reg_code = p.registration_code;
+                wallet = p.wallet_address;
+                break;
+            }
+            Ok(p) if p.status == "expired" => {
+                return Err("Login session expired. Run `sgl login` again.".to_string())
+            }
             Ok(_) => {}
             Err(e) => tracing::warn!("poll error (retrying): {e}"),
         }
@@ -152,7 +176,14 @@ pub async fn login(
     tracing::info!("Approved by wallet {wallet}. Registering node...");
 
     let registration = client
-        .register(&wallet, Some(&reg_code), tee_type, models, &public_key, &caps)
+        .register(
+            &wallet,
+            Some(&reg_code),
+            tee_type,
+            models,
+            &public_key,
+            &caps,
+        )
         .await?;
 
     let node_config = NodeConfig {
@@ -164,7 +195,10 @@ pub async fn login(
         keypair_path: kp_path.to_string_lossy().to_string(),
     };
     config::save_config(config_dir, &node_config)?;
-    tracing::info!("Linked! Node ID: {}. Run `sgl attest`, then `sgl start --model-path <model.gguf>`.", node_config.node_id);
+    tracing::info!(
+        "Linked! Node ID: {}. Run `sgl attest`, then `sgl start --model-path <model.gguf>`.",
+        node_config.node_id
+    );
     Ok(())
 }
 
@@ -179,13 +213,20 @@ pub async fn start(
     let cfg = config::load_config(config_dir)?;
     let keypair = NodeKeypair::load(&config::keypair_path(config_dir))?;
 
-    let client = Arc::new(OrchestratorClient::new(orchestrator_url, Some(cfg.auth_token.clone())));
+    let client = Arc::new(OrchestratorClient::new(
+        orchestrator_url,
+        Some(cfg.auth_token.clone()),
+    ));
 
     let total_cpus = std::thread::available_parallelism()
         .map(|p| p.get() as u32)
         .unwrap_or(4);
 
-    tracing::info!("Starting node {} (wallet: {})", cfg.node_id, cfg.wallet_address);
+    tracing::info!(
+        "Starting node {} (wallet: {})",
+        cfg.node_id,
+        cfg.wallet_address
+    );
     tracing::info!("Public key: {}", keypair.public_key_bs58());
     tracing::info!("Resource config:");
     tracing::info!("  Preset:       {}%", rc.resource_percent);
@@ -199,14 +240,12 @@ pub async fn start(
     let mut models: Vec<String> = vec![];
 
     if let Some(path) = model_path {
-        let name = model_name
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| {
-                Path::new(path)
-                    .file_stem()
-                    .map(|s| s.to_string_lossy().to_string())
-                    .unwrap_or_else(|| "unknown".to_string())
-            });
+        let name = model_name.map(|s| s.to_string()).unwrap_or_else(|| {
+            Path::new(path)
+                .file_stem()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|| "unknown".to_string())
+        });
 
         tracing::info!("Loading model: {name} from {path}");
         let eng_config = InferenceEngineConfig {
@@ -234,15 +273,22 @@ pub async fn start(
     // Node's X25519 encryption key (derived from its ed25519 seed). Published on
     // every REST heartbeat so the orchestrator can seal prompts to it (E2E).
     let node_secret = keypair.signing_key.to_bytes();
-    let node_enc_pubkey = crate::encryption::EncryptionKeypair::from_ed25519_seed(
-        &node_secret,
-    ).public_key_bs58();
+    let node_enc_pubkey =
+        crate::encryption::EncryptionKeypair::from_ed25519_seed(&node_secret).public_key_bs58();
     tracing::info!("X25519 encryption key: {node_enc_pubkey}");
 
     let active_jobs = Arc::new(std::sync::atomic::AtomicU32::new(0));
 
     loop {
-        match client.heartbeat(&cfg.node_id, &models, rc.load_factor(), Some(&node_enc_pubkey)).await {
+        match client
+            .heartbeat(
+                &cfg.node_id,
+                &models,
+                rc.load_factor(),
+                Some(&node_enc_pubkey),
+            )
+            .await
+        {
             Ok(resp) => {
                 tracing::debug!("Heartbeat OK — status: {}", resp.status);
 
@@ -255,8 +301,10 @@ pub async fn start(
                         tracing::error!("Failed to save rotated token: {e}");
                     } else {
                         client.update_auth_token(new_token.clone());
-                        tracing::info!("New token saved (expires: {})",
-                            resp.token_expires_at.as_deref().unwrap_or("unknown"));
+                        tracing::info!(
+                            "New token saved (expires: {})",
+                            resp.token_expires_at.as_deref().unwrap_or("unknown")
+                        );
                     }
                 }
 
@@ -264,7 +312,12 @@ pub async fn start(
                 for job in resp.pending_jobs {
                     let current = active_jobs.load(std::sync::atomic::Ordering::Relaxed);
                     if current >= rc.max_jobs {
-                        tracing::warn!("At max concurrent jobs ({}/{}), deferring job {}", current, rc.max_jobs, job.id);
+                        tracing::warn!(
+                            "At max concurrent jobs ({}/{}), deferring job {}",
+                            current,
+                            rc.max_jobs,
+                            job.id
+                        );
                         break;
                     }
 
@@ -343,7 +396,8 @@ pub async fn attest(config_dir: &Path, orchestrator_url: &str) -> Result<(), Str
     let expiry = match challenge.expires_at.as_deref() {
         Some(at) => at,
         None => {
-            expiry_owned = challenge.expires_in_seconds
+            expiry_owned = challenge
+                .expires_in_seconds
                 .map(|s| format!("{s}s"))
                 .unwrap_or_else(|| "unknown".to_string());
             &expiry_owned
@@ -355,7 +409,11 @@ pub async fn attest(config_dir: &Path, orchestrator_url: &str) -> Result<(), Str
     // orchestrator gates on SIP + binary-hash allowlist before activating.
     let report = crate::tee::generate_attestation_report();
     let report_hash = report.report_hash.clone();
-    tracing::info!("Hardware report: sip_enabled={}, binary_hash={}…", report.sip_enabled, &report.binary_hash[..report.binary_hash.len().min(12)]);
+    tracing::info!(
+        "Hardware report: sip_enabled={}, binary_hash={}…",
+        report.sip_enabled,
+        &report.binary_hash[..report.binary_hash.len().min(12)]
+    );
 
     // Sign the plain challenge (proves key ownership). The hardware report is
     // delivered over the authenticated node session and gated server-side.
@@ -365,15 +423,19 @@ pub async fn attest(config_dir: &Path, orchestrator_url: &str) -> Result<(), Str
 
     // Derive the node's X25519 encryption key (for E2E-encrypted prompts) from
     // the same ed25519 seed and publish it during attestation.
-    let enc_keypair = crate::encryption::EncryptionKeypair::from_ed25519_seed(
-        &keypair.signing_key.to_bytes(),
-    );
+    let enc_keypair =
+        crate::encryption::EncryptionKeypair::from_ed25519_seed(&keypair.signing_key.to_bytes());
     let encryption_public_key = enc_keypair.public_key_bs58();
     tracing::info!("Publishing X25519 encryption key: {encryption_public_key}");
 
     let report_json = serde_json::to_value(&report).ok();
     let result = client
-        .verify_attestation(&cfg.node_id, &signature, Some(encryption_public_key), report_json)
+        .verify_attestation(
+            &cfg.node_id,
+            &signature,
+            Some(encryption_public_key),
+            report_json,
+        )
         .await?;
 
     if result.verified {
@@ -396,18 +458,22 @@ async fn process_job(
     // If the prompt is sealed (E2E), decrypt it with the node's X25519 key and
     // remember the caller's response key so we can seal the reply back.
     let mut response_pubkey: Option<[u8; 32]> = None;
+    let mut enc_version = crate::encryption::EncVersion::V1;
     let mut effective_job = job.clone();
     if let Some(payload) = &job.input_payload {
         match crate::encryption::unseal_input(payload, node_secret) {
-            Ok((inner, resp)) => {
+            Ok((inner, resp, version)) => {
                 response_pubkey = resp;
+                enc_version = version;
                 if resp.is_some() {
                     effective_job.input_payload = Some(inner);
                 }
             }
             Err(e) => {
                 tracing::error!("Failed to unseal job {}: {e}", job.id);
-                let _ = client.fail_job(&job.id, &format!("decrypt failed: {e}")).await;
+                let _ = client
+                    .fail_job(&job.id, &format!("decrypt failed: {e}"))
+                    .await;
                 return;
             }
         }
@@ -427,14 +493,38 @@ async fn process_job(
                 // ── E2E: seal the result to the caller's response key ──
                 let result_bytes = output.to_string();
                 let usage = output.get("usage").cloned();
-                match crate::encryption::encrypt_for_recipient(&resp_pub, result_bytes.as_bytes()) {
+                // Reply in the SAME version the caller used (v2 = HKDF + AAD).
+                let sealed = if enc_version == crate::encryption::EncVersion::V2 {
+                    crate::encryption::encrypt_for_recipient_v2(&resp_pub, result_bytes.as_bytes())
+                } else {
+                    crate::encryption::encrypt_for_recipient(&resp_pub, result_bytes.as_bytes())
+                };
+                let algo = if enc_version == crate::encryption::EncVersion::V2 {
+                    crate::encryption::ALGO_V2
+                } else {
+                    "x25519-xchacha20poly1305"
+                };
+                match sealed {
                     Ok((sealed, ephemeral_pub)) => {
+                        let ciphertext_b58 = bs58::encode(&sealed).into_string();
+                        // Sign an envelope over the *public* ciphertext + job id so the
+                        // orchestrator can prove which node produced this result for this
+                        // job (anti-replay) without ever seeing the plaintext.
+                        let env_sig = crate::crypto::sign_result_envelope(
+                            node_secret,
+                            &job.id,
+                            "sealed",
+                            ciphertext_b58.as_bytes(),
+                        );
                         let sealed_result = serde_json::json!({
-                            "ciphertext": bs58::encode(&sealed).into_string(),
+                            "ciphertext": ciphertext_b58,
                             "ephemeral_public_key": bs58::encode(ephemeral_pub).into_string(),
-                            "algorithm": "x25519-xchacha20poly1305",
+                            "algorithm": algo,
                         });
-                        if let Err(e) = client.complete_job_sealed(&job.id, sealed_result, usage, None).await {
+                        if let Err(e) = client
+                            .complete_job_sealed(&job.id, sealed_result, usage, Some(env_sig))
+                            .await
+                        {
                             tracing::error!("Failed to report sealed completion: {e}");
                         } else {
                             tracing::info!("Job {} completed (E2E sealed, REST)", job.id);
@@ -445,10 +535,19 @@ async fn process_job(
                         let _ = client.fail_job(&job.id, &format!("seal failed: {e}")).await;
                     }
                 }
-            } else if let Err(e) = client.complete_job(&job.id, &output).await {
-                tracing::error!("Failed to report job completion: {e}");
             } else {
-                tracing::info!("Job {} completed", job.id);
+                let result_str = output.to_string();
+                let env_sig = crate::crypto::sign_result_envelope(
+                    node_secret,
+                    &job.id,
+                    "plain",
+                    result_str.as_bytes(),
+                );
+                if let Err(e) = client.complete_job(&job.id, &output, Some(env_sig)).await {
+                    tracing::error!("Failed to report job completion: {e}");
+                } else {
+                    tracing::info!("Job {} completed", job.id);
+                }
             }
         }
         Err(reason) => {
@@ -465,30 +564,60 @@ async fn execute_inference(
     engine: &Option<Arc<InferenceEngine>>,
     job: &PendingJob,
 ) -> Result<serde_json::Value, String> {
-    let engine = engine.as_ref().ok_or("No inference engine configured — start with --model-path")?;
+    let engine = engine
+        .as_ref()
+        .ok_or("No inference engine configured — start with --model-path")?;
 
-    let payload = job.input_payload.as_ref().ok_or("Job has no input payload")?;
+    let payload = job
+        .input_payload
+        .as_ref()
+        .ok_or("Job has no input payload")?;
 
     let messages: Vec<ChatMessage> = if let Some(msgs) = payload.get("messages") {
-        serde_json::from_value(msgs.clone())
-            .map_err(|e| format!("Invalid messages format: {e}"))?
+        serde_json::from_value(msgs.clone()).map_err(|e| format!("Invalid messages format: {e}"))?
     } else if let Some(prompt) = payload.get("prompt").and_then(|p| p.as_str()) {
-        vec![ChatMessage { role: "user".to_string(), content: prompt.to_string() }]
+        vec![ChatMessage {
+            role: "user".to_string(),
+            content: prompt.to_string(),
+        }]
     } else {
         return Err("Payload must contain 'messages' array or 'prompt' string".to_string());
     };
 
-    let temperature = payload.get("temperature")
+    // Bound untrusted input before handing it to the inference server.
+    const MAX_MESSAGES: usize = 256;
+    const MAX_TOTAL_PROMPT_BYTES: usize = 4 * 1024 * 1024; // 4 MiB
+    if messages.len() > MAX_MESSAGES {
+        return Err(format!(
+            "too many messages ({} > {MAX_MESSAGES})",
+            messages.len()
+        ));
+    }
+    let total_bytes: usize = messages
+        .iter()
+        .map(|m| m.content.len() + m.role.len())
+        .sum();
+    if total_bytes > MAX_TOTAL_PROMPT_BYTES {
+        return Err(format!(
+            "prompt too large ({total_bytes} bytes > {MAX_TOTAL_PROMPT_BYTES})"
+        ));
+    }
+
+    let temperature = payload
+        .get("temperature")
         .and_then(|t| t.as_f64())
         .unwrap_or(0.7)
         .clamp(0.0, 2.0);
 
-    let max_tokens = payload.get("max_tokens")
+    let max_tokens = payload
+        .get("max_tokens")
         .and_then(|t| t.as_i64())
         .unwrap_or(2048)
         .clamp(1, 8192) as i32;
 
-    let result = engine.chat_completion(messages, temperature, max_tokens).await?;
+    let result = engine
+        .chat_completion(messages, temperature, max_tokens)
+        .await?;
 
     Ok(serde_json::json!({
         "content": result.content,

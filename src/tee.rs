@@ -1,5 +1,5 @@
 use serde::Serialize;
-use sha2::{Sha256, Digest};
+use sha2::{Digest, Sha256};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct TeeCapabilities {
@@ -60,7 +60,11 @@ pub fn detect() -> TeeCapabilities {
     let metal = detect_metal();
 
     TeeCapabilities {
-        tee_type: if secure_enclave { "apple_se".to_string() } else { "none".to_string() },
+        tee_type: if secure_enclave {
+            "apple_se".to_string()
+        } else {
+            "none".to_string()
+        },
         secure_enclave_available: secure_enclave,
         chip,
         cpu_cores,
@@ -104,7 +108,10 @@ pub fn generate_attestation_report() -> HardwareAttestationReport {
 /// sha256 of the currently-running sgl binary. The orchestrator can require
 /// this to be on an allowlist of known-hardened builds.
 fn detect_binary_hash() -> String {
-    match std::env::current_exe().ok().and_then(|p| std::fs::read(p).ok()) {
+    match std::env::current_exe()
+        .ok()
+        .and_then(|p| std::fs::read(p).ok())
+    {
         Some(bytes) => {
             let mut hasher = Sha256::new();
             hasher.update(&bytes);
@@ -116,19 +123,25 @@ fn detect_binary_hash() -> String {
 
 fn detect_memory_gb() -> f64 {
     let s = run_cmd("sysctl", &["-n", "hw.memsize"]);
-    s.parse::<u64>().map(|b| b as f64 / (1024.0 * 1024.0 * 1024.0)).unwrap_or(16.0)
+    s.parse::<u64>()
+        .map(|b| b as f64 / (1024.0 * 1024.0 * 1024.0))
+        .unwrap_or(16.0)
 }
 
 fn detect_chip_name() -> String {
     let s = run_cmd("sysctl", &["-n", "machdep.cpu.brand_string"]);
-    if s.is_empty() { "Apple Silicon".to_string() } else { s }
+    if s.is_empty() {
+        "Apple Silicon".to_string()
+    } else {
+        s
+    }
 }
 
 fn detect_secure_enclave() -> bool {
     #[cfg(target_os = "macos")]
     {
         let text = run_cmd("ioreg", &["-l", "-p", "IODeviceTree"]);
-        return text.contains("AppleSEP") || text.contains("sep");
+        text.contains("AppleSEP") || text.contains("sep")
     }
     #[cfg(not(target_os = "macos"))]
     false
@@ -138,7 +151,7 @@ fn detect_metal() -> bool {
     #[cfg(target_os = "macos")]
     {
         let text = run_cmd("system_profiler", &["SPDisplaysDataType"]);
-        return text.contains("Metal");
+        text.contains("Metal")
     }
     #[cfg(not(target_os = "macos"))]
     false
@@ -148,7 +161,7 @@ fn detect_sip_status() -> bool {
     #[cfg(target_os = "macos")]
     {
         let text = run_cmd("csrutil", &["status"]);
-        return text.contains("enabled");
+        text.contains("enabled")
     }
     #[cfg(not(target_os = "macos"))]
     false
@@ -157,7 +170,7 @@ fn detect_sip_status() -> bool {
 fn detect_boot_uuid() -> String {
     #[cfg(target_os = "macos")]
     {
-        return run_cmd("sysctl", &["-n", "kern.bootsessionuuid"]);
+        run_cmd("sysctl", &["-n", "kern.bootsessionuuid"])
     }
     #[cfg(not(target_os = "macos"))]
     String::new()
@@ -175,7 +188,7 @@ fn detect_hardware_uuid() -> String {
                 }
             }
         }
-        return String::new();
+        String::new()
     }
     #[cfg(not(target_os = "macos"))]
     String::new()
@@ -187,13 +200,15 @@ fn detect_firmware_version() -> String {
         let text = run_cmd("system_profiler", &["SPHardwareDataType"]);
         for line in text.lines() {
             let trimmed = line.trim();
-            if trimmed.starts_with("System Firmware Version:") || trimmed.starts_with("OS Loader Version:") {
+            if trimmed.starts_with("System Firmware Version:")
+                || trimmed.starts_with("OS Loader Version:")
+            {
                 if let Some(val) = trimmed.split(':').nth(1) {
                     return val.trim().to_string();
                 }
             }
         }
-        return run_cmd("sysctl", &["-n", "kern.osversion"]);
+        run_cmd("sysctl", &["-n", "kern.osversion"])
     }
     #[cfg(not(target_os = "macos"))]
     String::new()
@@ -214,7 +229,7 @@ fn detect_serial_hash() -> String {
                 }
             }
         }
-        return String::new();
+        String::new()
     }
     #[cfg(not(target_os = "macos"))]
     String::new()
@@ -233,7 +248,17 @@ pub fn print_capabilities(caps: &TeeCapabilities) {
     println!("CPU cores:        {}", caps.cpu_cores);
     println!("Memory:           {:.1} GB", caps.memory_gb);
     println!("GPU:              {}", caps.gpu);
-    println!("Metal:            {}", if caps.metal_support { "Yes" } else { "No" });
-    println!("Secure Enclave:   {}", if caps.secure_enclave_available { "Available" } else { "Not detected" });
+    println!(
+        "Metal:            {}",
+        if caps.metal_support { "Yes" } else { "No" }
+    );
+    println!(
+        "Secure Enclave:   {}",
+        if caps.secure_enclave_available {
+            "Available"
+        } else {
+            "Not detected"
+        }
+    );
     println!("TEE type:         {}", caps.tee_type);
 }

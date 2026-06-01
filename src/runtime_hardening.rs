@@ -4,11 +4,15 @@ pub fn deny_debugger_attach() {
     #[cfg(target_os = "macos")]
     {
         const PT_DENY_ATTACH: libc::c_int = 31;
-        let result = unsafe { libc::ptrace(PT_DENY_ATTACH, 0, std::ptr::null_mut::<libc::c_char>(), 0) };
+        let result =
+            unsafe { libc::ptrace(PT_DENY_ATTACH, 0, std::ptr::null_mut::<libc::c_char>(), 0) };
         if result == 0 {
             tracing::debug!("Runtime hardening: PT_DENY_ATTACH enabled");
         } else {
-            tracing::warn!("Runtime hardening: PT_DENY_ATTACH failed (errno: {})", std::io::Error::last_os_error());
+            tracing::warn!(
+                "Runtime hardening: PT_DENY_ATTACH failed (errno: {})",
+                std::io::Error::last_os_error()
+            );
         }
     }
 

@@ -61,7 +61,8 @@ fn current_exe() -> Result<String, String> {
 
 fn log_path() -> Result<String, String> {
     let home = dirs::home_dir().ok_or("Cannot resolve home directory")?;
-    Ok(home.join("Library/Logs/sgl-node.log")
+    Ok(home
+        .join("Library/Logs/sgl-node.log")
         .to_str()
         .unwrap_or("/tmp/sgl-node.log")
         .to_string())
@@ -79,7 +80,10 @@ pub fn install(opts: &ServiceStartOptions) -> Result<(), String> {
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         let _ = opts;
-        Err("Service install is only supported on macOS and Linux. Run `sgl start ...` manually.".to_string())
+        Err(
+            "Service install is only supported on macOS and Linux. Run `sgl start ...` manually."
+                .to_string(),
+        )
     }
 }
 
@@ -118,7 +122,9 @@ pub fn status() -> Result<(), String> {
 #[cfg(target_os = "macos")]
 fn plist_path() -> Result<std::path::PathBuf, String> {
     let home = dirs::home_dir().ok_or("Cannot resolve home directory")?;
-    Ok(home.join("Library/LaunchAgents").join(format!("{SERVICE_LABEL}.plist")))
+    Ok(home
+        .join("Library/LaunchAgents")
+        .join(format!("{SERVICE_LABEL}.plist")))
 }
 
 #[cfg(target_os = "macos")]
@@ -192,8 +198,7 @@ fn install_macos(opts: &ServiceStartOptions) -> Result<(), String> {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("Failed to create LaunchAgents dir: {e}"))?;
     }
-    std::fs::write(&plist, plist_body)
-        .map_err(|e| format!("Failed to write plist: {e}"))?;
+    std::fs::write(&plist, plist_body).map_err(|e| format!("Failed to write plist: {e}"))?;
 
     let uid = unsafe { libc::getuid() };
     let domain = format!("gui/{uid}");
@@ -248,8 +253,11 @@ fn status_macos() -> Result<(), String> {
         Ok(out) => {
             for line in out.lines() {
                 let t = line.trim();
-                if t.starts_with("state =") || t.starts_with("pid =")
-                    || t.starts_with("last exit code =") || t.starts_with("runs =") {
+                if t.starts_with("state =")
+                    || t.starts_with("pid =")
+                    || t.starts_with("last exit code =")
+                    || t.starts_with("runs =")
+                {
                     println!("  {t}");
                 }
             }
@@ -264,7 +272,9 @@ fn status_macos() -> Result<(), String> {
 #[cfg(target_os = "linux")]
 fn unit_path() -> Result<std::path::PathBuf, String> {
     let home = dirs::home_dir().ok_or("Cannot resolve home directory")?;
-    Ok(home.join(".config/systemd/user").join(format!("{SERVICE_LABEL}.service")))
+    Ok(home
+        .join(".config/systemd/user")
+        .join(format!("{SERVICE_LABEL}.service")))
 }
 
 #[cfg(target_os = "linux")]
@@ -274,7 +284,13 @@ fn install_linux(opts: &ServiceStartOptions) -> Result<(), String> {
 
     let exec_start = std::iter::once(exe.clone())
         .chain(opts.start_args())
-        .map(|a| if a.contains(' ') { format!("\"{a}\"") } else { a })
+        .map(|a| {
+            if a.contains(' ') {
+                format!("\"{a}\"")
+            } else {
+                a
+            }
+        })
         .collect::<Vec<_>>()
         .join(" ");
 
@@ -309,13 +325,23 @@ WantedBy=default.target
 
     run("systemctl", &["--user", "daemon-reload"])
         .map_err(|e| format!("systemctl daemon-reload failed: {e}"))?;
-    run("systemctl", &["--user", "enable", "--now", &format!("{SERVICE_LABEL}.service")])
-        .map_err(|e| format!("systemctl enable --now failed: {e}"))?;
+    run(
+        "systemctl",
+        &[
+            "--user",
+            "enable",
+            "--now",
+            &format!("{SERVICE_LABEL}.service"),
+        ],
+    )
+    .map_err(|e| format!("systemctl enable --now failed: {e}"))?;
 
     println!("✅ SGL node service installed (systemd --user: {SERVICE_LABEL})");
     println!("   Unit:  {}", unit.display());
     println!("   Logs:  ~/.local/share/sgl-node/sgl-node.log");
-    println!("   Tip: run `loginctl enable-linger $USER` so it runs without an active login session.");
+    println!(
+        "   Tip: run `loginctl enable-linger $USER` so it runs without an active login session."
+    );
     println!("   Manage: sgl service status | sgl service uninstall");
     Ok(())
 }
@@ -323,7 +349,15 @@ WantedBy=default.target
 #[cfg(target_os = "linux")]
 fn uninstall_linux() -> Result<(), String> {
     let unit = unit_path()?;
-    let _ = run("systemctl", &["--user", "disable", "--now", &format!("{SERVICE_LABEL}.service")]);
+    let _ = run(
+        "systemctl",
+        &[
+            "--user",
+            "disable",
+            "--now",
+            &format!("{SERVICE_LABEL}.service"),
+        ],
+    );
     if unit.exists() {
         std::fs::remove_file(&unit).map_err(|e| format!("Failed to remove unit: {e}"))?;
     }
@@ -341,7 +375,10 @@ fn status_linux() -> Result<(), String> {
         return Ok(());
     }
     println!("SGL node service: installed ({})", unit.display());
-    match run("systemctl", &["--user", "is-active", &format!("{SERVICE_LABEL}.service")]) {
+    match run(
+        "systemctl",
+        &["--user", "is-active", &format!("{SERVICE_LABEL}.service")],
+    ) {
         Ok(out) => println!("  state = {}", out.trim()),
         Err(e) => println!("  state = unknown ({e})"),
     }

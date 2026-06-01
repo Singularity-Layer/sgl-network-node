@@ -7,13 +7,15 @@ mod orchestrator;
 mod runtime_hardening;
 mod service;
 mod tee;
-mod websocket;
 
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
-#[command(name = "sgl-node", about = "SGL Network node agent — earn $SGL by providing TEE compute")]
+#[command(
+    name = "sgl-node",
+    about = "SGL Network node agent — earn $SGL by providing confidential AI compute"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -156,7 +158,9 @@ enum ServiceAction {
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env().add_directive("sgl_node=info".parse().unwrap()))
+        .with_env_filter(
+            EnvFilter::from_default_env().add_directive("sgl_node=info".parse().unwrap()),
+        )
         .init();
 
     runtime_hardening::deny_debugger_attach();
@@ -165,12 +169,24 @@ async fn main() {
     let config_dir = config::resolve_config_dir(cli.config_dir.as_deref());
 
     match cli.command {
-        Commands::Init { wallet, tee_type, models } => {
+        Commands::Init {
+            wallet,
+            tee_type,
+            models,
+        } => {
             let models_vec: Vec<String> = models
                 .map(|m| m.split(',').map(|s| s.trim().to_string()).collect())
                 .unwrap_or_default();
 
-            if let Err(e) = node::init(&config_dir, &cli.orchestrator_url, &wallet, &tee_type, &models_vec).await {
+            if let Err(e) = node::init(
+                &config_dir,
+                &cli.orchestrator_url,
+                &wallet,
+                &tee_type,
+                &models_vec,
+            )
+            .await
+            {
                 tracing::error!("Init failed: {e}");
                 std::process::exit(1);
             }
@@ -180,19 +196,33 @@ async fn main() {
                 .map(|m| m.split(',').map(|s| s.trim().to_string()).collect())
                 .unwrap_or_default();
 
-            if let Err(e) = node::login(&config_dir, &cli.orchestrator_url, &tee_type, &models_vec).await {
+            if let Err(e) =
+                node::login(&config_dir, &cli.orchestrator_url, &tee_type, &models_vec).await
+            {
                 tracing::error!("Login failed: {e}");
                 std::process::exit(1);
             }
         }
         Commands::Start {
-            model_path, model_name, inference_port,
-            resource_percent, threads, gpu_layers, context_size,
-            max_jobs, batch_size, heartbeat_interval,
+            model_path,
+            model_name,
+            inference_port,
+            resource_percent,
+            threads,
+            gpu_layers,
+            context_size,
+            max_jobs,
+            batch_size,
+            heartbeat_interval,
         } => {
             let rc = node::ResourceConfig::from_args(
-                resource_percent, threads, gpu_layers,
-                context_size, max_jobs, batch_size, heartbeat_interval,
+                resource_percent,
+                threads,
+                gpu_layers,
+                context_size,
+                max_jobs,
+                batch_size,
+                heartbeat_interval,
             );
             if let Err(e) = node::start(
                 &config_dir,
@@ -201,7 +231,9 @@ async fn main() {
                 model_name.as_deref(),
                 inference_port,
                 &rc,
-            ).await {
+            )
+            .await
+            {
                 tracing::error!("Node stopped: {e}");
                 std::process::exit(1);
             }
@@ -225,8 +257,12 @@ async fn main() {
         Commands::Service { action } => {
             let result = match action {
                 ServiceAction::Install {
-                    model_path, model_name, resource_percent,
-                    inference_port, max_jobs, heartbeat_interval,
+                    model_path,
+                    model_name,
+                    resource_percent,
+                    inference_port,
+                    max_jobs,
+                    heartbeat_interval,
                 } => {
                     let opts = service::ServiceStartOptions {
                         model_path,

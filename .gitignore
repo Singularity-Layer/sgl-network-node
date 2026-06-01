@@ -2,3 +2,13 @@
 *.swp
 *.swo
 .DS_Store
+
+# Local keypairs / node config / secrets — NEVER commit
+*.keypair.json
+keypair.json
+node.json
+.env
+.env.*
+
+# Agent / tooling state
+.omx/
