@@ -13,7 +13,8 @@ use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
 #[command(
-    name = "sgl-node",
+    name = "sgl",
+    version,
     about = "SGL Network node agent — earn $SGL by providing confidential AI compute"
 )]
 struct Cli {

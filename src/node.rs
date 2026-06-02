@@ -439,7 +439,7 @@ pub async fn attest(config_dir: &Path, orchestrator_url: &str) -> Result<(), Str
         .await?;
 
     if result.verified {
-        tracing::info!("Attestation verified! Node status: {}", result.status);
+        println!("✅ Attestation verified — node status: {}", result.status);
     } else {
         return Err("Attestation verification failed".to_string());
     }
