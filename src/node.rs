@@ -384,6 +384,23 @@ pub async fn status(config_dir: &Path, orchestrator_url: &str) -> Result<(), Str
     Ok(())
 }
 
+/// Toggle off-grid (maintenance) mode. Off-grid removes the node from job
+/// dispatch for planned downtime — no jobs are routed to it and it isn't
+/// penalized for being offline. Tamper slashing is unaffected.
+pub async fn set_off_grid(config_dir: &Path, orchestrator_url: &str, off_grid: bool) -> Result<(), String> {
+    let cfg = config::load_config(config_dir)?;
+    let client = OrchestratorClient::new(orchestrator_url, Some(cfg.auth_token.clone()));
+    client.set_off_grid(&cfg.node_id, off_grid).await?;
+    if off_grid {
+        println!("🔌 Node is now OFF-GRID (maintenance).");
+        println!("   It won't receive new jobs and won't be penalized for being offline.");
+        println!("   Run `sgl on-grid` when you're ready to serve again.");
+    } else {
+        println!("✅ Node is back ON-GRID — eligible to receive jobs again.");
+    }
+    Ok(())
+}
+
 pub async fn attest(config_dir: &Path, orchestrator_url: &str) -> Result<(), String> {
     let cfg = config::load_config(config_dir)?;
     let keypair = NodeKeypair::load(&config::keypair_path(config_dir))?;

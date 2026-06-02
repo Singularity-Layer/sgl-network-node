@@ -393,6 +393,30 @@ impl OrchestratorClient {
             .map_err(|e| format!("Failed to parse challenge response: {e}"))
     }
 
+    /// Toggle off-grid (maintenance) mode for this node. When off-grid the node
+    /// is excluded from job dispatch (planned downtime) and is not penalized for
+    /// being offline. Tamper slashing is unaffected.
+    pub async fn set_off_grid(&self, node_id: &str, off_grid: bool) -> Result<(), String> {
+        let url = format!("{}/grid/nodes/{}/status", self.base_url, enc_seg(node_id));
+        let token = self.get_token()?;
+
+        let resp = self
+            .client
+            .post(&url)
+            .header("X-Node-Auth", token)
+            .json(&serde_json::json!({ "off_grid": off_grid }))
+            .send()
+            .await
+            .map_err(|e| format!("Status update failed: {e}"))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            return Err(format!("Status update failed ({status}): {text}"));
+        }
+        Ok(())
+    }
+
     pub async fn verify_attestation(
         &self,
         node_id: &str,

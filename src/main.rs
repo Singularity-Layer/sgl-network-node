@@ -106,6 +106,15 @@ enum Commands {
     /// Show node status, hardware capabilities, and orchestrator info
     Status,
 
+    /// Go off-grid (maintenance): stop receiving jobs without being penalized.
+    /// Use for planned downtime. Tamper slashing is unaffected.
+    #[command(name = "off-grid")]
+    OffGrid,
+
+    /// Come back on-grid: resume receiving jobs.
+    #[command(name = "on-grid")]
+    OnGrid,
+
     /// Verify attestation: sign the challenge from the orchestrator
     Attest,
 
@@ -242,6 +251,18 @@ async fn main() {
         Commands::Status => {
             if let Err(e) = node::status(&config_dir, &cli.orchestrator_url).await {
                 tracing::error!("Status check failed: {e}");
+                std::process::exit(1);
+            }
+        }
+        Commands::OffGrid => {
+            if let Err(e) = node::set_off_grid(&config_dir, &cli.orchestrator_url, true).await {
+                tracing::error!("Failed to go off-grid: {e}");
+                std::process::exit(1);
+            }
+        }
+        Commands::OnGrid => {
+            if let Err(e) = node::set_off_grid(&config_dir, &cli.orchestrator_url, false).await {
+                tracing::error!("Failed to go on-grid: {e}");
                 std::process::exit(1);
             }
         }
