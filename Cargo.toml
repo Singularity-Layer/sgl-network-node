@@ -26,3 +26,6 @@ chacha20poly1305 = "0.10"
 sha2 = "0.10"
 hkdf = "0.12"
 hex = "0.4"
+# WebSocket transport (primary dispatch + streaming; REST stays as fallback).
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+futures-util = "0.3"

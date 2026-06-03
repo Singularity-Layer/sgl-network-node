@@ -30,6 +30,52 @@ struct ChatCompletionRequest {
     stream: bool,
 }
 
+#[derive(Serialize)]
+struct ChatCompletionStreamRequest {
+    messages: Vec<ChatMessage>,
+    temperature: f64,
+    max_tokens: i32,
+    stream: bool,
+    stream_options: StreamOptions,
+}
+
+#[derive(Serialize)]
+struct StreamOptions {
+    include_usage: bool,
+}
+
+#[derive(Deserialize)]
+struct StreamChunk {
+    #[serde(default)]
+    choices: Vec<StreamChoice>,
+    #[serde(default)]
+    usage: Option<UsageInfo>,
+}
+
+#[derive(Deserialize)]
+struct StreamChoice {
+    #[serde(default)]
+    delta: StreamDelta,
+}
+
+#[derive(Deserialize, Default)]
+struct StreamDelta {
+    #[serde(default)]
+    content: Option<String>,
+}
+
+/// One event from a streaming completion: a batch of decoded text (with the
+/// number of tokens it carries, for partial billing), or the terminal marker
+/// carrying final token counts. A generation failure is signalled by the
+/// function returning `Err` WITHOUT a `Done` — never a forged terminal.
+pub enum StreamEvent {
+    Delta { text: String, tokens: u32 },
+    Done {
+        prompt_tokens: u32,
+        completion_tokens: u32,
+    },
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct ChatMessage {
     pub role: String,
@@ -204,6 +250,139 @@ impl InferenceEngine {
                 .and_then(|u| u.completion_tokens)
                 .unwrap_or(0),
         })
+    }
+
+    /// Streaming chat completion. Calls llama-server with `stream:true`, reads the
+    /// SSE response incrementally (via `resp.chunk()` — no extra deps), batches
+    /// decoded tokens, and forwards them over `tx` as `StreamEvent`s. The caller
+    /// seals each batch and relays it. Ends with a `Done` carrying token counts.
+    ///
+    /// Returns early (Ok) if the receiver is dropped — that means the consumer
+    /// (and ultimately the browser) went away, so we stop generating.
+    pub async fn chat_completion_stream(
+        &self,
+        messages: Vec<ChatMessage>,
+        temperature: f64,
+        max_tokens: i32,
+        tx: tokio::sync::mpsc::Sender<StreamEvent>,
+    ) -> Result<(), String> {
+        // Flush a batch every N decoded deltas. Keeps the POST count bounded
+        // (~tokens/N requests) while still feeling live. Time-based flushing is a
+        // later refinement; count-based is enough for current model speeds.
+        const FLUSH_EVERY: u32 = 6;
+        const MAX_SSE_BUF: usize = 2 * 1024 * 1024;
+
+        let url = format!("{}/v1/chat/completions", self.base_url);
+        let body = ChatCompletionStreamRequest {
+            messages,
+            temperature,
+            max_tokens,
+            stream: true,
+            stream_options: StreamOptions {
+                include_usage: true,
+            },
+        };
+
+        let mut resp = self
+            .client
+            .post(&url)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| format!("Inference request failed: {e}"))?;
+
+        if !resp.status().is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            return Err(format!("Inference failed: {text}"));
+        }
+
+        let mut buf: Vec<u8> = Vec::new();
+        let mut pending = String::new();
+        let mut batched: u32 = 0; // tokens accumulated in `pending`
+        let mut emitted: u32 = 0; // total content deltas seen (fallback count)
+        let mut prompt_tokens: u32 = 0;
+        let mut completion_tokens: u32 = 0;
+
+        while let Some(chunk) = resp
+            .chunk()
+            .await
+            .map_err(|e| format!("stream read failed: {e}"))?
+        {
+            if buf.len() + chunk.len() > MAX_SSE_BUF {
+                return Err("SSE buffer exceeded maximum size".to_string());
+            }
+            buf.extend_from_slice(&chunk);
+
+            // Drain complete newline-delimited lines from the buffer.
+            while let Some(nl) = buf.iter().position(|&b| b == b'\n') {
+                let line_bytes: Vec<u8> = buf.drain(..=nl).collect();
+                let line = String::from_utf8_lossy(&line_bytes);
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+                let data = match line.strip_prefix("data:") {
+                    Some(d) => d.trim(),
+                    None => continue,
+                };
+                if data == "[DONE]" {
+                    // Clean end of stream → flush the tail, then the terminal Done.
+                    if !pending.is_empty() {
+                        let _ = tx
+                            .send(StreamEvent::Delta {
+                                text: std::mem::take(&mut pending),
+                                tokens: batched,
+                            })
+                            .await;
+                    }
+                    let c = if completion_tokens > 0 { completion_tokens } else { emitted };
+                    let _ = tx
+                        .send(StreamEvent::Done {
+                            prompt_tokens,
+                            completion_tokens: c,
+                        })
+                        .await;
+                    return Ok(());
+                }
+                let parsed: StreamChunk = match serde_json::from_str(data) {
+                    Ok(p) => p,
+                    Err(_) => continue, // ignore keep-alives / non-JSON lines
+                };
+                if let Some(u) = parsed.usage {
+                    prompt_tokens = u.prompt_tokens.unwrap_or(prompt_tokens);
+                    completion_tokens = u.completion_tokens.unwrap_or(completion_tokens);
+                }
+                for ch in parsed.choices {
+                    if let Some(c) = ch.delta.content {
+                        if !c.is_empty() {
+                            pending.push_str(&c);
+                            batched += 1;
+                            emitted += 1;
+                            if batched >= FLUSH_EVERY {
+                                if tx
+                                    .send(StreamEvent::Delta {
+                                        text: std::mem::take(&mut pending),
+                                        tokens: batched,
+                                    })
+                                    .await
+                                    .is_err()
+                                {
+                                    // Consumer dropped (client aborted). Stop
+                                    // generating; the node settles the partial.
+                                    return Ok(());
+                                }
+                                batched = 0;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Upstream ended WITHOUT a `[DONE]` sentinel → treat as a generation failure
+        // (truncation), NOT a successful completion. The caller fails the job and
+        // aborts the client stream; the client never sees a forged `final`.
+        Err("inference stream ended without [DONE] (truncated)".to_string())
     }
 }
 

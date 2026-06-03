@@ -1,5 +1,7 @@
+use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
 
 use crate::config::{self, NodeConfig};
 use crate::crypto::NodeKeypair;
@@ -15,9 +17,13 @@ pub struct ResourceConfig {
     pub batch_size: u32,
     pub heartbeat_interval: u64,
     pub resource_percent: u8,
+    /// Opt-in confidential token streaming. Off by default — the node advertises
+    /// `streaming` capability and serves stream jobs only when this is enabled.
+    pub streaming_enabled: bool,
 }
 
 impl ResourceConfig {
+    #[allow(clippy::too_many_arguments)]
     pub fn from_args(
         resource_percent: u8,
         threads: Option<u32>,
@@ -26,6 +32,7 @@ impl ResourceConfig {
         max_jobs: u32,
         batch_size: u32,
         heartbeat_interval: u64,
+        streaming_enabled: bool,
     ) -> Self {
         let total_cpus = std::thread::available_parallelism()
             .map(|p| p.get() as u32)
@@ -47,12 +54,92 @@ impl ResourceConfig {
             batch_size,
             heartbeat_interval,
             resource_percent,
+            streaming_enabled,
         }
     }
 
     pub fn load_factor(&self) -> f64 {
         1.0 - (self.resource_percent as f64 / 100.0)
     }
+}
+
+/// Bounded de-dup set of job ids the node has already handled. A job can arrive
+/// via WS push AND a REST heartbeat poll during transitions — this ensures each
+/// runs exactly once. Capped so it can't grow without bound.
+struct SeenJobs {
+    set: HashSet<String>,
+    order: VecDeque<String>,
+    cap: usize,
+}
+
+impl SeenJobs {
+    fn new() -> Self {
+        Self {
+            set: HashSet::new(),
+            order: VecDeque::new(),
+            cap: 1024,
+        }
+    }
+
+    /// Returns true if the id is new (caller should handle it); false if a duplicate.
+    fn check_and_insert(&mut self, id: &str) -> bool {
+        if self.set.contains(id) {
+            return false;
+        }
+        if self.order.len() >= self.cap {
+            if let Some(old) = self.order.pop_front() {
+                self.set.remove(&old);
+            }
+        }
+        self.set.insert(id.to_string());
+        self.order.push_back(id.to_string());
+        true
+    }
+}
+
+/// De-dup + capacity check, then spawn job processing. Shared by the REST poll
+/// loop and the WS push callback so both transports are equivalent and safe.
+#[allow(clippy::too_many_arguments)]
+fn maybe_spawn_job(
+    job: PendingJob,
+    client: Arc<OrchestratorClient>,
+    engine: Option<Arc<InferenceEngine>>,
+    node_secret: [u8; 32],
+    streaming_enabled: bool,
+    active_jobs: Arc<AtomicU32>,
+    seen: Arc<Mutex<SeenJobs>>,
+    max_jobs: u32,
+) {
+    // Atomically reserve a slot (capacity check + increment in one CAS) so
+    // concurrent WS-push + REST-poll arrivals can't exceed max_jobs.
+    if active_jobs
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |c| {
+            if c < max_jobs {
+                Some(c + 1)
+            } else {
+                None
+            }
+        })
+        .is_err()
+    {
+        // At capacity. Not marked seen, so the next REST poll retries it.
+        tracing::warn!("At max concurrent jobs ({max_jobs}), deferring job {}", job.id);
+        return;
+    }
+    // De-dup; roll back the reserved slot if this id was already handled.
+    {
+        let mut s = seen.lock().unwrap();
+        if !s.check_and_insert(&job.id) {
+            active_jobs.fetch_sub(1, Ordering::Relaxed);
+            tracing::debug!("Duplicate job {} ignored", job.id);
+            return;
+        }
+    }
+    tracing::info!("Accepted job {} (type: {})", job.id, job.job_type);
+    tokio::spawn(async move {
+        process_job(&client, &engine, &job, &node_secret, streaming_enabled).await;
+        active_jobs.fetch_sub(1, Ordering::Relaxed);
+    });
 }
 
 pub async fn init(
@@ -235,6 +322,7 @@ pub async fn start(
     tracing::info!("  Context:      {} tokens", rc.context_size);
     tracing::info!("  Batch size:   {}", rc.batch_size);
     tracing::info!("  Max jobs:     {}", rc.max_jobs);
+    tracing::info!("  Streaming:    {}", if rc.streaming_enabled { "enabled" } else { "disabled" });
 
     let mut engine: Option<Arc<InferenceEngine>> = None;
     let mut models: Vec<String> = vec![];
@@ -277,7 +365,61 @@ pub async fn start(
         crate::encryption::EncryptionKeypair::from_ed25519_seed(&node_secret).public_key_bs58();
     tracing::info!("X25519 encryption key: {node_enc_pubkey}");
 
-    let active_jobs = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let active_jobs = Arc::new(AtomicU32::new(0));
+    let seen_jobs = Arc::new(Mutex::new(SeenJobs::new()));
+
+    // ── WebSocket push-dispatch (additive fast-path) ──────────────────
+    // Connects to the orchestrator and processes jobs the instant they're pushed,
+    // removing the heartbeat pickup delay. If the socket is down the REST loop
+    // below keeps serving (fallback). Jobs are de-duplicated by id across both.
+    let ws_state = Arc::new(crate::ws::WsState::new());
+    {
+        let base = orchestrator_url.to_string();
+        let node_id = cfg.node_id.clone();
+        let client_ws = Arc::clone(&client);
+        let client_job = Arc::clone(&client);
+        let client_tok = Arc::clone(&client);
+        let engine_ws = engine.clone();
+        let secret = node_secret;
+        let se = rc.streaming_enabled;
+        let aj = Arc::clone(&active_jobs);
+        let sj = Arc::clone(&seen_jobs);
+        let mj = rc.max_jobs;
+        let st = Arc::clone(&ws_state);
+        let cfg_tok = cfg.clone();
+        let config_dir_buf = config_dir.to_path_buf();
+        tokio::spawn(async move {
+            crate::ws::run(
+                base,
+                node_id,
+                client_ws,
+                st,
+                move |job| {
+                    maybe_spawn_job(
+                        job,
+                        Arc::clone(&client_job),
+                        engine_ws.clone(),
+                        secret,
+                        se,
+                        Arc::clone(&aj),
+                        Arc::clone(&sj),
+                        mj,
+                    );
+                },
+                move |new_tok, _exp| {
+                    client_tok.update_auth_token(new_tok.clone());
+                    let mut updated = cfg_tok.clone();
+                    updated.auth_token = new_tok;
+                    if let Err(e) = config::save_config(&config_dir_buf, &updated) {
+                        tracing::error!("Failed to save WS-rotated token: {e}");
+                    } else {
+                        tracing::info!("Auth token rotated over WS");
+                    }
+                },
+            )
+            .await;
+        });
+    }
 
     loop {
         match client
@@ -286,6 +428,7 @@ pub async fn start(
                 &models,
                 rc.load_factor(),
                 Some(&node_enc_pubkey),
+                rc.streaming_enabled,
             )
             .await
         {
@@ -308,31 +451,19 @@ pub async fn start(
                     }
                 }
 
-                // Process jobs concurrently
+                // Process jobs concurrently (REST fallback path; de-duped against
+                // anything already picked up via WS push).
                 for job in resp.pending_jobs {
-                    let current = active_jobs.load(std::sync::atomic::Ordering::Relaxed);
-                    if current >= rc.max_jobs {
-                        tracing::warn!(
-                            "At max concurrent jobs ({}/{}), deferring job {}",
-                            current,
-                            rc.max_jobs,
-                            job.id
-                        );
-                        break;
-                    }
-
-                    tracing::info!("Received job: {} (type: {})", job.id, job.job_type);
-                    let client_clone = Arc::clone(&client);
-                    let engine_clone = engine.clone();
-                    let jobs_counter = Arc::clone(&active_jobs);
-                    let secret_clone = node_secret;
-
-                    jobs_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
-                    tokio::spawn(async move {
-                        process_job(&client_clone, &engine_clone, &job, &secret_clone).await;
-                        jobs_counter.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-                    });
+                    maybe_spawn_job(
+                        job,
+                        Arc::clone(&client),
+                        engine.clone(),
+                        node_secret,
+                        rc.streaming_enabled,
+                        Arc::clone(&active_jobs),
+                        Arc::clone(&seen_jobs),
+                        rc.max_jobs,
+                    );
                 }
             }
             Err(e) => {
@@ -469,6 +600,7 @@ async fn process_job(
     engine: &Option<Arc<InferenceEngine>>,
     job: &PendingJob,
     node_secret: &[u8; 32],
+    streaming_enabled: bool,
 ) {
     tracing::info!("Processing job {} (type: {})", job.id, job.job_type);
 
@@ -493,6 +625,37 @@ async fn process_job(
                     .await;
                 return;
             }
+        }
+    }
+
+    // Streaming path requires three independent agreements, so a single party
+    // can't force it:
+    //   1. this node has streaming enabled locally (`streaming_enabled`)
+    //   2. the orchestrator set the cleartext dispatch marker (it set up the SSE
+    //      relay) — read from the ORIGINAL job payload, alongside `enc`
+    //   3. the client asked for it in the AUTHENTICATED, sealed payload — read from
+    //      the DECRYPTED inner payload (a relay can't flip this)
+    let dispatch_stream = job
+        .input_payload
+        .as_ref()
+        .and_then(|p| p.get("stream"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let sealed_stream = effective_job
+        .input_payload
+        .as_ref()
+        .and_then(|p| p.get("stream"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if streaming_enabled
+        && dispatch_stream
+        && sealed_stream
+        && enc_version == crate::encryption::EncVersion::V2
+        && effective_job.job_type == "inference"
+    {
+        if let Some(resp_pub) = response_pubkey {
+            process_inference_stream(client, engine, &effective_job, node_secret, &resp_pub).await;
+            return;
         }
     }
 
@@ -577,18 +740,12 @@ async fn process_job(
     }
 }
 
-async fn execute_inference(
-    engine: &Option<Arc<InferenceEngine>>,
-    job: &PendingJob,
-) -> Result<serde_json::Value, String> {
-    let engine = engine
-        .as_ref()
-        .ok_or("No inference engine configured — start with --model-path")?;
-
-    let payload = job
-        .input_payload
-        .as_ref()
-        .ok_or("Job has no input payload")?;
+/// Parse + bound the inference parameters from a (decrypted) job payload. Shared
+/// by the non-streaming and streaming paths so both apply identical validation.
+fn parse_inference_params(
+    payload: Option<&serde_json::Value>,
+) -> Result<(Vec<ChatMessage>, f64, i32), String> {
+    let payload = payload.ok_or("Job has no input payload")?;
 
     let messages: Vec<ChatMessage> = if let Some(msgs) = payload.get("messages") {
         serde_json::from_value(msgs.clone()).map_err(|e| format!("Invalid messages format: {e}"))?
@@ -632,6 +789,19 @@ async fn execute_inference(
         .unwrap_or(2048)
         .clamp(1, 8192) as i32;
 
+    Ok((messages, temperature, max_tokens))
+}
+
+async fn execute_inference(
+    engine: &Option<Arc<InferenceEngine>>,
+    job: &PendingJob,
+) -> Result<serde_json::Value, String> {
+    let engine = engine
+        .as_ref()
+        .ok_or("No inference engine configured — start with --model-path")?;
+
+    let (messages, temperature, max_tokens) = parse_inference_params(job.input_payload.as_ref())?;
+
     let result = engine
         .chat_completion(messages, temperature, max_tokens)
         .await?;
@@ -645,4 +815,183 @@ async fn execute_inference(
             "total_tokens": result.prompt_tokens + result.completion_tokens,
         }
     }))
+}
+
+/// Streaming inference: run llama-server with streaming, seal each token batch as
+/// an ordered chunk, and POST it to the orchestrator (which relays it to the
+/// client over SSE). Each chunk's AAD binds its seq + final flag; the node also
+/// signs an envelope per chunk so the orchestrator can attribute it. Billing
+/// happens on the final chunk's usage; if the client aborts, chunk POSTs start
+/// failing and we stop early (no final → no charge).
+/// Seal one stream chunk, sign its envelope, and POST it. Returns `Ok(true)` if
+/// the orchestrator reports the client is gone (stop early), `Ok(false)` to keep
+/// going, `Err` on a hard failure.
+#[allow(clippy::too_many_arguments)]
+async fn seal_post_chunk(
+    client: &OrchestratorClient,
+    sealer: &crate::encryption::StreamSealer,
+    node_secret: &[u8; 32],
+    job_id: &str,
+    eph_b58: &str,
+    seq: u64,
+    is_final: bool,
+    plaintext: &[u8],
+    usage: Option<serde_json::Value>,
+) -> Result<bool, String> {
+    let ct = sealer.seal_chunk(plaintext, seq, is_final)?;
+    let kind = format!("stream:{seq}:{}", if is_final { 1 } else { 0 });
+    let sig = crate::crypto::sign_result_envelope(node_secret, job_id, &kind, ct.as_bytes());
+    let eph = if seq == 0 { Some(eph_b58) } else { None };
+    client
+        .post_chunk(job_id, seq, is_final, eph, &ct, usage, Some(sig))
+        .await
+}
+
+async fn process_inference_stream(
+    client: &OrchestratorClient,
+    engine: &Option<Arc<InferenceEngine>>,
+    job: &PendingJob,
+    node_secret: &[u8; 32],
+    resp_pub: &[u8; 32],
+) {
+    let engine = match engine {
+        Some(e) => e.clone(),
+        None => {
+            let _ = client
+                .fail_job(&job.id, "No inference engine configured")
+                .await;
+            return;
+        }
+    };
+
+    let (messages, temperature, max_tokens) =
+        match parse_inference_params(job.input_payload.as_ref()) {
+            Ok(v) => v,
+            Err(e) => {
+                let _ = client.fail_job(&job.id, &e).await;
+                return;
+            }
+        };
+
+    // Per-request nonce chosen by the client (inside the sealed prompt) — bound
+    // into every chunk's AAD so a stream can't be spliced into another request.
+    let req_nonce = job
+        .input_payload
+        .as_ref()
+        .and_then(|p| p.get("nonce"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let sealer = match crate::encryption::StreamSealer::new(resp_pub, req_nonce) {
+        Ok(s) => s,
+        Err(e) => {
+            let _ = client
+                .fail_job(&job.id, &format!("stream seal init failed: {e}"))
+                .await;
+            return;
+        }
+    };
+    let eph_b58 = sealer.ephemeral_public_b58().to_string();
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<crate::inference::StreamEvent>(64);
+    let engine2 = engine.clone();
+    let inf = tokio::spawn(async move {
+        engine2
+            .chat_completion_stream(messages, temperature, max_tokens, tx)
+            .await
+    });
+
+    let mut seq: u64 = 0;
+    let mut emitted_tokens: u32 = 0;
+    let mut final_sent = false;
+    let mut client_gone = false;
+
+    while let Some(ev) = rx.recv().await {
+        match ev {
+            crate::inference::StreamEvent::Delta { text, tokens } => {
+                emitted_tokens = emitted_tokens.saturating_add(tokens);
+                match seal_post_chunk(
+                    client, &sealer, node_secret, &job.id, &eph_b58, seq, false,
+                    text.as_bytes(), None,
+                )
+                .await
+                {
+                    Ok(false) => seq += 1,
+                    Ok(true) => {
+                        client_gone = true;
+                        break;
+                    }
+                    Err(e) => {
+                        tracing::warn!("Job {} chunk {seq} post failed: {e}", job.id);
+                        client_gone = true;
+                        break;
+                    }
+                }
+            }
+            crate::inference::StreamEvent::Done {
+                prompt_tokens,
+                completion_tokens,
+            } => {
+                let usage = serde_json::json!({
+                    "prompt_tokens": prompt_tokens,
+                    "completion_tokens": completion_tokens,
+                    "total_tokens": prompt_tokens + completion_tokens,
+                });
+                // Only treat as success if the final chunk was actually accepted;
+                // otherwise fall through to the failure path below.
+                match seal_post_chunk(
+                    client, &sealer, node_secret, &job.id, &eph_b58, seq, true, b"", Some(usage),
+                )
+                .await
+                {
+                    Ok(_) => final_sent = true,
+                    Err(e) => tracing::warn!("Job {} final chunk post failed: {e}", job.id),
+                }
+                break;
+            }
+        }
+    }
+
+    if final_sent {
+        inf.abort(); // generation already finished; ensure the task is reaped
+        tracing::info!("Job {} completed (E2E stream, {} chunk(s))", job.id, seq);
+        return;
+    }
+
+    if client_gone {
+        // Client disconnected mid-stream. Stop the generator FIRST (drop the
+        // receiver so llama-server reads stop unblocking the task, then abort it),
+        // then settle the partial so the generated tokens aren't free. Prompt
+        // tokens are unknown without [DONE]; bill completion tokens only
+        // (conservative, favors the user).
+        drop(rx);
+        inf.abort();
+        let usage = serde_json::json!({
+            "prompt_tokens": 0,
+            "completion_tokens": emitted_tokens,
+            "total_tokens": emitted_tokens,
+        });
+        let _ = seal_post_chunk(
+            client, &sealer, node_secret, &job.id, &eph_b58, seq, true, b"", Some(usage),
+        )
+        .await;
+        tracing::warn!(
+            "Job {} client aborted after {} chunk(s); settled partial ({} tokens)",
+            job.id,
+            seq,
+            emitted_tokens
+        );
+        return;
+    }
+
+    // Generation failure (upstream EOF without [DONE], or the final post failed) —
+    // abort the client stream and fail the job. NO billing.
+    let inf_res = inf
+        .await
+        .unwrap_or_else(|_| Err("inference task panicked".to_string()));
+    let reason = inf_res.err().unwrap_or_else(|| "stream ended without completion".to_string());
+    if let Err(e) = client.report_stream_error(&job.id).await {
+        tracing::warn!("stream error report failed for {}: {e}", job.id);
+        let _ = client.fail_job(&job.id, &format!("stream failed: {reason}")).await;
+    }
+    tracing::warn!("Job {} stream failed: {reason}", job.id);
 }

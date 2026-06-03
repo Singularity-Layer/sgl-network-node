@@ -15,6 +15,10 @@ const MAX_SEALED_B58_LEN: usize = 8 * 1024 * 1024;
 /// Wire algorithm tags.
 const ALGO_V1: &str = "x25519-xchacha20poly1305";
 pub const ALGO_V2: &str = "x25519-xchacha20poly1305-hkdf-v2";
+/// Streaming output: same primitives as v2, but one stream ephemeral key + one
+/// derived output key for the whole stream, and a per-chunk AAD that binds the
+/// chunk's sequence number and final-flag (so a relay can't drop/reorder/truncate).
+pub const ALGO_V2_STREAM: &str = "x25519-xchacha20poly1305-hkdf-v2-stream";
 
 // v2 HKDF domain separation. Must match the orchestrator + cloud e2e.ts byte-for-byte.
 const HKDF_SALT: &[u8] = b"sgl-e2e-v2-salt";
@@ -50,6 +54,18 @@ fn aad_input(node_b58: &str, eph_b58: &str, resp_b58: &str) -> Vec<u8> {
 /// the node's ephemeral key.
 fn aad_output(resp_b58: &str, eph_b58: &str) -> Vec<u8> {
     format!("sgl-aad/v2/output|resp={resp_b58}|eph={eph_b58}").into_bytes()
+}
+
+/// AAD bound into a v2 *stream* chunk (node → caller, one of many): the response
+/// key, the (fixed) stream ephemeral key, a per-request `nonce` chosen by the
+/// client (binds the whole stream to this specific request), the chunk sequence
+/// number, and whether this is the final chunk. Binding seq+final makes
+/// drop/reorder/truncate/inject detectable client-side — the client enforces seq
+/// 0,1,2… ending in final=1; binding the nonce defeats any cross-request splice.
+fn aad_stream(resp_b58: &str, eph_b58: &str, nonce_b58: &str, seq: u64, is_final: bool) -> Vec<u8> {
+    let f = if is_final { 1 } else { 0 };
+    format!("sgl-aad/v2/stream|resp={resp_b58}|eph={eph_b58}|nonce={nonce_b58}|seq={seq}|final={f}")
+        .into_bytes()
 }
 
 fn bs58_to_32(s: &str) -> Result<[u8; 32], String> {
@@ -267,6 +283,72 @@ fn seal_common(
     Ok((output, *ephemeral_public.as_bytes()))
 }
 
+/// Seals a sequence of output chunks for one streaming response. One stream
+/// ephemeral key is generated and one output key derived for the whole stream;
+/// each chunk gets a fresh nonce and an AAD that binds its `seq` and `final` flag.
+/// The client derives the same output key once (from the stream ephemeral carried
+/// on chunk 0) and opens each chunk, enforcing ordering + termination.
+pub struct StreamSealer {
+    out_key: [u8; 32],
+    eph_pub_b58: String,
+    resp_b58: String,
+    req_nonce_b58: String,
+}
+
+impl StreamSealer {
+    /// `recipient_response_public` is the caller's X25519 response key (same key
+    /// the non-stream v2 reply is sealed to). `req_nonce_b58` is the client's
+    /// per-request nonce (taken from the sealed prompt), bound into every chunk AAD.
+    pub fn new(recipient_response_public: &[u8; 32], req_nonce_b58: &str) -> Result<Self, String> {
+        let ephemeral_secret = EphemeralSecret::random_from_rng(OsRng);
+        let ephemeral_public = PublicKey::from(&ephemeral_secret);
+
+        let recipient_pk = PublicKey::from(*recipient_response_public);
+        let shared = ephemeral_secret.diffie_hellman(&recipient_pk);
+        if !shared.was_contributory() {
+            return Err("invalid recipient key (non-contributory shared secret)".to_string());
+        }
+
+        Ok(Self {
+            out_key: hkdf_key(shared.as_bytes(), HKDF_INFO_OUTPUT),
+            eph_pub_b58: bs58::encode(ephemeral_public.as_bytes()).into_string(),
+            resp_b58: bs58::encode(recipient_response_public).into_string(),
+            req_nonce_b58: req_nonce_b58.to_string(),
+        })
+    }
+
+    /// The stream ephemeral public key (base58). Sent to the client on chunk 0;
+    /// the client derives the output key from it and binds it into every AAD.
+    pub fn ephemeral_public_b58(&self) -> &str {
+        &self.eph_pub_b58
+    }
+
+    /// Seal one chunk. Returns base58(`nonce || ciphertext`).
+    pub fn seal_chunk(&self, plaintext: &[u8], seq: u64, is_final: bool) -> Result<String, String> {
+        let mut nonce_bytes = [0u8; 24];
+        OsRng.fill_bytes(&mut nonce_bytes);
+        let nonce = XNonce::from_slice(&nonce_bytes);
+
+        let aad = aad_stream(&self.resp_b58, &self.eph_pub_b58, &self.req_nonce_b58, seq, is_final);
+        let cipher = XChaCha20Poly1305::new_from_slice(&self.out_key)
+            .map_err(|e| format!("Cipher init failed: {e}"))?;
+        let ciphertext = cipher
+            .encrypt(
+                nonce,
+                Payload {
+                    msg: plaintext,
+                    aad: &aad,
+                },
+            )
+            .map_err(|e| format!("Encryption failed: {e}"))?;
+
+        let mut out = Vec::with_capacity(24 + ciphertext.len());
+        out.extend_from_slice(&nonce_bytes);
+        out.extend_from_slice(&ciphertext);
+        Ok(bs58::encode(&out).into_string())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -308,6 +390,52 @@ mod tests {
             }
         });
         assert!(unseal_input(&payload, &node_secret).is_err());
+    }
+
+    // Stream sealer: a recipient derives the output key once from chunk 0's
+    // ephemeral, then opens each chunk with the seq/final-bound AAD. Proves the
+    // exact contract the browser client implements.
+    #[test]
+    fn v2_stream_roundtrip_and_integrity() {
+        let resp_secret = StaticSecret::from([0x09u8; 32]);
+        let resp_pub = PublicKey::from(&resp_secret);
+        let req_nonce = "ReqNonceTestVector11111";
+        let sealer = StreamSealer::new(resp_pub.as_bytes(), req_nonce).unwrap();
+        let eph_b58 = sealer.ephemeral_public_b58().to_string();
+        let resp_b58 = bs58::encode(resp_pub.as_bytes()).into_string();
+
+        // Recipient derives the output key once from the stream ephemeral (chunk 0).
+        let node_eph = bs58_to_32(&eph_b58).unwrap();
+        let shared = resp_secret.diffie_hellman(&PublicKey::from(node_eph));
+        let key = hkdf_key(shared.as_bytes(), HKDF_INFO_OUTPUT);
+        let cipher = XChaCha20Poly1305::new_from_slice(&key).unwrap();
+
+        let open = |b58: &str, seq: u64, is_final: bool| -> Result<Vec<u8>, ()> {
+            let blob = bs58::decode(b58).into_vec().map_err(|_| ())?;
+            let aad = aad_stream(&resp_b58, &eph_b58, req_nonce, seq, is_final);
+            cipher
+                .decrypt(
+                    XNonce::from_slice(&blob[..24]),
+                    Payload {
+                        msg: &blob[24..],
+                        aad: &aad,
+                    },
+                )
+                .map_err(|_| ())
+        };
+
+        let c0 = sealer.seal_chunk(b"Hello, ", 0, false).unwrap();
+        let c1 = sealer.seal_chunk(b"world", 1, false).unwrap();
+        let c2 = sealer.seal_chunk(b"", 2, true).unwrap();
+
+        assert_eq!(open(&c0, 0, false).unwrap(), b"Hello, ");
+        assert_eq!(open(&c1, 1, false).unwrap(), b"world");
+        assert_eq!(open(&c2, 2, true).unwrap(), b"");
+
+        // Wrong seq (reorder/replay) must fail — AAD binds the sequence number.
+        assert!(open(&c1, 0, false).is_err());
+        // A non-final chunk presented as final (truncation forgery) must fail.
+        assert!(open(&c1, 1, true).is_err());
     }
 
     // Rust v2 seal → Rust v2 open round-trip (output direction self-consistency).

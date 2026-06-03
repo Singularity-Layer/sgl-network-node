@@ -23,6 +23,7 @@ pub struct ServiceStartOptions {
     pub inference_port: u16,
     pub max_jobs: u32,
     pub heartbeat_interval: u64,
+    pub enable_streaming: bool,
 }
 
 impl ServiceStartOptions {
@@ -47,6 +48,9 @@ impl ServiceStartOptions {
         args.push(self.max_jobs.to_string());
         args.push("--heartbeat-interval".into());
         args.push(self.heartbeat_interval.to_string());
+        if self.enable_streaming {
+            args.push("--enable-streaming".into());
+        }
         args
     }
 }

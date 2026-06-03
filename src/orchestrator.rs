@@ -107,6 +107,14 @@ struct HeartbeatRequest {
     // orchestrator always has the current key without a separate attest step).
     #[serde(skip_serializing_if = "Option::is_none")]
     encryption_public_key: Option<String>,
+    // Feature capabilities the orchestrator uses for routing (e.g. only route
+    // streaming requests to nodes that advertise `streaming: true`).
+    capabilities: NodeCapabilities,
+}
+
+#[derive(Serialize)]
+struct NodeCapabilities {
+    streaming: bool,
 }
 
 #[derive(Deserialize)]
@@ -238,6 +246,11 @@ impl OrchestratorClient {
             .ok_or_else(|| "No auth token configured".to_string())
     }
 
+    /// Current auth token (for the WS client to read fresh on each reconnect).
+    pub fn current_token(&self) -> Option<String> {
+        self.auth_token.read().unwrap().clone()
+    }
+
     pub async fn register(
         &self,
         wallet: &str,
@@ -335,6 +348,7 @@ impl OrchestratorClient {
         models: &[String],
         current_load: f64,
         encryption_public_key: Option<&str>,
+        streaming: bool,
     ) -> Result<HeartbeatResponse, String> {
         let url = format!("{}/grid/nodes/heartbeat", self.base_url);
         let token = self.get_token()?;
@@ -343,6 +357,7 @@ impl OrchestratorClient {
             current_load,
             available_models: models.to_vec(),
             encryption_public_key: encryption_public_key.map(|s| s.to_string()),
+            capabilities: NodeCapabilities { streaming },
         };
 
         let resp = self
@@ -511,6 +526,84 @@ impl OrchestratorClient {
             body["result_envelope_version"] = serde_json::Value::String("v1".to_string());
         }
         self.post_complete(job_id, body).await
+    }
+
+    /// Post one sealed stream chunk to the orchestrator, which relays it to the
+    /// waiting client over SSE. `ephemeral_public_key` is sent only on seq 0 (the
+    /// client derives the stream output key from it). On the final chunk, `usage`
+    /// carries the token counts the orchestrator uses to bill.
+    /// Returns `Ok(true)` when the orchestrator reports the client stream is closed
+    /// (the browser went away) so the node can stop generating early; `Ok(false)`
+    /// to keep going. `Err` on a real failure (e.g. signature rejected).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn post_chunk(
+        &self,
+        job_id: &str,
+        seq: u64,
+        is_final: bool,
+        ephemeral_public_key: Option<&str>,
+        ciphertext_b58: &str,
+        usage: Option<serde_json::Value>,
+        envelope_signature: Option<String>,
+    ) -> Result<bool, String> {
+        let url = format!("{}/grid/jobs/{}/chunk", self.base_url, enc_seg(job_id));
+        let token = self.get_token()?;
+
+        let mut body = serde_json::json!({
+            "seq": seq,
+            "final": is_final,
+            "ciphertext": ciphertext_b58,
+            "algorithm": crate::encryption::ALGO_V2_STREAM,
+        });
+        if let Some(eph) = ephemeral_public_key {
+            body["ephemeral_public_key"] = serde_json::Value::String(eph.to_string());
+        }
+        if let Some(u) = usage {
+            body["usage"] = u;
+        }
+        if let Some(sig) = envelope_signature {
+            body["result_envelope_signature"] = serde_json::Value::String(sig);
+            body["result_envelope_version"] = serde_json::Value::String("v1".to_string());
+        }
+
+        let resp = self
+            .client
+            .post(&url)
+            .header("X-Node-Auth", token)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| format!("chunk post failed: {e}"))?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            return Err(format!("chunk post failed ({status}): {text}"));
+        }
+        // 200 body: { ok, closed }. `closed` means the client is gone.
+        let parsed: serde_json::Value = serde_json::from_slice(&Self::read_body_capped(resp).await?)
+            .unwrap_or(serde_json::Value::Null);
+        Ok(parsed.get("closed").and_then(|v| v.as_bool()).unwrap_or(false))
+    }
+
+    /// Tell the orchestrator a streaming job failed to generate (e.g. the model
+    /// truncated). It aborts the client's SSE stream and fails the job — no billing.
+    pub async fn report_stream_error(&self, job_id: &str) -> Result<(), String> {
+        let url = format!("{}/grid/jobs/{}/chunk", self.base_url, enc_seg(job_id));
+        let token = self.get_token()?;
+        let body = serde_json::json!({ "error": true });
+        let resp = self
+            .client
+            .post(&url)
+            .header("X-Node-Auth", token)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| format!("stream error report failed: {e}"))?;
+        if !resp.status().is_success() {
+            return Err(format!("stream error report failed ({})", resp.status()));
+        }
+        Ok(())
     }
 
     async fn post_complete(&self, job_id: &str, body: serde_json::Value) -> Result<(), String> {

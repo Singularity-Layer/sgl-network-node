@@ -7,6 +7,7 @@ mod orchestrator;
 mod runtime_hardening;
 mod service;
 mod tee;
+mod ws;
 
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
@@ -101,6 +102,12 @@ enum Commands {
         /// Heartbeat interval in seconds (lower = faster job pickup, more network traffic)
         #[arg(long, default_value = "5")]
         heartbeat_interval: u64,
+
+        /// Enable confidential token streaming (per-chunk sealed SSE). Off by
+        /// default; the node advertises the capability and serves stream jobs
+        /// only when this flag is set.
+        #[arg(long, default_value = "false")]
+        enable_streaming: bool,
     },
 
     /// Show node status, hardware capabilities, and orchestrator info
@@ -156,6 +163,10 @@ enum ServiceAction {
         /// Heartbeat interval in seconds
         #[arg(long, default_value = "5")]
         heartbeat_interval: u64,
+
+        /// Enable confidential token streaming (per-chunk sealed SSE).
+        #[arg(long, default_value = "false")]
+        enable_streaming: bool,
     },
 
     /// Stop and remove the background service.
@@ -224,6 +235,7 @@ async fn main() {
             max_jobs,
             batch_size,
             heartbeat_interval,
+            enable_streaming,
         } => {
             let rc = node::ResourceConfig::from_args(
                 resource_percent,
@@ -233,6 +245,7 @@ async fn main() {
                 max_jobs,
                 batch_size,
                 heartbeat_interval,
+                enable_streaming,
             );
             if let Err(e) = node::start(
                 &config_dir,
@@ -285,6 +298,7 @@ async fn main() {
                     inference_port,
                     max_jobs,
                     heartbeat_interval,
+                    enable_streaming,
                 } => {
                     let opts = service::ServiceStartOptions {
                         model_path,
@@ -294,6 +308,7 @@ async fn main() {
                         inference_port,
                         max_jobs,
                         heartbeat_interval,
+                        enable_streaming,
                     };
                     service::install(&opts)
                 }
