@@ -143,11 +143,16 @@ download_binary() {
 
     chmod +x "$TEMP_FILE"
 
-    if [ -w "$INSTALL_DIR" ]; then
+    # On a clean macOS install /usr/local/bin may not exist yet (Homebrew creates
+    # it; Apple Silicon Homebrew lives in /opt/homebrew). Create it before moving,
+    # or `mv` fails with "No such file or directory".
+    if [ -d "$INSTALL_DIR" ] && [ -w "$INSTALL_DIR" ]; then
         mv "$TEMP_FILE" "${INSTALL_DIR}/${BINARY_NAME}"
     else
         echo "  Installing to ${INSTALL_DIR} (requires sudo)..."
+        sudo mkdir -p "$INSTALL_DIR"
         sudo mv "$TEMP_FILE" "${INSTALL_DIR}/${BINARY_NAME}"
+        sudo chmod +x "${INSTALL_DIR}/${BINARY_NAME}"
     fi
     rm -f "$TEMP_SUM"
 
