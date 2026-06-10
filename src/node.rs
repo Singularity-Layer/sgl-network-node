@@ -17,8 +17,11 @@ pub struct ResourceConfig {
     pub batch_size: u32,
     pub heartbeat_interval: u64,
     pub resource_percent: u8,
-    /// Opt-in confidential token streaming. Off by default — the node advertises
-    /// `streaming` capability and serves stream jobs only when this is enabled.
+    /// Confidential token streaming. ALWAYS enabled: the node always advertises
+    /// the `streaming` capability and serves stream jobs. Whether a given request
+    /// streams is the CALLER's choice (`stream: true`), not the operator's — a
+    /// provider can't silently disable it. The legacy `--enable-streaming` flag is
+    /// now a deprecated no-op kept only so old service definitions still parse.
     pub streaming_enabled: bool,
 }
 
@@ -32,7 +35,7 @@ impl ResourceConfig {
         max_jobs: u32,
         batch_size: u32,
         heartbeat_interval: u64,
-        streaming_enabled: bool,
+        _streaming_enabled: bool, // deprecated no-op: streaming is always on (see below)
     ) -> Self {
         let total_cpus = std::thread::available_parallelism()
             .map(|p| p.get() as u32)
@@ -54,7 +57,8 @@ impl ResourceConfig {
             batch_size,
             heartbeat_interval,
             resource_percent,
-            streaming_enabled,
+            // Always on — providers always stream; the caller opts in per request.
+            streaming_enabled: true,
         }
     }
 

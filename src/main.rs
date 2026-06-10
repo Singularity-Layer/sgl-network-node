@@ -103,15 +103,19 @@ enum Commands {
         #[arg(long, default_value = "5")]
         heartbeat_interval: u64,
 
-        /// Enable confidential token streaming (per-chunk sealed SSE). Off by
-        /// default; the node advertises the capability and serves stream jobs
-        /// only when this flag is set.
-        #[arg(long, default_value = "false")]
+        /// [Deprecated, no-op] Confidential token streaming is always on now;
+        /// the node always advertises it and the caller opts in per request via
+        /// `stream: true`. Kept so existing scripts still parse.
+        #[arg(long, default_value = "false", hide = true)]
         enable_streaming: bool,
     },
 
     /// Show node status, hardware capabilities, and orchestrator info
     Status,
+
+    /// Show version and this binary's sha256 fingerprint (the value the
+    /// orchestrator allowlists). Use to confirm you're running an approved build.
+    Version,
 
     /// Go off-grid (maintenance): stop receiving jobs without being penalized.
     /// Use for planned downtime. Tamper slashing is unaffected.
@@ -164,8 +168,9 @@ enum ServiceAction {
         #[arg(long, default_value = "5")]
         heartbeat_interval: u64,
 
-        /// Enable confidential token streaming (per-chunk sealed SSE).
-        #[arg(long, default_value = "false")]
+        /// [Deprecated, no-op] Streaming is always on; kept so existing service
+        /// definitions still parse.
+        #[arg(long, default_value = "false", hide = true)]
         enable_streaming: bool,
     },
 
@@ -266,6 +271,22 @@ async fn main() {
                 tracing::error!("Status check failed: {e}");
                 std::process::exit(1);
             }
+        }
+        Commands::Version => {
+            // Read-only, offline. Prints the build version + the sha256 the
+            // orchestrator allowlists, so an operator can confirm they're on an
+            // approved build. No network call, no config required.
+            println!("sgl {}", env!("CARGO_PKG_VERSION"));
+            println!("binary sha256: {}", tee::detect_binary_hash());
+            println!("config dir:    {}", config_dir.display());
+            println!("orchestrator:  {}", cli.orchestrator_url);
+            println!();
+            println!(
+                "To serve on the grid this sha256 must be on the orchestrator's"
+            );
+            println!(
+                "approved-build allowlist (published with each official release)."
+            );
         }
         Commands::OffGrid => {
             if let Err(e) = node::set_off_grid(&config_dir, &cli.orchestrator_url, true).await {
