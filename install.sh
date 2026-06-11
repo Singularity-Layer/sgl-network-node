@@ -4,7 +4,7 @@
 set -e
 
 BINARY_NAME="sgl"                       # installed command + built binary name
-ASSET_NAME="sgl-darwin-arm64"           # release asset filename
+ASSET_NAME="sgl-darwin-arm64"           # default; overridden per-platform in check_platform()
 INSTALL_DIR="/usr/local/bin"
 REPO="Singularity-Layer/sgl-network-node"
 RELEASES_URL="https://github.com/${REPO}/releases"
@@ -30,28 +30,40 @@ check_platform() {
     ARCH=$(uname -m)
 
     case "$OS" in
-        Darwin) ;;
+        Darwin)
+            case "$ARCH" in
+                arm64|aarch64) ASSET_NAME="sgl-darwin-arm64" ;;
+                *)
+                    echo "Error: on macOS, sgl-node requires Apple Silicon (arm64)."
+                    echo "Intel Macs are not supported (no Secure Enclave)."
+                    exit 1
+                    ;;
+            esac
+            echo "  Platform: macOS arm64 ✓"
+            # Check minimum RAM (16GB)
+            TOTAL_MEM=$(sysctl -n hw.memsize 2>/dev/null || echo "0")
+            TOTAL_GB=$((TOTAL_MEM / 1073741824))
+            ;;
+        Linux)
+            case "$ARCH" in
+                x86_64|amd64) ASSET_NAME="sgl-linux-x86_64" ;;
+                arm64|aarch64) ASSET_NAME="sgl-linux-arm64" ;;
+                *)
+                    echo "Error: unsupported Linux architecture: ${ARCH}."
+                    echo "Build from source: cargo build --release"
+                    exit 1
+                    ;;
+            esac
+            echo "  Platform: Linux ${ARCH} ✓ (Intel TDX / AMD SEV hosts supported)"
+            TOTAL_KB=$(grep MemTotal /proc/meminfo 2>/dev/null | awk '{print $2}' || echo "0")
+            TOTAL_GB=$((TOTAL_KB / 1048576))
+            ;;
         *)
-            echo "Error: sgl-node currently only supports macOS."
-            echo "Linux and Windows support coming in Phase 2."
+            echo "Error: unsupported OS: ${OS}. macOS and Linux are supported."
             exit 1
             ;;
     esac
 
-    case "$ARCH" in
-        arm64|aarch64) ;;
-        *)
-            echo "Error: sgl-node requires Apple Silicon (arm64)."
-            echo "Intel Macs are not supported (no Secure Enclave)."
-            exit 1
-            ;;
-    esac
-
-    echo "  Platform: macOS arm64 ✓"
-
-    # Check minimum RAM (16GB)
-    TOTAL_MEM=$(sysctl -n hw.memsize 2>/dev/null || echo "0")
-    TOTAL_GB=$((TOTAL_MEM / 1073741824))
     if [ "$TOTAL_GB" -lt 16 ]; then
         echo "  Warning: ${TOTAL_GB}GB RAM detected. 16GB+ recommended for inference."
     else

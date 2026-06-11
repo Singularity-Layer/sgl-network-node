@@ -7,6 +7,7 @@ mod orchestrator;
 mod runtime_hardening;
 mod service;
 mod tee;
+mod update;
 mod ws;
 
 use clap::{Parser, Subcommand};
@@ -116,6 +117,11 @@ enum Commands {
     /// Show version and this binary's sha256 fingerprint (the value the
     /// orchestrator allowlists). Use to confirm you're running an approved build.
     Version,
+
+    /// Update to the latest official release. Fail-closed: the download must
+    /// match the published checksum AND be on the grid's approved-binary
+    /// allowlist before it replaces this binary.
+    Update,
 
     /// Go off-grid (maintenance): stop receiving jobs without being penalized.
     /// Use for planned downtime. Tamper slashing is unaffected.
@@ -287,6 +293,12 @@ async fn main() {
             println!(
                 "approved-build allowlist (published with each official release)."
             );
+        }
+        Commands::Update => {
+            if let Err(e) = update::run(&cli.orchestrator_url).await {
+                tracing::error!("Update failed: {e}");
+                std::process::exit(1);
+            }
         }
         Commands::OffGrid => {
             if let Err(e) = node::set_off_grid(&config_dir, &cli.orchestrator_url, true).await {

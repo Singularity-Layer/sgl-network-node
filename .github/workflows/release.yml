@@ -1,0 +1,94 @@
+# Release pipeline — builds official binaries on GitHub's own runners.
+#
+# Trigger: push a version tag (v1.2.0, v1.3.0, …).
+# Output: a GitHub Release with one binary + .sha256 per platform:
+#   sgl-darwin-arm64   (macOS Apple Silicon)
+#   sgl-linux-x86_64   (Linux x86_64 — Intel TDX / AMD SEV hosts)
+#   sgl-linux-arm64    (Linux arm64)
+#
+# Why CI builds: binaries are produced from the public source on GitHub's
+# infrastructure, not a developer laptop — a verifiable supply chain. After a
+# release, each new sha256 must be appended to the orchestrator's
+# ALLOWED_NODE_BINARY_HASHES (add-before-remove) or the build cannot serve.
+
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build (${{ matrix.asset }})
+    strategy:
+      matrix:
+        include:
+          - os: macos-14
+            target: aarch64-apple-darwin
+            asset: sgl-darwin-arm64
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            asset: sgl-linux-x86_64
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            asset: sgl-linux-arm64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Package + checksum
+        run: |
+          cp "target/${{ matrix.target }}/release/sgl" "${{ matrix.asset }}"
+          if command -v shasum >/dev/null 2>&1; then
+            shasum -a 256 "${{ matrix.asset }}" > "${{ matrix.asset }}.sha256"
+          else
+            sha256sum "${{ matrix.asset }}" > "${{ matrix.asset }}.sha256"
+          fi
+          cat "${{ matrix.asset }}.sha256"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: |
+            ${{ matrix.asset }}
+            ${{ matrix.asset }}.sha256
+          if-no-files-found: error
+
+  release:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+
+      - name: Show checksums (paste these into the allowlist)
+        run: cat ./*.sha256
+
+      - name: Create release with assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          gh release create "$TAG" \
+            --repo "$REPO" \
+            --title "sgl-node $TAG" \
+            --generate-notes \
+            sgl-darwin-arm64 sgl-darwin-arm64.sha256 \
+            sgl-linux-x86_64 sgl-linux-x86_64.sha256 \
+            sgl-linux-arm64 sgl-linux-arm64.sha256
