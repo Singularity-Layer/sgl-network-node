@@ -107,7 +107,7 @@ pub fn generate_attestation_report() -> HardwareAttestationReport {
 
 /// sha256 of the currently-running sgl binary. The orchestrator can require
 /// this to be on an allowlist of known-hardened builds.
-fn detect_binary_hash() -> String {
+pub fn detect_binary_hash() -> String {
     match std::env::current_exe()
         .ok()
         .and_then(|p| std::fs::read(p).ok())
