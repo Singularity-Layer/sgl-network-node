@@ -536,6 +536,51 @@ pub async fn set_off_grid(config_dir: &Path, orchestrator_url: &str, off_grid: b
     Ok(())
 }
 
+/// Show this node's per-model pricing (custom vs platform suggested, + the band).
+pub async fn show_prices(config_dir: &Path, orchestrator_url: &str) -> Result<(), String> {
+    let cfg = config::load_config(config_dir)?;
+    let client = OrchestratorClient::new(orchestrator_url, Some(cfg.auth_token.clone()));
+    let data = client.get_prices(&cfg.node_id).await?;
+    let prices = data.get("prices").and_then(|p| p.as_array()).cloned().unwrap_or_default();
+    if prices.is_empty() {
+        println!("This node isn't serving any models yet.");
+        return Ok(());
+    }
+    println!("Per-model pricing (USD per 1M tokens):\n");
+    for p in prices {
+        let model = p.get("model").and_then(|m| m.as_str()).unwrap_or("?");
+        let eff = p.get("effective");
+        let custom = p.get("custom").map(|c| !c.is_null()).unwrap_or(false);
+        let r = p.get("reference");
+        let g = |v: Option<&serde_json::Value>, k: &str| v.and_then(|o| o.get(k)).and_then(|n| n.as_f64()).unwrap_or(0.0);
+        println!(
+            "  {model:<20} in ${:.6} / out ${:.6}  [{}]   (suggested in ${:.6} / out ${:.6})",
+            g(eff, "inputPerM"), g(eff, "outputPerM"),
+            if custom { "custom" } else { "suggested" },
+            g(r, "inputPerM"), g(r, "outputPerM"),
+        );
+    }
+    Ok(())
+}
+
+/// Set a custom per-token price for a model (USD per 1M tokens). Band-enforced server-side.
+pub async fn set_price(config_dir: &Path, orchestrator_url: &str, model: &str, input_per_m: f64, output_per_m: f64) -> Result<(), String> {
+    let cfg = config::load_config(config_dir)?;
+    let client = OrchestratorClient::new(orchestrator_url, Some(cfg.auth_token.clone()));
+    client.set_price(&cfg.node_id, model, input_per_m, output_per_m).await?;
+    println!("✅ Price set for {model}: in ${input_per_m}/1M · out ${output_per_m}/1M. You earn 80% of what you charge.");
+    Ok(())
+}
+
+/// Reset a model's price back to the platform suggested rate.
+pub async fn reset_price(config_dir: &Path, orchestrator_url: &str, model: &str) -> Result<(), String> {
+    let cfg = config::load_config(config_dir)?;
+    let client = OrchestratorClient::new(orchestrator_url, Some(cfg.auth_token.clone()));
+    client.reset_price(&cfg.node_id, model).await?;
+    println!("✅ {model} reset to the platform suggested price.");
+    Ok(())
+}
+
 pub async fn attest(config_dir: &Path, orchestrator_url: &str) -> Result<(), String> {
     let cfg = config::load_config(config_dir)?;
     let keypair = NodeKeypair::load(&config::keypair_path(config_dir))?;

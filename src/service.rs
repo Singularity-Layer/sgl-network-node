@@ -24,6 +24,9 @@ pub struct ServiceStartOptions {
     pub max_jobs: u32,
     pub heartbeat_interval: u64,
     pub enable_streaming: bool,
+    /// macOS: wrap the node in a Seatbelt sandbox (opt-in). Ignored on Linux,
+    /// where equivalent systemd hardening is always applied.
+    pub sandbox: bool,
 }
 
 impl ServiceStartOptions {
@@ -138,20 +141,73 @@ fn xml_escape(s: &str) -> String {
         .replace('>', "&gt;")
 }
 
+// Targeted-deny Seatbelt profile. We allow everything the inference engine
+// legitimately needs (Metal/GPU, Secure Enclave attestation, model file reads,
+// outbound network) and only deny reads/writes of the operator's most sensitive
+// data — so a compromised llama.cpp (the one place attacker-controlled prompt
+// bytes hit native code) cannot exfiltrate SSH keys, wallets, or browser data.
+// "Allow default, deny secrets" (rather than "deny default, allow list") is the
+// safe choice for an unattended GPU process we can't pre-test on every machine.
+#[cfg(target_os = "macos")]
+fn write_sandbox_profile() -> Result<String, String> {
+    let home = dirs::home_dir().ok_or("Cannot resolve home directory")?;
+    let home_str = home.to_str().ok_or("home directory path not UTF-8")?;
+    let dir = home.join("Library/Application Support/sgl-node");
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| format!("Failed to create sandbox profile dir: {e}"))?;
+    let profile = dir.join("sandbox.sb");
+
+    let body = format!(
+        r#"(version 1)
+(allow default)
+;; Wall off the operator's secrets from the inference process.
+(deny file-read* file-write*
+    (subpath "{home}/.ssh")
+    (subpath "{home}/.gnupg")
+    (subpath "{home}/.aws")
+    (subpath "{home}/.config/solana")
+    (subpath "{home}/.config/gcloud")
+    (subpath "{home}/Library/Keychains")
+    (subpath "{home}/Library/Cookies")
+    (subpath "{home}/Library/Application Support/Google/Chrome")
+    (subpath "{home}/Library/Application Support/Firefox")
+    (subpath "{home}/Library/Application Support/BraveSoftware")
+    (subpath "{home}/Library/Application Support/Exodus")
+    (subpath "{home}/Library/Application Support/Electrum")
+    (literal "{home}/.zsh_history")
+    (literal "{home}/.bash_history"))
+"#,
+        home = home_str,
+    );
+    std::fs::write(&profile, body)
+        .map_err(|e| format!("Failed to write sandbox profile: {e}"))?;
+    profile
+        .to_str()
+        .map(|s| s.to_string())
+        .ok_or_else(|| "sandbox profile path not UTF-8".to_string())
+}
+
 #[cfg(target_os = "macos")]
 fn install_macos(opts: &ServiceStartOptions) -> Result<(), String> {
     let exe = current_exe()?;
     let log = log_path()?;
     let plist = plist_path()?;
 
-    // ProgramArguments: caffeinate -i <exe> start <args...>
+    // ProgramArguments: caffeinate -i [sandbox-exec -f <profile>] <exe> start <args...>
     // caffeinate -i blocks idle sleep so the node stays on the grid; if the
-    // node exits, launchd (KeepAlive) restarts the whole thing.
+    // node exits, launchd (KeepAlive) restarts the whole thing. When --sandbox
+    // is set, the node (and its llama-server child) run under a Seatbelt profile.
     let mut program_args: Vec<String> = vec![
         "/usr/bin/caffeinate".to_string(),
         "-i".to_string(),
-        exe.clone(),
     ];
+    if opts.sandbox {
+        let profile = write_sandbox_profile()?;
+        program_args.push("/usr/bin/sandbox-exec".to_string());
+        program_args.push("-f".to_string());
+        program_args.push(profile);
+    }
+    program_args.push(exe.clone());
     program_args.extend(opts.start_args());
 
     let args_xml: String = program_args
@@ -219,6 +275,13 @@ fn install_macos(opts: &ServiceStartOptions) -> Result<(), String> {
     println!("✅ SGL node service installed (launchd: {SERVICE_LABEL})");
     println!("   Plist:   {}", plist.display());
     println!("   Logs:    {log}");
+    if opts.sandbox {
+        println!("   Sandbox: ON (Seatbelt) — SSH keys, wallets, keychains, and");
+        println!("            browser data are walled off from the inference process.");
+    } else {
+        println!("   Sandbox: off — pass `--sandbox` to wall off keys/wallets from");
+        println!("            the inference process (recommended; test on your setup).");
+    }
     println!("   It starts at login, restarts on crash, and blocks idle sleep.");
     println!("   Manage:  sgl service status | sgl service uninstall");
     println!();
@@ -298,6 +361,14 @@ fn install_linux(opts: &ServiceStartOptions) -> Result<(), String> {
         .collect::<Vec<_>>()
         .join(" ");
 
+    // Re-expose the operator's chosen model read-only (ProtectHome=true would
+    // otherwise hide it if it lives under $HOME). "-" tolerates a missing path.
+    let model_ro = opts
+        .model_path
+        .as_ref()
+        .map(|m| format!("ReadOnlyPaths=-{m}\n"))
+        .unwrap_or_default();
+
     let unit_body = format!(
         r#"[Unit]
 Description=SGL Network compute node
@@ -311,10 +382,43 @@ RestartSec=15
 StandardOutput=append:%h/.local/share/sgl-node/sgl-node.log
 StandardError=append:%h/.local/share/sgl-node/sgl-node.log
 
+# ── sandbox hardening ──────────────────────────────────────────────────────
+# Contains the blast radius if the native inference engine (llama.cpp) is ever
+# exploited via a crafted prompt: the process can still read its model and reach
+# the network, but cannot touch the operator's home (SSH keys, wallets, etc.),
+# gain privileges, or write outside the node's own state dirs.
+# GPU-safe by design: devices stay accessible (no PrivateDevices), no W^X
+# (no MemoryDenyWriteExecute) that would break CUDA/ROCm, and denied syscalls
+# return EPERM instead of killing the process (no SIGSYS surprises).
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=-%h/.config/sgl-node -%h/.local/share/sgl-node
+{model_ro}ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+LockPersonality=true
+RemoveIPC=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+SystemCallArchitectures=native
+SystemCallErrorNumber=EPERM
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @obsolete @mount @reboot @swap @raw-io @cpu-emulation
+
 [Install]
 WantedBy=default.target
 "#,
         exec_start = exec_start,
+        model_ro = model_ro,
     );
 
     if let Some(parent) = unit.parent() {
@@ -343,6 +447,8 @@ WantedBy=default.target
     println!("✅ SGL node service installed (systemd --user: {SERVICE_LABEL})");
     println!("   Unit:  {}", unit.display());
     println!("   Logs:  ~/.local/share/sgl-node/sgl-node.log");
+    println!("   Sandbox: ON — systemd hardening confines the inference process");
+    println!("            (home/keys/wallets protected; GPU + network preserved).");
     println!(
         "   Tip: run `loginctl enable-linger $USER` so it runs without an active login session."
     );

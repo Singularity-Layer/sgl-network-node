@@ -144,6 +144,36 @@ enum Commands {
         #[command(subcommand)]
         action: ServiceAction,
     },
+
+    /// View or set your per-token prices (USD per 1M tokens). You earn 80% of
+    /// whatever you charge; prices must stay within the network's allowed band.
+    Price {
+        #[command(subcommand)]
+        action: PriceAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum PriceAction {
+    /// Show your per-model prices, the platform suggested rate, and the band.
+    Show,
+    /// Set a custom price for a model (USD per 1M tokens).
+    Set {
+        /// Model id you serve (e.g. "llama-3.2-3b")
+        #[arg(long)]
+        model: String,
+        /// Input (prompt) price, USD per 1M tokens
+        #[arg(long)]
+        input: f64,
+        /// Output (completion) price, USD per 1M tokens
+        #[arg(long)]
+        output: f64,
+    },
+    /// Reset a model back to the platform suggested price.
+    Reset {
+        #[arg(long)]
+        model: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -178,6 +208,13 @@ enum ServiceAction {
         /// definitions still parse.
         #[arg(long, default_value = "false", hide = true)]
         enable_streaming: bool,
+
+        /// macOS only: run the node under a Seatbelt sandbox that walls off
+        /// SSH keys, wallets, keychains, and browser data from the inference
+        /// process. Opt-in (test on your setup first). On Linux, equivalent
+        /// systemd hardening is always applied automatically.
+        #[arg(long, default_value = "false")]
+        sandbox: bool,
     },
 
     /// Stop and remove the background service.
@@ -312,6 +349,17 @@ async fn main() {
                 std::process::exit(1);
             }
         }
+        Commands::Price { action } => {
+            let result = match action {
+                PriceAction::Show => node::show_prices(&config_dir, &cli.orchestrator_url).await,
+                PriceAction::Set { model, input, output } => node::set_price(&config_dir, &cli.orchestrator_url, &model, input, output).await,
+                PriceAction::Reset { model } => node::reset_price(&config_dir, &cli.orchestrator_url, &model).await,
+            };
+            if let Err(e) = result {
+                tracing::error!("Price command failed: {e}");
+                std::process::exit(1);
+            }
+        }
         Commands::Attest => {
             if let Err(e) = node::attest(&config_dir, &cli.orchestrator_url).await {
                 tracing::error!("Attestation failed: {e}");
@@ -332,6 +380,7 @@ async fn main() {
                     max_jobs,
                     heartbeat_interval,
                     enable_streaming,
+                    sandbox,
                 } => {
                     let opts = service::ServiceStartOptions {
                         model_path,
@@ -342,6 +391,7 @@ async fn main() {
                         max_jobs,
                         heartbeat_interval,
                         enable_streaming,
+                        sandbox,
                     };
                     service::install(&opts)
                 }

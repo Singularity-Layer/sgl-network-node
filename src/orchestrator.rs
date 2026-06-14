@@ -432,6 +432,59 @@ impl OrchestratorClient {
         Ok(())
     }
 
+    /// Fetch this node's per-model prices + the allowed band (public endpoint).
+    pub async fn get_prices(&self, node_id: &str) -> Result<serde_json::Value, String> {
+        let url = format!("{}/grid/nodes/{}/prices", self.base_url, enc_seg(node_id));
+        let resp = self.client.get(&url).send().await.map_err(|e| format!("Price fetch failed: {e}"))?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            return Err(format!("Price fetch failed ({status}): {text}"));
+        }
+        resp.json().await.map_err(|e| format!("Bad price response: {e}"))
+    }
+
+    /// Set a custom per-token price for a model this node serves (X-Node-Auth; the
+    /// orchestrator enforces the allowed band). Prices are USD per 1M tokens.
+    pub async fn set_price(&self, node_id: &str, model: &str, input_per_m: f64, output_per_m: f64) -> Result<(), String> {
+        let url = format!("{}/grid/nodes/{}/prices", self.base_url, enc_seg(node_id));
+        let token = self.get_token()?;
+        let resp = self
+            .client
+            .post(&url)
+            .header("X-Node-Auth", token)
+            .json(&serde_json::json!({ "model": model, "input_per_m": input_per_m, "output_per_m": output_per_m }))
+            .send()
+            .await
+            .map_err(|e| format!("Set price failed: {e}"))?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            return Err(format!("Set price failed ({status}): {text}"));
+        }
+        Ok(())
+    }
+
+    /// Reset a model's price back to the platform suggested rate.
+    pub async fn reset_price(&self, node_id: &str, model: &str) -> Result<(), String> {
+        let url = format!("{}/grid/nodes/{}/prices", self.base_url, enc_seg(node_id));
+        let token = self.get_token()?;
+        let resp = self
+            .client
+            .post(&url)
+            .header("X-Node-Auth", token)
+            .json(&serde_json::json!({ "model": model, "reset": true }))
+            .send()
+            .await
+            .map_err(|e| format!("Reset price failed: {e}"))?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            return Err(format!("Reset price failed ({status}): {text}"));
+        }
+        Ok(())
+    }
+
     pub async fn verify_attestation(
         &self,
         node_id: &str,
