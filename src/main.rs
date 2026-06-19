@@ -200,6 +200,11 @@ enum ServiceAction {
         #[arg(long, default_value = "1")]
         max_jobs: u32,
 
+        /// Context window size in tokens (bigger handles longer conversations but
+        /// uses more RAM for the KV cache).
+        #[arg(long, default_value = "4096")]
+        context_size: u32,
+
         /// Heartbeat interval in seconds
         #[arg(long, default_value = "5")]
         heartbeat_interval: u64,
@@ -378,6 +383,7 @@ async fn main() {
                     resource_percent,
                     inference_port,
                     max_jobs,
+                    context_size,
                     heartbeat_interval,
                     enable_streaming,
                     sandbox,
@@ -389,6 +395,7 @@ async fn main() {
                         resource_percent,
                         inference_port,
                         max_jobs,
+                        context_size,
                         heartbeat_interval,
                         enable_streaming,
                         sandbox,

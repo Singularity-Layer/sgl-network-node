@@ -22,6 +22,7 @@ pub struct ServiceStartOptions {
     pub resource_percent: u8,
     pub inference_port: u16,
     pub max_jobs: u32,
+    pub context_size: u32,
     pub heartbeat_interval: u64,
     pub enable_streaming: bool,
     /// macOS: wrap the node in a Seatbelt sandbox (opt-in). Ignored on Linux,
@@ -49,6 +50,8 @@ impl ServiceStartOptions {
         args.push(self.inference_port.to_string());
         args.push("--max-jobs".into());
         args.push(self.max_jobs.to_string());
+        args.push("--context-size".into());
+        args.push(self.context_size.to_string());
         args.push("--heartbeat-interval".into());
         args.push(self.heartbeat_interval.to_string());
         if self.enable_streaming {
