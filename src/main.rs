@@ -89,7 +89,7 @@ enum Commands {
         gpu_layers: Option<u32>,
 
         /// Context window size in tokens
-        #[arg(long, default_value = "4096")]
+        #[arg(long, default_value = "4096", value_parser = clap::value_parser!(u32).range(512..=131072))]
         context_size: u32,
 
         /// Max concurrent jobs this node will accept
@@ -202,7 +202,7 @@ enum ServiceAction {
 
         /// Context window size in tokens (bigger handles longer conversations but
         /// uses more RAM for the KV cache).
-        #[arg(long, default_value = "4096")]
+        #[arg(long, default_value = "4096", value_parser = clap::value_parser!(u32).range(512..=131072))]
         context_size: u32,
 
         /// Heartbeat interval in seconds

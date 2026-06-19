@@ -115,6 +115,9 @@ struct HeartbeatRequest {
 #[derive(Serialize)]
 struct NodeCapabilities {
     streaming: bool,
+    // Context window this node serves with (llama-server -c). The grid uses it to
+    // size the pre-dispatch prompt check per node instead of assuming a default.
+    context_size: u32,
 }
 
 #[derive(Deserialize)]
@@ -349,6 +352,7 @@ impl OrchestratorClient {
         current_load: f64,
         encryption_public_key: Option<&str>,
         streaming: bool,
+        context_size: u32,
     ) -> Result<HeartbeatResponse, String> {
         let url = format!("{}/grid/nodes/heartbeat", self.base_url);
         let token = self.get_token()?;
@@ -357,7 +361,7 @@ impl OrchestratorClient {
             current_load,
             available_models: models.to_vec(),
             encryption_public_key: encryption_public_key.map(|s| s.to_string()),
-            capabilities: NodeCapabilities { streaming },
+            capabilities: NodeCapabilities { streaming, context_size },
         };
 
         let resp = self

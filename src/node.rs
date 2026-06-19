@@ -433,6 +433,7 @@ pub async fn start(
                 rc.load_factor(),
                 Some(&node_enc_pubkey),
                 rc.streaming_enabled,
+                rc.context_size,
             )
             .await
         {
