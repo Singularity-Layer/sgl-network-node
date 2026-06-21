@@ -369,6 +369,22 @@ pub async fn start(
         crate::encryption::EncryptionKeypair::from_ed25519_seed(&node_secret).public_key_bs58();
     tracing::info!("X25519 encryption key: {node_enc_pubkey}");
 
+    // #94: sign the keybind blob once (it's static per node — node_id + ed25519 +
+    // x25519 + key_version are all fixed) and publish it on every heartbeat. Clients
+    // verify this against the node's on-chain identity before sealing, so a malicious
+    // orchestrator can't substitute its own key. Backward-compatible: if signing
+    // can't happen (e.g. node_id isn't a UUID) we just publish the key unsigned.
+    const KEY_VERSION: u32 = 1;
+    let node_enc_pubkey_bytes =
+        crate::encryption::EncryptionKeypair::from_ed25519_seed(&node_secret).public_key_bytes();
+    let keybind_sig =
+        crate::crypto::sign_keybind_v1(&node_secret, &cfg.node_id, &node_enc_pubkey_bytes, KEY_VERSION);
+    let key_version_opt = keybind_sig.as_ref().map(|_| KEY_VERSION);
+    match &keybind_sig {
+        Some(_) => tracing::info!("Signed key identity published (keybind v1, key_version={KEY_VERSION})"),
+        None => tracing::warn!("Could not sign keybind (node_id not a UUID?) — publishing key unsigned"),
+    }
+
     let active_jobs = Arc::new(AtomicU32::new(0));
     let seen_jobs = Arc::new(Mutex::new(SeenJobs::new()));
 
@@ -432,6 +448,8 @@ pub async fn start(
                 &models,
                 rc.load_factor(),
                 Some(&node_enc_pubkey),
+                keybind_sig.as_deref(),
+                key_version_opt,
                 rc.streaming_enabled,
                 rc.context_size,
             )

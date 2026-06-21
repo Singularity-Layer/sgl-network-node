@@ -107,6 +107,13 @@ struct HeartbeatRequest {
     // orchestrator always has the current key without a separate attest step).
     #[serde(skip_serializing_if = "Option::is_none")]
     encryption_public_key: Option<String>,
+    // #94: ed25519 signature binding the X25519 key above to this node's identity
+    // (node_id + ed25519 + x25519 + key_version). The orchestrator stores + relays it
+    // so clients can verify they're sealing to the genuine node (anti-MITM).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    encryption_public_key_signature: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    key_version: Option<u32>,
     // Feature capabilities the orchestrator uses for routing (e.g. only route
     // streaming requests to nodes that advertise `streaming: true`).
     capabilities: NodeCapabilities,
@@ -351,6 +358,8 @@ impl OrchestratorClient {
         models: &[String],
         current_load: f64,
         encryption_public_key: Option<&str>,
+        encryption_public_key_signature: Option<&str>,
+        key_version: Option<u32>,
         streaming: bool,
         context_size: u32,
     ) -> Result<HeartbeatResponse, String> {
@@ -361,6 +370,8 @@ impl OrchestratorClient {
             current_load,
             available_models: models.to_vec(),
             encryption_public_key: encryption_public_key.map(|s| s.to_string()),
+            encryption_public_key_signature: encryption_public_key_signature.map(|s| s.to_string()),
+            key_version,
             capabilities: NodeCapabilities { streaming, context_size },
         };
 

@@ -160,6 +160,11 @@ impl EncryptionKeypair {
         bs58::encode(self.public.as_bytes()).into_string()
     }
 
+    /// Raw 32-byte X25519 public key (for the #94 keybind signature blob).
+    pub fn public_key_bytes(&self) -> [u8; 32] {
+        *self.public.as_bytes()
+    }
+
     fn shared_with(&self, sender_public: &[u8; 32]) -> Result<[u8; 32], String> {
         let sender_pk = PublicKey::from(*sender_public);
         let shared = self.secret.diffie_hellman(&sender_pk);

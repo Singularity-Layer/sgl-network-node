@@ -180,5 +180,86 @@ pub fn sign_result_envelope(secret: &[u8; 32], job_id: &str, kind: &str, payload
     bs58::encode(sk.sign(msg.as_bytes()).to_bytes()).into_string()
 }
 
+/// #94 — sign the canonical "keybind" blob binding the node's X25519 encryption key
+/// to its ed25519 identity (+ node_id + key_version). A client (#105) verifies this
+/// against the node's ed25519 identity and on-chain stake before sealing its prompt,
+/// so a malicious/compromised orchestrator can't substitute its own X25519 key and
+/// MITM the "E2E" handoff. The orchestrator relays the signature + key_version
+/// untouched (it never needs the node's secret).
+///
+/// Blob = b"SGL-NODE-KEYBIND-v1" || 0x00 || node_id(16) || ed25519_pub(32)
+///        || x25519_pub(32) || key_version(u32 LE)
+/// Returns the bs58 signature, or None if node_id isn't a parseable UUID (caller then
+/// simply omits the signature — fully backward-compatible).
+pub fn sign_keybind_v1(
+    secret: &[u8; 32],
+    node_id: &str,
+    x25519_pub: &[u8; 32],
+    key_version: u32,
+) -> Option<String> {
+    let node_id_bytes = uuid_to_bytes(node_id)?;
+    let sk = SigningKey::from_bytes(secret);
+    let ed25519_pub = sk.verifying_key().to_bytes();
+    let mut blob = Vec::with_capacity(19 + 1 + 16 + 32 + 32 + 4);
+    blob.extend_from_slice(b"SGL-NODE-KEYBIND-v1");
+    blob.push(0x00);
+    blob.extend_from_slice(&node_id_bytes);
+    blob.extend_from_slice(&ed25519_pub);
+    blob.extend_from_slice(x25519_pub);
+    blob.extend_from_slice(&key_version.to_le_bytes());
+    Some(bs58::encode(sk.sign(&blob).to_bytes()).into_string())
+}
+
+/// Parse a UUID string (dashed or not) into its 16 raw bytes.
+fn uuid_to_bytes(s: &str) -> Option<[u8; 16]> {
+    let hex: String = s.chars().filter(|c| *c != '-').collect();
+    if hex.len() != 32 {
+        return None;
+    }
+    let mut out = [0u8; 16];
+    for i in 0..16 {
+        out[i] = u8::from_str_radix(hex.get(i * 2..i * 2 + 2)?, 16).ok()?;
+    }
+    Some(out)
+}
+
 pub use create_secure_dir as create_dir_0700;
 pub use write_secure_file as write_file_0600;
+
+#[cfg(test)]
+mod keybind_tests {
+    use super::*;
+    use ed25519_dalek::{Signature, Verifier};
+
+    #[test]
+    fn keybind_sig_verifies_against_identity() {
+        let secret = [7u8; 32];
+        let x25519 = [9u8; 32];
+        let node_id = "f617ee39-17e3-4904-9474-112446c9326a";
+        let sig_b58 = sign_keybind_v1(&secret, node_id, &x25519, 1).expect("sig");
+
+        // Rebuild the exact blob a verifier (the client, #105) would and check it.
+        let sk = SigningKey::from_bytes(&secret);
+        let vk = sk.verifying_key();
+        let mut blob = Vec::new();
+        blob.extend_from_slice(b"SGL-NODE-KEYBIND-v1");
+        blob.push(0x00);
+        blob.extend_from_slice(&uuid_to_bytes(node_id).unwrap());
+        blob.extend_from_slice(&vk.to_bytes());
+        blob.extend_from_slice(&x25519);
+        blob.extend_from_slice(&1u32.to_le_bytes());
+
+        let sig = Signature::from_slice(&bs58::decode(&sig_b58).into_vec().unwrap()).unwrap();
+        assert!(vk.verify(&blob, &sig).is_ok());
+
+        // A tampered x25519 key must NOT verify (the MITM case).
+        let mut bad = blob.clone();
+        bad[19 + 1 + 16 + 32] ^= 0xFF; // flip a byte in the x25519 section
+        assert!(vk.verify(&bad, &sig).is_err());
+    }
+
+    #[test]
+    fn bad_uuid_returns_none() {
+        assert!(sign_keybind_v1(&[0u8; 32], "not-a-uuid", &[0u8; 32], 1).is_none());
+    }
+}
