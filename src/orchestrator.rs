@@ -117,6 +117,10 @@ struct HeartbeatRequest {
     // Feature capabilities the orchestrator uses for routing (e.g. only route
     // streaming requests to nodes that advertise `streaming: true`).
     capabilities: NodeCapabilities,
+    // #119: ids of jobs this node is ACTUALLY processing right now. The orchestrator
+    // terminalizes any dispatched job NOT in this set (a ghost) and frees the slot.
+    // Always sent (even empty) so an idle node clears its ghosts.
+    active_job_ids: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -362,6 +366,7 @@ impl OrchestratorClient {
         key_version: Option<u32>,
         streaming: bool,
         context_size: u32,
+        active_job_ids: Vec<String>,
     ) -> Result<HeartbeatResponse, String> {
         let url = format!("{}/grid/nodes/heartbeat", self.base_url);
         let token = self.get_token()?;
@@ -373,6 +378,7 @@ impl OrchestratorClient {
             encryption_public_key_signature: encryption_public_key_signature.map(|s| s.to_string()),
             key_version,
             capabilities: NodeCapabilities { streaming, context_size },
+            active_job_ids,
         };
 
         let resp = self

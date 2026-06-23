@@ -111,6 +111,7 @@ fn maybe_spawn_job(
     node_secret: [u8; 32],
     streaming_enabled: bool,
     active_jobs: Arc<AtomicU32>,
+    inflight: Arc<Mutex<HashSet<String>>>,
     seen: Arc<Mutex<SeenJobs>>,
     max_jobs: u32,
 ) {
@@ -139,10 +140,16 @@ fn maybe_spawn_job(
             return;
         }
     }
+    // Record the REAL in-flight job id so the heartbeat can report exactly what we're
+    // running (#119). The orchestrator uses this to clear ghost slots — dispatched jobs
+    // we are NOT processing — without ever killing a job we ARE processing.
+    inflight.lock().unwrap().insert(job.id.clone());
     tracing::info!("Accepted job {} (type: {})", job.id, job.job_type);
+    let job_id = job.id.clone();
     tokio::spawn(async move {
         process_job(&client, &engine, &job, &node_secret, streaming_enabled).await;
         active_jobs.fetch_sub(1, Ordering::Relaxed);
+        inflight.lock().unwrap().remove(&job_id);
     });
 }
 
@@ -386,6 +393,9 @@ pub async fn start(
     }
 
     let active_jobs = Arc::new(AtomicU32::new(0));
+    // Real in-flight job ids (#119) — reported in each heartbeat so the orchestrator can
+    // clear ghost slots safely. Distinct from `active_jobs` (the capacity CAS counter).
+    let inflight: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
     let seen_jobs = Arc::new(Mutex::new(SeenJobs::new()));
 
     // ── WebSocket push-dispatch (additive fast-path) ──────────────────
@@ -403,6 +413,7 @@ pub async fn start(
         let secret = node_secret;
         let se = rc.streaming_enabled;
         let aj = Arc::clone(&active_jobs);
+        let inf = Arc::clone(&inflight);
         let sj = Arc::clone(&seen_jobs);
         let mj = rc.max_jobs;
         let st = Arc::clone(&ws_state);
@@ -422,6 +433,7 @@ pub async fn start(
                         secret,
                         se,
                         Arc::clone(&aj),
+                        Arc::clone(&inf),
                         Arc::clone(&sj),
                         mj,
                     );
@@ -442,6 +454,9 @@ pub async fn start(
     }
 
     loop {
+        // Snapshot the jobs we're actually running right now (#119) so the orchestrator can
+        // clear any ghost slots. Always sent (even empty) so an idle node frees its slots.
+        let active_job_ids: Vec<String> = inflight.lock().unwrap().iter().cloned().collect();
         match client
             .heartbeat(
                 &cfg.node_id,
@@ -452,6 +467,7 @@ pub async fn start(
                 key_version_opt,
                 rc.streaming_enabled,
                 rc.context_size,
+                active_job_ids,
             )
             .await
         {
@@ -484,6 +500,7 @@ pub async fn start(
                         node_secret,
                         rc.streaming_enabled,
                         Arc::clone(&active_jobs),
+                        Arc::clone(&inflight),
                         Arc::clone(&seen_jobs),
                         rc.max_jobs,
                     );
