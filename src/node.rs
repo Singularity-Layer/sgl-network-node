@@ -453,14 +453,44 @@ pub async fn start(
         });
     }
 
+    // Liveness-gated advertising: only advertise the model while llama-server actually
+    // answers /health. If the engine has crashed/OOM'd mid-run (e.g. a 14B model on a
+    // too-small box) we stop advertising after 2 consecutive failed probes, so the
+    // orchestrator routes elsewhere instead of dispatching jobs this node would ghost.
+    // A single transient blip is tolerated, and advertising resumes automatically the
+    // moment /health is OK again (self-healing on operator restart or engine recovery).
+    let mut unhealthy_streak: u32 = 0;
     loop {
         // Snapshot the jobs we're actually running right now (#119) so the orchestrator can
         // clear any ghost slots. Always sent (even empty) so an idle node frees its slots.
         let active_job_ids: Vec<String> = inflight.lock().unwrap().iter().cloned().collect();
+
+        let advertised: Vec<String> = if let Some(ref eng) = engine {
+            if eng.is_healthy().await {
+                if unhealthy_streak > 0 {
+                    tracing::info!("llama-server healthy again — resuming model advertisement");
+                }
+                unhealthy_streak = 0;
+                models.clone()
+            } else {
+                unhealthy_streak += 1;
+                if unhealthy_streak >= 2 {
+                    tracing::warn!(
+                        "llama-server not responding ({unhealthy_streak} checks) — not advertising models so the grid routes elsewhere. Restart the node to recover."
+                    );
+                    Vec::new()
+                } else {
+                    models.clone() // tolerate one transient blip before pulling the model
+                }
+            }
+        } else {
+            models.clone()
+        };
+
         match client
             .heartbeat(
                 &cfg.node_id,
-                &models,
+                &advertised,
                 rc.load_factor(),
                 Some(&node_enc_pubkey),
                 keybind_sig.as_deref(),

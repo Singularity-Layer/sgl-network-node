@@ -201,6 +201,30 @@ impl InferenceEngine {
         }
     }
 
+    /// Liveness probe for the heartbeat loop, with a SHORT timeout so a hung or dead
+    /// llama-server is detected fast (instead of blocking). The node uses this to stop
+    /// advertising its model when the engine isn't actually serving — which is what
+    /// prevents "ghost" jobs (a node that heartbeats fine but whose llama-server has
+    /// crashed/OOM'd mid-run, e.g. a 14B model on a too-small box). Self-healing: once
+    /// the engine answers /health again, the node re-advertises automatically.
+    pub async fn is_healthy(&self) -> bool {
+        let url = format!("{}/health", self.base_url);
+        match self
+            .client
+            .get(&url)
+            .timeout(Duration::from_secs(3))
+            .send()
+            .await
+        {
+            Ok(resp) => resp
+                .json::<HealthResponse>()
+                .await
+                .map(|h| h.status.as_deref() == Some("ok"))
+                .unwrap_or(false),
+            Err(_) => false,
+        }
+    }
+
     pub async fn chat_completion(
         &self,
         messages: Vec<ChatMessage>,
