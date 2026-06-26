@@ -2,6 +2,8 @@ mod config;
 mod crypto;
 mod encryption;
 mod inference;
+#[cfg(feature = "inprocess")]
+mod inprocess;
 mod node;
 mod orchestrator;
 mod runtime_hardening;
