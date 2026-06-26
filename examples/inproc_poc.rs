@@ -10,7 +10,7 @@ use llama_cpp_2::context::params::LlamaContextParams;
 use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::params::LlamaModelParams;
-use llama_cpp_2::model::{AddBos, LlamaModel, Special};
+use llama_cpp_2::model::{AddBos, LlamaChatMessage, LlamaModel, Special};
 use llama_cpp_2::sampling::LlamaSampler;
 
 fn main() {
@@ -25,9 +25,17 @@ fn main() {
         .new_context(&backend, LlamaContextParams::default())
         .expect("create context");
 
-    let prompt = "Say hi in three words.";
+    // Apply the model's baked-in chat template so instruct behavior matches llama-server.
+    let template = model.chat_template(None).expect("model chat template");
+    let messages = vec![
+        LlamaChatMessage::new("user".to_string(), "Say hi in three words.".to_string()).unwrap(),
+    ];
+    let prompt = model
+        .apply_chat_template(&template, &messages, true)
+        .expect("apply chat template");
+    // Template already includes BOS + special tokens (str_to_token parses special=true).
     let tokens = model
-        .str_to_token(prompt, AddBos::Always)
+        .str_to_token(&prompt, AddBos::Never)
         .expect("tokenize prompt");
     let prompt_tokens = tokens.len();
 
