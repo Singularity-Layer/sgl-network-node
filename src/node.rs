@@ -357,11 +357,17 @@ pub async fn start(
             batch_size: rc.batch_size,
             parallel_slots: rc.max_jobs,
         };
-        let eng = InferenceEngine::new(eng_config);
-        eng.start().await?;
+        // Engine selection: SGL_ENGINE=server|inprocess (default server during the
+        // in-process rollout). `inprocess` requires a build with the `inprocess` feature.
+        let engine_mode = match std::env::var("SGL_ENGINE").ok().as_deref() {
+            Some(s) if !s.is_empty() => crate::inference::EngineMode::parse(s)?,
+            _ => crate::inference::EngineMode::Server,
+        };
+        tracing::info!("Inference engine mode: {engine_mode:?}");
+        let eng = InferenceEngine::create(eng_config, engine_mode).await?;
         models.push(name);
         engine = Some(Arc::new(eng));
-        tracing::info!("Inference engine ready on port {inference_port}");
+        tracing::info!("Inference engine ready ({engine_mode:?})");
     } else {
         tracing::warn!("No model specified — node will register but cannot process inference jobs");
         tracing::warn!("Use --model-path <path.gguf> --model-name <name> to enable inference");

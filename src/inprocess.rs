@@ -35,6 +35,7 @@ pub struct GenOut {
 
 pub struct InProcessConfig {
     pub model_path: PathBuf,
+    pub model_name: String,
     pub n_ctx: u32,
     pub n_gpu_layers: u32,
 }
@@ -59,6 +60,7 @@ struct Job {
 pub struct InProcessEngine {
     job_tx: Sender<Job>,
     healthy: Arc<AtomicBool>,
+    model_name: String,
     _worker: JoinHandle<()>,
 }
 
@@ -68,6 +70,7 @@ impl InProcessEngine {
         let (job_tx, job_rx) = std::sync::mpsc::channel::<Job>();
         let healthy = Arc::new(AtomicBool::new(false));
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
+        let model_name = cfg.model_name.clone();
 
         let worker_healthy = Arc::clone(&healthy);
         let worker = std::thread::Builder::new()
@@ -76,10 +79,14 @@ impl InProcessEngine {
             .map_err(|e| format!("failed to spawn inference worker: {e}"))?;
 
         match ready_rx.await {
-            Ok(Ok(())) => Ok(Self { job_tx, healthy, _worker: worker }),
+            Ok(Ok(())) => Ok(Self { job_tx, healthy, model_name, _worker: worker }),
             Ok(Err(e)) => Err(e),
             Err(_) => Err("inference worker died during startup".to_string()),
         }
+    }
+
+    pub fn model_name(&self) -> &str {
+        &self.model_name
     }
 
     /// Non-streaming completion.
@@ -158,14 +165,31 @@ fn worker_main(
     let _ = ready_tx.send(Ok(()));
 
     while let Ok(job) = job_rx.recv() {
-        match job.kind {
-            JobKind::NonStream(reply) => {
-                let r = generate(&backend, &model, cfg.n_ctx, &job.messages, job.max_tokens, job.temperature, None);
-                let _ = reply.send(r);
+        let Job { messages, max_tokens, temperature, kind } = job;
+        let stream_sink = match &kind {
+            JobKind::Stream { tokens, .. } => Some(tokens.clone()),
+            JobKind::NonStream(_) => None,
+        };
+        // A Rust panic mid-generation means a broken invariant — make it FATAL so the OS
+        // service relaunches the node clean (the anti-zombie property). Native llama.cpp
+        // aborts/segfaults already kill the process; this covers the Rust-panic case
+        // without forcing global panic=abort on the rest of the node.
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            generate(&backend, &model, cfg.n_ctx, &messages, max_tokens, temperature, stream_sink.as_ref())
+        }));
+        let result = match outcome {
+            Ok(r) => r,
+            Err(_) => {
+                tracing::error!("inference worker panicked mid-generation — aborting for a clean OS restart");
+                std::process::abort();
             }
-            JobKind::Stream { tokens, done } => {
-                let r = generate(&backend, &model, cfg.n_ctx, &job.messages, job.max_tokens, job.temperature, Some(&tokens));
-                let _ = done.send(r.map(|_| ()));
+        };
+        match kind {
+            JobKind::NonStream(reply) => {
+                let _ = reply.send(result);
+            }
+            JobKind::Stream { done, .. } => {
+                let _ = done.send(result.map(|_| ()));
             }
         }
     }

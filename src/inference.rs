@@ -15,10 +15,12 @@ pub struct InferenceEngineConfig {
     pub parallel_slots: u32,
 }
 
-pub struct InferenceEngine {
-    // Behind a Mutex so the engine can be shared as Arc<InferenceEngine> across the
-    // heartbeat loop + job handlers AND still be (re)started/stopped via &self. The
-    // guard is never held across an await (we lock only to swap the Child handle).
+/// The original child-process engine (spawns `llama-server`, talks HTTP). Kept as one
+/// arm of the `InferenceEngine` enum for A/B during the in-process rollout.
+pub struct ServerEngine {
+    // Behind a Mutex so the engine can be shared across the heartbeat loop + job handlers
+    // AND still be (re)started/stopped via &self. The guard is never held across an await
+    // (we lock only to swap the Child handle).
     server_process: std::sync::Mutex<Option<Child>>,
     client: Client,
     base_url: String,
@@ -109,7 +111,7 @@ struct HealthResponse {
     status: Option<String>,
 }
 
-impl InferenceEngine {
+impl ServerEngine {
     pub fn new(mut config: InferenceEngineConfig) -> Self {
         let port = find_available_port(config.port);
         config.port = port;
@@ -433,7 +435,7 @@ impl InferenceEngine {
     }
 }
 
-impl Drop for InferenceEngine {
+impl Drop for ServerEngine {
     fn drop(&mut self) {
         self.stop();
     }
@@ -444,6 +446,131 @@ pub struct InferenceResult {
     pub model: String,
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
+}
+
+/// Which inference backend the node runs (`--engine`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EngineMode {
+    /// Spawn `llama-server` as a child process and talk HTTP (legacy).
+    Server,
+    /// Embed llama.cpp in-process (no child, no localhost, no IPC). Requires the
+    /// `inprocess` build feature; the node is one process so a crash relaunches clean.
+    InProcess,
+}
+
+impl EngineMode {
+    pub fn parse(s: &str) -> Result<Self, String> {
+        match s.to_ascii_lowercase().as_str() {
+            "server" => Ok(EngineMode::Server),
+            "inprocess" | "in-process" => Ok(EngineMode::InProcess),
+            other => Err(format!("unknown --engine '{other}' (use 'server' or 'inprocess')")),
+        }
+    }
+}
+
+/// The node's inference engine. Dispatches to the legacy child-process `ServerEngine` or
+/// the in-process `llama-cpp-2` engine. Public API matches what node.rs / ws.rs already
+/// call, so the rest of the node is engine-agnostic.
+pub enum InferenceEngine {
+    Server(ServerEngine),
+    #[cfg(feature = "inprocess")]
+    InProcess(crate::inprocess::InProcessEngine),
+}
+
+impl InferenceEngine {
+    /// Build + start the chosen engine.
+    pub async fn create(config: InferenceEngineConfig, mode: EngineMode) -> Result<Self, String> {
+        match mode {
+            EngineMode::Server => {
+                let e = ServerEngine::new(config);
+                e.start().await?;
+                Ok(InferenceEngine::Server(e))
+            }
+            EngineMode::InProcess => {
+                #[cfg(feature = "inprocess")]
+                {
+                    let e = crate::inprocess::InProcessEngine::start(crate::inprocess::InProcessConfig {
+                        model_path: config.model_path,
+                        model_name: config.model_name,
+                        n_ctx: config.context_size,
+                        n_gpu_layers: config.gpu_layers,
+                    })
+                    .await?;
+                    Ok(InferenceEngine::InProcess(e))
+                }
+                #[cfg(not(feature = "inprocess"))]
+                {
+                    let _ = config;
+                    Err("--engine=inprocess requires a build with the `inprocess` feature".to_string())
+                }
+            }
+        }
+    }
+
+    pub async fn is_healthy(&self) -> bool {
+        match self {
+            InferenceEngine::Server(e) => e.is_healthy().await,
+            #[cfg(feature = "inprocess")]
+            InferenceEngine::InProcess(e) => e.is_healthy(),
+        }
+    }
+
+    pub fn stop(&self) {
+        match self {
+            InferenceEngine::Server(e) => e.stop(),
+            #[cfg(feature = "inprocess")]
+            InferenceEngine::InProcess(_) => { /* worker stops when the engine is dropped */ }
+        }
+    }
+
+    pub async fn restart(&self) -> Result<(), String> {
+        match self {
+            InferenceEngine::Server(e) => e.restart().await,
+            // In-process: a fatal fault aborts the whole process (panic=abort) so the OS
+            // service relaunches it clean — there is no child process to restart here.
+            #[cfg(feature = "inprocess")]
+            InferenceEngine::InProcess(_) => Ok(()),
+        }
+    }
+
+    pub async fn chat_completion(
+        &self,
+        messages: Vec<ChatMessage>,
+        temperature: f64,
+        max_tokens: i32,
+    ) -> Result<InferenceResult, String> {
+        match self {
+            InferenceEngine::Server(e) => e.chat_completion(messages, temperature, max_tokens).await,
+            #[cfg(feature = "inprocess")]
+            InferenceEngine::InProcess(e) => {
+                let out = e.chat_completion(&messages, max_tokens, temperature as f32).await?;
+                Ok(InferenceResult {
+                    content: out.content,
+                    model: e.model_name().to_string(),
+                    prompt_tokens: out.prompt_tokens,
+                    completion_tokens: out.completion_tokens,
+                })
+            }
+        }
+    }
+
+    pub async fn chat_completion_stream(
+        &self,
+        messages: Vec<ChatMessage>,
+        temperature: f64,
+        max_tokens: i32,
+        tx: tokio::sync::mpsc::Sender<StreamEvent>,
+    ) -> Result<(), String> {
+        match self {
+            InferenceEngine::Server(e) => {
+                e.chat_completion_stream(messages, temperature, max_tokens, tx).await
+            }
+            #[cfg(feature = "inprocess")]
+            InferenceEngine::InProcess(e) => {
+                e.chat_completion_stream(&messages, max_tokens, temperature as f32, tx).await
+            }
+        }
+    }
 }
 
 pub fn find_available_port(preferred: u16) -> u16 {
