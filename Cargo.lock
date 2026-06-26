@@ -1300,7 +1300,7 @@ dependencies = [
 
 [[package]]
 name = "sgl-node"
-version = "1.4.2"
+version = "1.4.4"
 dependencies = [
  "bs58",
  "chacha20poly1305",

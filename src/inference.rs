@@ -16,7 +16,10 @@ pub struct InferenceEngineConfig {
 }
 
 pub struct InferenceEngine {
-    server_process: Option<Child>,
+    // Behind a Mutex so the engine can be shared as Arc<InferenceEngine> across the
+    // heartbeat loop + job handlers AND still be (re)started/stopped via &self. The
+    // guard is never held across an await (we lock only to swap the Child handle).
+    server_process: std::sync::Mutex<Option<Child>>,
     client: Client,
     base_url: String,
     config: InferenceEngineConfig,
@@ -112,14 +115,17 @@ impl InferenceEngine {
         config.port = port;
         let base_url = format!("http://127.0.0.1:{}", port);
         Self {
-            server_process: None,
+            server_process: std::sync::Mutex::new(None),
             client: Client::new(),
             base_url,
             config,
         }
     }
 
-    pub async fn start(&mut self) -> Result<(), String> {
+    pub async fn start(&self) -> Result<(), String> {
+        // Non-reentrant: kill any existing child first so a second start() (or a manual
+        // call) can never orphan a running llama-server. No-op on the initial start.
+        self.stop();
         if !self.config.model_path.exists() {
             return Err(format!(
                 "Model file not found: {}",
@@ -164,7 +170,9 @@ impl InferenceEngine {
             .spawn()
             .map_err(|e| format!("Failed to start llama-server: {e}"))?;
 
-        self.server_process = Some(child);
+        // Store the new child (replacing any prior handle). Lock is dropped before the
+        // await loop below — never hold a std Mutex guard across .await.
+        { *self.server_process.lock().unwrap() = Some(child); }
 
         for i in 0..30 {
             sleep(Duration::from_secs(1)).await;
@@ -178,18 +186,33 @@ impl InferenceEngine {
         Err("llama-server failed to start within 30s".to_string())
     }
 
-    pub fn stop(&mut self) {
-        if let Some(ref mut child) = self.server_process {
+    pub fn stop(&self) {
+        // take() the child out under the lock, then kill+wait (all sync; no await).
+        let child = self.server_process.lock().unwrap().take();
+        if let Some(mut child) = child {
             let _ = child.kill();
             let _ = child.wait();
             tracing::info!("llama-server stopped");
         }
-        self.server_process = None;
+    }
+
+    /// Supervised restart: kill the (crashed/hung) llama-server and start a fresh one.
+    /// Called by the heartbeat loop when /health has failed repeatedly, so a node whose
+    /// engine OOM'd or crashed mid-run self-heals WITHOUT the operator restarting it.
+    /// Returns Ok once the new server answers /health (start() waits up to 30s).
+    pub async fn restart(&self) -> Result<(), String> {
+        tracing::warn!("llama-server unhealthy — restarting the inference engine");
+        self.stop();
+        // Brief pause so the OS reclaims the port + GPU/unified memory before relaunch.
+        sleep(Duration::from_secs(2)).await;
+        self.start().await
     }
 
     async fn health_check(&self) -> bool {
         let url = format!("{}/health", self.base_url);
-        match self.client.get(&url).send().await {
+        // Bounded so start()'s 30s readiness wait can't hang on a /health that accepts
+        // the connection but never responds.
+        match self.client.get(&url).timeout(Duration::from_secs(3)).send().await {
             Ok(resp) => {
                 if let Ok(h) = resp.json::<HealthResponse>().await {
                     h.status.as_deref() == Some("ok")

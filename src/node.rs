@@ -357,7 +357,7 @@ pub async fn start(
             batch_size: rc.batch_size,
             parallel_slots: rc.max_jobs,
         };
-        let mut eng = InferenceEngine::new(eng_config);
+        let eng = InferenceEngine::new(eng_config);
         eng.start().await?;
         models.push(name);
         engine = Some(Arc::new(eng));
@@ -459,7 +459,15 @@ pub async fn start(
     // orchestrator routes elsewhere instead of dispatching jobs this node would ghost.
     // A single transient blip is tolerated, and advertising resumes automatically the
     // moment /health is OK again (self-healing on operator restart or engine recovery).
+    // Auto-restart supervision: when the engine has been unhealthy for 2+ checks we
+    // KILL + RELAUNCH llama-server (instead of waiting for the operator). Bounded by a
+    // restart cap so a model that can't run on this box (e.g. a 14B OOM-loop) doesn't
+    // thrash forever — after the cap we stay unadvertised until a manual fix/recovery.
+    // The counter resets the moment the engine is healthy again, so transient crashes
+    // get unlimited future restarts. This is what lets a dead node self-heal.
+    const MAX_ENGINE_RESTARTS: u32 = 5;
     let mut unhealthy_streak: u32 = 0;
+    let mut restart_attempts: u32 = 0;
     loop {
         // Snapshot the jobs we're actually running right now (#119) so the orchestrator can
         // clear any ghost slots. Always sent (even empty) so an idle node frees its slots.
@@ -471,13 +479,27 @@ pub async fn start(
                     tracing::info!("llama-server healthy again — resuming model advertisement");
                 }
                 unhealthy_streak = 0;
+                restart_attempts = 0; // healthy → future crashes get a fresh restart budget
                 models.clone()
             } else {
                 unhealthy_streak += 1;
                 if unhealthy_streak >= 2 {
-                    tracing::warn!(
-                        "llama-server not responding ({unhealthy_streak} checks) — not advertising models so the grid routes elsewhere. Restart the node to recover."
-                    );
+                    // Engine is down: stop advertising (grid routes elsewhere) AND try to
+                    // self-heal by relaunching llama-server, up to the cap.
+                    if restart_attempts < MAX_ENGINE_RESTARTS {
+                        restart_attempts += 1;
+                        tracing::warn!(
+                            "llama-server not responding ({unhealthy_streak} checks) — auto-restarting engine (attempt {restart_attempts}/{MAX_ENGINE_RESTARTS})"
+                        );
+                        match eng.restart().await {
+                            Ok(()) => tracing::info!("engine restarted; re-verifying health next cycle"),
+                            Err(e) => tracing::error!("engine restart failed: {e}"),
+                        }
+                    } else {
+                        tracing::error!(
+                            "llama-server still down after {MAX_ENGINE_RESTARTS} restarts — staying unadvertised (likely the model can't run on this box; pick a smaller model)"
+                        );
+                    }
                     Vec::new()
                 } else {
                     models.clone() // tolerate one transient blip before pulling the model

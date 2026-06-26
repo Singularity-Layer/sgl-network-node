@@ -1,6 +1,6 @@
 [package]
 name = "sgl-node"
-version = "1.4.3"
+version = "1.4.4"
 edition = "2021"
 description = "SGL Network node agent — confidential AI compute provider for the Singularity grid"
 
