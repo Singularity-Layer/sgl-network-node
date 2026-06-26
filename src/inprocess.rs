@@ -9,7 +9,7 @@
 //! process down so launchd/systemd relaunches it clean — the anti-zombie property.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::Arc;
 use std::thread::JoinHandle;
@@ -25,6 +25,18 @@ use crate::inference::{ChatMessage, StreamEvent};
 
 /// Flush a streamed batch every N decoded tokens (mirrors the server path's cadence).
 const FLUSH_EVERY: u32 = 6;
+
+/// If a job is in flight but the worker hasn't made token progress in this long, treat
+/// it as WEDGED (deadlocked / hung native call) → is_healthy() goes false so the node
+/// stops advertising. Generous so a legitimately slow prefill/token never trips it.
+const WEDGE_MS: u64 = 120_000;
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
 
 /// Result of one non-streaming completion, with billing-critical token counts.
 pub struct GenOut {
@@ -60,6 +72,10 @@ struct Job {
 pub struct InProcessEngine {
     job_tx: Sender<Job>,
     healthy: Arc<AtomicBool>,
+    /// True while a job is being generated. Idle (false) is always healthy.
+    processing: Arc<AtomicBool>,
+    /// Unix-ms of the last token (or prefill) progress; used to detect a wedged worker.
+    last_progress_ms: Arc<AtomicU64>,
     model_name: String,
     _worker: JoinHandle<()>,
 }
@@ -69,17 +85,21 @@ impl InProcessEngine {
     pub async fn start(cfg: InProcessConfig) -> Result<Self, String> {
         let (job_tx, job_rx) = std::sync::mpsc::channel::<Job>();
         let healthy = Arc::new(AtomicBool::new(false));
+        let processing = Arc::new(AtomicBool::new(false));
+        let last_progress_ms = Arc::new(AtomicU64::new(0));
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
         let model_name = cfg.model_name.clone();
 
-        let worker_healthy = Arc::clone(&healthy);
+        let w_healthy = Arc::clone(&healthy);
+        let w_processing = Arc::clone(&processing);
+        let w_progress = Arc::clone(&last_progress_ms);
         let worker = std::thread::Builder::new()
             .name("sgl-inference".into())
-            .spawn(move || worker_main(cfg, job_rx, worker_healthy, ready_tx))
+            .spawn(move || worker_main(cfg, job_rx, w_healthy, w_processing, w_progress, ready_tx))
             .map_err(|e| format!("failed to spawn inference worker: {e}"))?;
 
         match ready_rx.await {
-            Ok(Ok(())) => Ok(Self { job_tx, healthy, model_name, _worker: worker }),
+            Ok(Ok(())) => Ok(Self { job_tx, healthy, processing, last_progress_ms, model_name, _worker: worker }),
             Ok(Err(e)) => Err(e),
             Err(_) => Err("inference worker died during startup".to_string()),
         }
@@ -132,9 +152,18 @@ impl InProcessEngine {
             .map_err(|_| "inference worker dropped the request".to_string())?
     }
 
-    /// Healthy = model loaded and the worker thread alive.
+    /// Healthy = model loaded AND (idle OR the in-flight job is still making token
+    /// progress). A wedged worker (in flight but no progress for WEDGE_MS) reads as
+    /// UNHEALTHY so the heartbeat loop de-advertises it — closing the in-process
+    /// equivalent of the zombie.
     pub fn is_healthy(&self) -> bool {
-        self.healthy.load(Ordering::Relaxed)
+        if !self.healthy.load(Ordering::Relaxed) {
+            return false;
+        }
+        if !self.processing.load(Ordering::Relaxed) {
+            return true; // idle, model loaded
+        }
+        now_ms().saturating_sub(self.last_progress_ms.load(Ordering::Relaxed)) < WEDGE_MS
     }
 }
 
@@ -143,6 +172,8 @@ fn worker_main(
     cfg: InProcessConfig,
     job_rx: Receiver<Job>,
     healthy: Arc<AtomicBool>,
+    processing: Arc<AtomicBool>,
+    progress: Arc<AtomicU64>,
     ready_tx: tokio::sync::oneshot::Sender<Result<(), String>>,
 ) {
     let backend = match LlamaBackend::init() {
@@ -170,13 +201,18 @@ fn worker_main(
             JobKind::Stream { tokens, .. } => Some(tokens.clone()),
             JobKind::NonStream(_) => None,
         };
+        // Mark in-flight + seed progress so the watchdog (is_healthy) distinguishes a
+        // slow-but-alive generation from a wedged one.
+        progress.store(now_ms(), Ordering::Relaxed);
+        processing.store(true, Ordering::Relaxed);
         // A Rust panic mid-generation means a broken invariant — make it FATAL so the OS
         // service relaunches the node clean (the anti-zombie property). Native llama.cpp
         // aborts/segfaults already kill the process; this covers the Rust-panic case
         // without forcing global panic=abort on the rest of the node.
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            generate(&backend, &model, cfg.n_ctx, &messages, max_tokens, temperature, stream_sink.as_ref())
+            generate(&backend, &model, cfg.n_ctx, &messages, max_tokens, temperature, stream_sink.as_ref(), &progress)
         }));
+        processing.store(false, Ordering::Relaxed);
         let result = match outcome {
             Ok(r) => r,
             Err(_) => {
@@ -207,9 +243,13 @@ fn generate(
     max_tokens: i32,
     temperature: f32,
     stream: Option<&tokio::sync::mpsc::Sender<StreamEvent>>,
+    progress: &AtomicU64,
 ) -> Result<GenOut, String> {
+    // Honor the configured context window (matches `llama-server -c <n_ctx>`); without
+    // this the context would silently use the model/crate default.
+    let ctx_params = LlamaContextParams::default().with_n_ctx(std::num::NonZeroU32::new(n_ctx));
     let mut ctx = model
-        .new_context(backend, LlamaContextParams::default())
+        .new_context(backend, ctx_params)
         .map_err(|e| format!("context create failed: {e}"))?;
 
     let template = model
@@ -243,6 +283,7 @@ fn generate(
             .map_err(|e| format!("batch add failed: {e}"))?;
     }
     ctx.decode(&mut batch).map_err(|e| format!("prompt decode failed: {e}"))?;
+    progress.store(now_ms(), Ordering::Relaxed); // prefill done
 
     let mut sampler = if temperature > 0.0 {
         LlamaSampler::chain_simple([LlamaSampler::temp(temperature), LlamaSampler::dist(0)])
@@ -263,6 +304,7 @@ fn generate(
         if model.is_eog_token(token) {
             break;
         }
+        progress.store(now_ms(), Ordering::Relaxed); // token progress (watchdog)
         let piece = model.token_to_str(token, Special::Plaintext).unwrap_or_default();
         completion_tokens += 1;
 
