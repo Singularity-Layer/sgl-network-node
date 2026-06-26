@@ -18,7 +18,7 @@ use llama_cpp_2::context::params::LlamaContextParams;
 use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::params::LlamaModelParams;
-use llama_cpp_2::model::{AddBos, LlamaChatMessage, LlamaModel, Special};
+use llama_cpp_2::model::{AddBos, LlamaModel, Special};
 use llama_cpp_2::sampling::LlamaSampler;
 
 use crate::inference::{ChatMessage, StreamEvent};
@@ -252,17 +252,7 @@ fn generate(
         .new_context(backend, ctx_params)
         .map_err(|e| format!("context create failed: {e}"))?;
 
-    let template = model
-        .chat_template(None)
-        .map_err(|e| format!("chat template unavailable: {e}"))?;
-    let chat: Vec<LlamaChatMessage> = messages
-        .iter()
-        .map(|m| LlamaChatMessage::new(m.role.clone(), m.content.clone()))
-        .collect::<Result<_, _>>()
-        .map_err(|e| format!("bad chat message: {e}"))?;
-    let prompt = model
-        .apply_chat_template(&template, &chat, true)
-        .map_err(|e| format!("apply chat template failed: {e}"))?;
+    let prompt = render_chat_prompt(model, messages)?;
 
     let tokens = model
         .str_to_token(&prompt, AddBos::Never)
@@ -302,6 +292,7 @@ fn generate(
         let token = sampler.sample(&ctx, batch.n_tokens() - 1);
         sampler.accept(token);
         if model.is_eog_token(token) {
+            completion_tokens += 1; // llama-server counts the terminal stop token; match it for billing parity
             break;
         }
         progress.store(now_ms(), Ordering::Relaxed); // token progress (watchdog)
@@ -343,4 +334,43 @@ fn generate(
     }
 
     Ok(GenOut { content: out, prompt_tokens, completion_tokens })
+}
+
+/// Render the chat prompt EXACTLY like llama-server: parse the GGUF's jinja chat template
+/// (tokenizer.chat_template) with minijinja and feed it the same context — `messages`,
+/// `add_generation_prompt=true`, the model's `bos_token`, plus `strftime_now` so Llama-3's
+/// "Today Date" preamble matches. This closes the legacy-vs-jinja parity gap (prompt token
+/// counts + output) so billing is identical across the server and in-process engines.
+fn render_chat_prompt(model: &LlamaModel, messages: &[ChatMessage]) -> Result<String, String> {
+    let tmpl_str = model
+        .meta_val_str("tokenizer.chat_template")
+        .map_err(|e| format!("model has no chat_template metadata: {e}"))?;
+    // BOS as text (e.g. "<|begin_of_text|>"); the template emits it via {{ bos_token }} and
+    // str_to_token(parse_special) maps it back to the BOS id, so we tokenize with AddBos::Never.
+    let bos_token = model
+        .token_to_str(model.token_bos(), Special::Tokenize)
+        .unwrap_or_default();
+
+    let mut env = minijinja::Environment::new();
+    env.add_function("strftime_now", |fmt: String| {
+        chrono::Local::now().format(&fmt).to_string()
+    });
+    env.add_function(
+        "raise_exception",
+        |msg: String| -> Result<minijinja::Value, minijinja::Error> {
+            Err(minijinja::Error::new(minijinja::ErrorKind::InvalidOperation, msg))
+        },
+    );
+    env.add_template("chat", &tmpl_str)
+        .map_err(|e| format!("chat template parse failed: {e}"))?;
+    let tmpl = env
+        .get_template("chat")
+        .map_err(|e| format!("chat template load failed: {e}"))?;
+
+    tmpl.render(minijinja::context! {
+        messages => messages,
+        add_generation_prompt => true,
+        bos_token => bos_token,
+    })
+    .map_err(|e| format!("chat template render failed: {e}"))
 }

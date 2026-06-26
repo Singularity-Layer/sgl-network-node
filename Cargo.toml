@@ -33,9 +33,14 @@ futures-util = "0.3"
 # llama.cpp via cmake. Pin exact once the PoC resolves a version (crate doesn't follow
 # semver). Metal on macOS via the `metal` feature.
 llama-cpp-2 = { version = "0.1", optional = true }
+# Render the GGUF's jinja chat template EXACTLY like llama-server (the crate's
+# apply_chat_template uses llama.cpp's legacy engine, which omits Llama-3's date/system
+# preamble — see the parity finding). minijinja + chrono give byte-identical prompts.
+minijinja = { version = "2", optional = true }
+chrono = { version = "0.4", optional = true, default-features = false, features = ["clock", "std"] }
 
 [features]
-inprocess = ["dep:llama-cpp-2"]
+inprocess = ["dep:llama-cpp-2", "dep:minijinja", "dep:chrono"]
 metal = ["llama-cpp-2/metal"]
 
 [[example]]

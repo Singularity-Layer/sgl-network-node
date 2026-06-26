@@ -21,19 +21,42 @@ fn main() {
     let backend = LlamaBackend::init().expect("llama backend init");
     let model_params = LlamaModelParams::default().with_n_gpu_layers(999); // offload to Metal
     let model = LlamaModel::load_from_file(&backend, &path, &model_params).expect("load model");
+
+    // Dump the raw jinja chat template + key tokens so we can match llama-server's render.
+    if std::env::var("DUMP_TEMPLATE").is_ok() {
+        match model.meta_val_str("tokenizer.chat_template") {
+            Ok(t) => println!("===TEMPLATE_BEGIN===\n{t}\n===TEMPLATE_END==="),
+            Err(e) => println!("no chat_template meta: {e}"),
+        }
+        for k in ["tokenizer.ggml.bos_token_id", "tokenizer.ggml.eos_token_id"] {
+            if let Ok(v) = model.meta_val_str(k) {
+                println!("{k} = {v}");
+            }
+        }
+        return;
+    }
     let mut ctx = model
         .new_context(&backend, LlamaContextParams::default())
         .expect("create context");
 
-    // Apply the model's baked-in chat template so instruct behavior matches llama-server.
-    let template = model.chat_template(None).expect("model chat template");
-    let messages = vec![
-        LlamaChatMessage::new("user".to_string(), "Say hi in three words.".to_string()).unwrap(),
-    ];
-    let prompt = model
-        .apply_chat_template(&template, &messages, true)
-        .expect("apply chat template");
-    // Template already includes BOS + special tokens (str_to_token parses special=true).
+    // Render the GGUF jinja template with minijinja (same logic as InProcessEngine's
+    // render_chat_prompt) so the prompt matches llama-server exactly.
+    let tmpl_str = model.meta_val_str("tokenizer.chat_template").expect("chat_template meta");
+    let bos_token = model.token_to_str(model.token_bos(), Special::Tokenize).unwrap_or_default();
+    let mut env = minijinja::Environment::new();
+    env.add_function("strftime_now", |fmt: String| chrono::Local::now().format(&fmt).to_string());
+    env.add_function("raise_exception", |m: String| -> Result<minijinja::Value, minijinja::Error> {
+        Err(minijinja::Error::new(minijinja::ErrorKind::InvalidOperation, m))
+    });
+    env.add_template("chat", &tmpl_str).expect("parse template");
+    let tmpl = env.get_template("chat").unwrap();
+    let prompt = tmpl
+        .render(minijinja::context! {
+            messages => vec![minijinja::context!{ role => "user", content => "Say hi in three words." }],
+            add_generation_prompt => true,
+            bos_token => bos_token,
+        })
+        .expect("render template");
     let tokens = model
         .str_to_token(&prompt, AddBos::Never)
         .expect("tokenize prompt");
@@ -56,6 +79,7 @@ fn main() {
         let token = sampler.sample(&ctx, batch.n_tokens() - 1);
         sampler.accept(token);
         if model.is_eog_token(token) {
+            completion_tokens += 1; // match llama-server (counts the stop token)
             break;
         }
         out.push_str(&model.token_to_str(token, Special::Plaintext).unwrap_or_default());
