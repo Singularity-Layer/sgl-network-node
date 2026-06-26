@@ -29,3 +29,15 @@ hex = "0.4"
 # WebSocket transport (primary dispatch + streaming; REST stays as fallback).
 tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 futures-util = "0.3"
+# In-process inference (v1.5.0, behind the `inprocess` feature). Vendors + builds
+# llama.cpp via cmake. Pin exact once the PoC resolves a version (crate doesn't follow
+# semver). Metal on macOS via the `metal` feature.
+llama-cpp-2 = { version = "0.1", optional = true }
+
+[features]
+inprocess = ["dep:llama-cpp-2"]
+metal = ["llama-cpp-2/metal"]
+
+[[example]]
+name = "inproc_poc"
+required-features = ["inprocess"]
