@@ -27,15 +27,25 @@ jobs:
     strategy:
       matrix:
         include:
+          # macOS = every live grid node. Build with in-process inference (v1.5.0)
+          # + Metal so SGL_ENGINE=inprocess works out of the box (vendors llama.cpp
+          # via cmake, preinstalled on macos-14 runners).
           - os: macos-14
             target: aarch64-apple-darwin
             asset: sgl-darwin-arm64
+            features: "inprocess,metal"
+          # Linux = future confidential TDX/SEV tier (#109), no live nodes yet.
+          # Kept as plain server-engine builds for now to keep the release green —
+          # a cmake/llama.cpp build hiccup here would block the macOS binary too.
+          # Add `inprocess` here when the Linux tier actually ships.
           - os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             asset: sgl-linux-x86_64
+            features: ""
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             asset: sgl-linux-arm64
+            features: ""
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -46,7 +56,12 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Build
-        run: cargo build --release --target ${{ matrix.target }}
+        run: |
+          if [ -n "${{ matrix.features }}" ]; then
+            cargo build --release --target ${{ matrix.target }} --features "${{ matrix.features }}"
+          else
+            cargo build --release --target ${{ matrix.target }}
+          fi
 
       - name: Package + checksum
         run: |

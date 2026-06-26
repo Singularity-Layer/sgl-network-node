@@ -398,6 +398,16 @@ pub async fn start(
         None => tracing::warn!("Could not sign keybind (node_id not a UUID?) — publishing key unsigned"),
     }
 
+    // sha256 of the running binary, computed ONCE (reading the whole exe every
+    // heartbeat would be wasteful — it can't change under a live process). Sent on
+    // every heartbeat so the orchestrator tracks the build that's actually serving
+    // and re-gates it against the allowlist (the attest-time hash goes stale the
+    // moment `sgl update` swaps the binary). Empty string → send None.
+    let binary_hash = {
+        let h = crate::tee::detect_binary_hash();
+        if h.is_empty() { None } else { Some(h) }
+    };
+
     let active_jobs = Arc::new(AtomicU32::new(0));
     // Real in-flight job ids (#119) — reported in each heartbeat so the orchestrator can
     // clear ghost slots safely. Distinct from `active_jobs` (the capacity CAS counter).
@@ -526,6 +536,7 @@ pub async fn start(
                 rc.streaming_enabled,
                 rc.context_size,
                 active_job_ids,
+                binary_hash.clone(),
             )
             .await
         {

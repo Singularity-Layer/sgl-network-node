@@ -121,6 +121,12 @@ struct HeartbeatRequest {
     // terminalizes any dispatched job NOT in this set (a ghost) and frees the slot.
     // Always sent (even empty) so an idle node clears its ghosts.
     active_job_ids: Vec<String>,
+    // sha256 of the running sgl binary. Sent every heartbeat so the orchestrator
+    // always knows which build is ACTUALLY serving (the attest-time hash goes stale
+    // the moment `sgl update` swaps the binary out from under a live process). The
+    // orchestrator refreshes node metadata + re-gates against the allowlist on this.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    binary_hash: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -367,6 +373,7 @@ impl OrchestratorClient {
         streaming: bool,
         context_size: u32,
         active_job_ids: Vec<String>,
+        binary_hash: Option<String>,
     ) -> Result<HeartbeatResponse, String> {
         let url = format!("{}/grid/nodes/heartbeat", self.base_url);
         let token = self.get_token()?;
@@ -379,6 +386,7 @@ impl OrchestratorClient {
             key_version,
             capabilities: NodeCapabilities { streaming, context_size },
             active_job_ids,
+            binary_hash,
         };
 
         let resp = self
