@@ -166,6 +166,10 @@ impl ServerEngine {
                 &batch_str,
                 "--parallel",
                 &parallel_str,
+                // Continuous batching: interleave multiple in-flight requests in one
+                // decode loop so the node serves `--parallel` jobs concurrently instead
+                // of one-at-a-time. This is what stops "busy after a single request".
+                "--cont-batching",
             ])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::piped())

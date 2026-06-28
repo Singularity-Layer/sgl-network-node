@@ -15,6 +15,7 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 
 use llama_cpp_2::context::params::LlamaContextParams;
+use llama_cpp_2::context::LlamaContext;
 use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::params::LlamaModelParams;
@@ -98,10 +99,21 @@ impl InProcessEngine {
             .spawn(move || worker_main(cfg, job_rx, w_healthy, w_processing, w_progress, ready_tx))
             .map_err(|e| format!("failed to spawn inference worker: {e}"))?;
 
-        match ready_rx.await {
-            Ok(Ok(())) => Ok(Self { job_tx, healthy, processing, last_progress_ms, model_name, _worker: worker }),
-            Ok(Err(e)) => Err(e),
-            Err(_) => Err("inference worker died during startup".to_string()),
+        // Bound the startup wait. Model load + context creation are native llama.cpp/Metal
+        // calls that CAN wedge (e.g. a cold Metal shader compile, or a KV-cache alloc that
+        // never returns). Without a timeout a wedge hangs the WHOLE node forever — it never
+        // registers or heartbeats and looks dead with no error in the log. A clean timeout
+        // turns that silent infinite hang into a returned Err, so the caller can exit (and
+        // the OS service relaunch) instead of stranding the node. Generous (10 min) so a
+        // legitimately slow first-run Metal compile + big-model load never trips it.
+        const STARTUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+        match tokio::time::timeout(STARTUP_TIMEOUT, ready_rx).await {
+            Ok(Ok(Ok(()))) => Ok(Self { job_tx, healthy, processing, last_progress_ms, model_name, _worker: worker }),
+            Ok(Ok(Err(e))) => Err(e),
+            Ok(Err(_)) => Err("inference worker died during startup".to_string()),
+            Err(_) => Err(format!(
+                "inference worker startup timed out after {STARTUP_TIMEOUT:?} (model/context load wedged)"
+            )),
         }
     }
 
@@ -192,6 +204,22 @@ fn worker_main(
         }
     };
 
+    // Create the inference context ONCE, here at startup — NOT lazily per request. This is
+    // the billing-/liveness-critical step: it allocates the KV cache (n_ctx tokens) on the
+    // GPU, which on Metal can be the slowest/heaviest part of bring-up. Doing it before we
+    // signal `ready` means "ready" guarantees the model AND a working context, so a context
+    // wedge surfaces at startup (behind start()'s timeout) instead of on the first paying
+    // request. The context is then REUSED for every job; we clear its KV cache between jobs.
+    let ctx_params =
+        LlamaContextParams::default().with_n_ctx(std::num::NonZeroU32::new(cfg.n_ctx));
+    let mut ctx = match model.new_context(&backend, ctx_params) {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = ready_tx.send(Err(format!("context create failed: {e}")));
+            return;
+        }
+    };
+
     healthy.store(true, Ordering::Relaxed);
     let _ = ready_tx.send(Ok(()));
 
@@ -210,7 +238,7 @@ fn worker_main(
         // aborts/segfaults already kill the process; this covers the Rust-panic case
         // without forcing global panic=abort on the rest of the node.
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            generate(&backend, &model, cfg.n_ctx, &messages, max_tokens, temperature, stream_sink.as_ref(), &progress)
+            generate(&mut ctx, cfg.n_ctx, &messages, max_tokens, temperature, stream_sink.as_ref(), &progress)
         }));
         processing.store(false, Ordering::Relaxed);
         let result = match outcome {
@@ -236,8 +264,7 @@ fn worker_main(
 /// the token cap. When `stream` is Some, forwards `StreamEvent::Delta` batches and a final
 /// `Done`; otherwise accumulates the full text. Returns exact token counts either way.
 fn generate(
-    backend: &LlamaBackend,
-    model: &LlamaModel,
+    ctx: &mut LlamaContext,
     n_ctx: u32,
     messages: &[ChatMessage],
     max_tokens: i32,
@@ -245,12 +272,11 @@ fn generate(
     stream: Option<&tokio::sync::mpsc::Sender<StreamEvent>>,
     progress: &AtomicU64,
 ) -> Result<GenOut, String> {
-    // Honor the configured context window (matches `llama-server -c <n_ctx>`); without
-    // this the context would silently use the model/crate default.
-    let ctx_params = LlamaContextParams::default().with_n_ctx(std::num::NonZeroU32::new(n_ctx));
-    let mut ctx = model
-        .new_context(backend, ctx_params)
-        .map_err(|e| format!("context create failed: {e}"))?;
+    // The context is created once at worker startup and REUSED across jobs (see worker_main).
+    // Clear its KV cache so this prompt starts at position 0 with no leftover state from the
+    // previous request — otherwise positions/logits would be polluted and billing would drift.
+    ctx.clear_kv_cache();
+    let model = ctx.model;
 
     let prompt = render_chat_prompt(model, messages)?;
 
@@ -289,7 +315,7 @@ fn generate(
     let mut batched: u32 = 0;
 
     for _ in 0..max_new {
-        let token = sampler.sample(&ctx, batch.n_tokens() - 1);
+        let token = sampler.sample(&*ctx, batch.n_tokens() - 1);
         sampler.accept(token);
         if model.is_eog_token(token) {
             completion_tokens += 1; // llama-server counts the terminal stop token; match it for billing parity

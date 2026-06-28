@@ -1,7 +1,15 @@
 use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+
+/// Unix-ms now (for the inference-progress watchdog).
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
 
 use crate::config::{self, NodeConfig};
 use crate::crypto::NodeKeypair;
@@ -114,6 +122,8 @@ fn maybe_spawn_job(
     inflight: Arc<Mutex<HashSet<String>>>,
     seen: Arc<Mutex<SeenJobs>>,
     max_jobs: u32,
+    last_activity: Arc<AtomicU64>,
+    completions: Arc<AtomicU64>,
 ) {
     // Atomically reserve a slot (capacity check + increment in one CAS) so
     // concurrent WS-push + REST-poll arrivals can't exceed max_jobs.
@@ -144,12 +154,24 @@ fn maybe_spawn_job(
     // running (#119). The orchestrator uses this to clear ghost slots — dispatched jobs
     // we are NOT processing — without ever killing a job we ARE processing.
     inflight.lock().unwrap().insert(job.id.clone());
+    // Stamp activity on accept AND completion — the watchdog treats "busy but no
+    // activity for too long" as a wedged engine (jobs hang while /health still passes).
+    last_activity.store(now_ms(), Ordering::Relaxed);
     tracing::info!("Accepted job {} (type: {})", job.id, job.job_type);
     let job_id = job.id.clone();
     tokio::spawn(async move {
         process_job(&client, &engine, &job, &node_secret, streaming_enabled).await;
-        active_jobs.fetch_sub(1, Ordering::Relaxed);
-        inflight.lock().unwrap().remove(&job_id);
+        // Release the slot ONLY if this job is still tracked. The watchdog may have already
+        // abandoned it (removed it from inflight + released its slot) when the engine wedged.
+        // Gating decrement + completion on inflight membership makes slot-release idempotent,
+        // preventing an active_jobs underflow (u32 wrap) and a false progress signal.
+        let still_tracked = inflight.lock().unwrap().remove(&job_id);
+        if still_tracked {
+            active_jobs.fetch_sub(1, Ordering::Relaxed);
+            // Genuine progress (the engine responded) — resets the watchdog's abort backstop.
+            completions.fetch_add(1, Ordering::Relaxed);
+        }
+        last_activity.store(now_ms(), Ordering::Relaxed);
     });
 }
 
@@ -300,6 +322,72 @@ pub async fn login(
     Ok(())
 }
 
+/// Continuous-batching concurrency: how many requests this node serves in parallel.
+/// llama-server runs N slots (`--parallel N --cont-batching`) over ONE loaded model — the
+/// weights load once, so the only per-slot RAM cost is the KV cache. We keep each slot's
+/// usable context at the operator's configured `context_size` by setting the server's total
+/// `-c` to `slots * context_size` (llama-server divides total context across slots), so
+/// concurrency trades RAM, not per-request context.
+///
+/// RAM-aware + conservative so a small operator Mac never OOMs:
+///   fixed    = model weights (≈ GGUF file size) + headroom for OS/runtime/app
+///   per-slot = KV cache at `context_size` (estimated from model size, rounded up)
+///   slots    = clamp(free_for_kv / per_slot_kv, 1, MAX_SLOTS)
+/// Boxes under MIN_RAM stay at 1. An explicit `--max-jobs N>1` caps (never raises) the auto
+/// value; the baked default of 1 means "auto".
+fn compute_parallel_slots(
+    memory_gb: f64,
+    model_path: &Path,
+    context_size: u32,
+    requested_max_jobs: u32,
+) -> u32 {
+    // Conservative first rollout: 2 slots already removes the "busy after one request"
+    // cliff; we raise this later with real telemetry. Apple Silicon is unified memory, so
+    // model weights + KV share ONE pool — we never assume 100% of RAM is ours.
+    const MAX_SLOTS: u32 = 2;
+    const OVERHEAD_GB: f64 = 4.0; // OS + llama runtime + node app + mmap slack
+    const MIN_RAM_FOR_BATCHING_GB: f64 = 16.0;
+    const USABLE_FRACTION: f64 = 0.85; // headroom for the rest of the machine
+
+    let model_gb = std::fs::metadata(model_path)
+        .map(|m| m.len() as f64 / 1e9)
+        .unwrap_or(6.0); // unknown size → assume large, stay safe
+
+    if memory_gb < MIN_RAM_FOR_BATCHING_GB {
+        return 1; // too small to risk concurrency
+    }
+
+    // KV per slot at the configured context, estimated HIGH so we under-provision slots
+    // rather than risk OOM (the estimate ignores exact dtype/arch, so we round up).
+    let per_slot_kv_gb = (model_gb * 0.20).max(0.4) * (context_size as f64 / 8192.0).max(0.25);
+    let usable = memory_gb * USABLE_FRACTION;
+    let free_for_kv = (usable - model_gb - OVERHEAD_GB).max(0.0);
+    let auto = ((free_for_kv / per_slot_kv_gb).floor() as u32).clamp(1, MAX_SLOTS);
+
+    if requested_max_jobs > 1 {
+        auto.min(requested_max_jobs) // explicit override caps, never raises past RAM-safe
+    } else {
+        auto
+    }
+}
+
+/// How long a slot may be "busy with zero progress" before the watchdog treats the engine
+/// as wedged. MUST exceed the orchestrator's model-aware stuck-job SLA (≈360s for 7–12B,
+/// 900s for 13–34B, 1800s for 65B+) so a legitimately slow large-model inference is never
+/// killed early. Tiered by GGUF size (a node serves one model) + margin over the SLA.
+fn wedge_timeout_ms(model_path: &Path) -> u64 {
+    let gb = std::fs::metadata(model_path)
+        .map(|m| m.len() as f64 / 1e9)
+        .unwrap_or(6.0);
+    if gb < 11.0 {
+        600_000 // ~7–12B: SLA 360s + margin
+    } else if gb < 40.0 {
+        1_200_000 // ~13–34B: SLA 900s + margin
+    } else {
+        2_100_000 // 65B+: SLA 1800s + margin
+    }
+}
+
 pub async fn start(
     config_dir: &Path,
     orchestrator_url: &str,
@@ -337,6 +425,13 @@ pub async fn start(
 
     let mut engine: Option<Arc<InferenceEngine>> = None;
     let mut models: Vec<String> = vec![];
+    // Continuous-batching concurrency: how many requests this node serves at once.
+    // Defaults to 1 (no model, or in-process engine); the server engine computes a
+    // RAM-aware value below. Used for the LOCAL capacity gate AND advertised to the
+    // orchestrator so it dispatches up to this many concurrent jobs.
+    let mut effective_slots: u32 = 1;
+    // #159 watchdog timeout, model-aware (set from the GGUF size once we know the model).
+    let mut wedge_ms: u64 = 600_000;
 
     if let Some(path) = model_path {
         let name = model_name.map(|s| s.to_string()).unwrap_or_else(|| {
@@ -346,22 +441,43 @@ pub async fn start(
                 .unwrap_or_else(|| "unknown".to_string())
         });
 
-        tracing::info!("Loading model: {name} from {path}");
-        let eng_config = InferenceEngineConfig {
-            model_path: PathBuf::from(path),
-            model_name: name.clone(),
-            port: inference_port,
-            threads: rc.threads,
-            gpu_layers: rc.gpu_layers,
-            context_size: rc.context_size,
-            batch_size: rc.batch_size,
-            parallel_slots: rc.max_jobs,
-        };
         // Engine selection: SGL_ENGINE=server|inprocess (default server during the
         // in-process rollout). `inprocess` requires a build with the `inprocess` feature.
         let engine_mode = match std::env::var("SGL_ENGINE").ok().as_deref() {
             Some(s) if !s.is_empty() => crate::inference::EngineMode::parse(s)?,
             _ => crate::inference::EngineMode::Server,
+        };
+
+        let model_pb = PathBuf::from(path);
+        // Continuous batching applies only to the server (llama-server) engine; the
+        // in-process engine is concurrency-1 by design (single worker thread).
+        effective_slots = match engine_mode {
+            crate::inference::EngineMode::Server => {
+                compute_parallel_slots(tee::detect().memory_gb, &model_pb, rc.context_size, rc.max_jobs)
+            }
+            _ => 1,
+        };
+        wedge_ms = wedge_timeout_ms(&model_pb);
+        // llama-server divides its total `-c` across slots, so pass slots × context_size
+        // to keep each slot at the operator's configured per-request context.
+        let total_ctx = effective_slots
+            .saturating_mul(rc.context_size)
+            .max(rc.context_size);
+
+        tracing::info!("Loading model: {name} from {path}");
+        tracing::info!(
+            "  Parallel slots: {effective_slots} (continuous batching) — total ctx {total_ctx} ({} per slot)",
+            rc.context_size
+        );
+        let eng_config = InferenceEngineConfig {
+            model_path: model_pb,
+            model_name: name.clone(),
+            port: inference_port,
+            threads: rc.threads,
+            gpu_layers: rc.gpu_layers,
+            context_size: total_ctx,
+            batch_size: rc.batch_size,
+            parallel_slots: effective_slots,
         };
         tracing::info!("Inference engine mode: {engine_mode:?}");
         let eng = InferenceEngine::create(eng_config, engine_mode).await?;
@@ -413,6 +529,13 @@ pub async fn start(
     // clear ghost slots safely. Distinct from `active_jobs` (the capacity CAS counter).
     let inflight: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
     let seen_jobs = Arc::new(Mutex::new(SeenJobs::new()));
+    // #159 watchdog input: unix-ms of the last job accept/completion. The heartbeat loop
+    // treats "busy (active_jobs>0) but no activity for WEDGE_MS" as a wedged engine —
+    // catches the case where llama-server answers /health but inference hangs forever.
+    let last_activity = Arc::new(AtomicU64::new(now_ms()));
+    // Monotonic count of genuinely-completed jobs — the watchdog resets its abort
+    // backstop only when this advances (real progress, not a forced slot-reset).
+    let completions = Arc::new(AtomicU64::new(0));
 
     // ── WebSocket push-dispatch (additive fast-path) ──────────────────
     // Connects to the orchestrator and processes jobs the instant they're pushed,
@@ -431,7 +554,9 @@ pub async fn start(
         let aj = Arc::clone(&active_jobs);
         let inf = Arc::clone(&inflight);
         let sj = Arc::clone(&seen_jobs);
-        let mj = rc.max_jobs;
+        let mj = effective_slots;
+        let la = Arc::clone(&last_activity);
+        let co = Arc::clone(&completions);
         let st = Arc::clone(&ws_state);
         let cfg_tok = cfg.clone();
         let config_dir_buf = config_dir.to_path_buf();
@@ -452,6 +577,8 @@ pub async fn start(
                         Arc::clone(&inf),
                         Arc::clone(&sj),
                         mj,
+                        Arc::clone(&la),
+                        Arc::clone(&co),
                     );
                 },
                 move |new_tok, _exp| {
@@ -484,7 +611,64 @@ pub async fn start(
     const MAX_ENGINE_RESTARTS: u32 = 5;
     let mut unhealthy_streak: u32 = 0;
     let mut restart_attempts: u32 = 0;
+    // #159 inference-progress watchdog. `wedge_ms` (set above per model size) is always
+    // LONGER than the orchestrator's stuck-job SLA for this model, so a legitimately slow
+    // inference is never mistaken for a wedge — only a truly hung slot trips it.
+    const MAX_WEDGE_RESTARTS: u32 = 3; // restart up to this many times, THEN abort the process
+    let mut wedge_restarts: u32 = 0;
+    let mut last_completions: u64 = 0;
     loop {
+        // ── #159 inference-progress watchdog ──────────────────────────────
+        // The /health restart below only fires when llama-server stops answering /health.
+        // But a slot can WEDGE while /health still passes — the job hangs, no tokens, no
+        // completion (seen live with qwen-7b). Detect it independently: if we are busy
+        // (active_jobs>0) yet nothing has started or finished for WEDGE_MS, the engine is
+        // stuck → kill+relaunch llama-server to free the slot and abandon the hung job (the
+        // orchestrator's stuck-reaper terminalizes it; it never completed so it is never
+        // billed). Backstop: if the wedge survives MAX_WEDGE_RESTARTS with no real
+        // completion in between, abort the process for a clean OS relaunch (anti-zombie).
+        {
+            let done = completions.load(Ordering::Relaxed);
+            if done > last_completions {
+                last_completions = done;
+                wedge_restarts = 0; // real progress happened → reset the backstop
+            }
+            if let Some(ref eng) = engine {
+                let busy = active_jobs.load(Ordering::Relaxed) > 0;
+                let idle_ms = now_ms().saturating_sub(last_activity.load(Ordering::Relaxed));
+                if busy && idle_ms > wedge_ms {
+                    wedge_restarts += 1;
+                    tracing::error!(
+                        "inference WEDGED: busy {}s with no progress — restarting engine (wedge {wedge_restarts}/{MAX_WEDGE_RESTARTS})",
+                        idle_ms / 1000
+                    );
+                    if wedge_restarts > MAX_WEDGE_RESTARTS {
+                        tracing::error!("engine still wedged after {MAX_WEDGE_RESTARTS} restarts — aborting for a clean OS relaunch");
+                        std::process::abort();
+                    }
+                    let _ = eng.restart().await;
+                    // Abandon the hung job(s): drop them from inflight and release EXACTLY that
+                    // many slots (saturating). Their tasks are still awaiting the now-killed
+                    // llama-server; when they error out they'll find their id already gone and
+                    // skip their own decrement (see maybe_spawn_job) — so no double-release and
+                    // no underflow. The orchestrator's stuck-reaper terminalizes the jobs; they
+                    // never completed, so they're never billed.
+                    let abandoned = {
+                        let mut g = inflight.lock().unwrap();
+                        let n = g.len() as u32;
+                        g.clear();
+                        n
+                    };
+                    if abandoned > 0 {
+                        let _ = active_jobs.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |c| {
+                            Some(c.saturating_sub(abandoned))
+                        });
+                    }
+                    last_activity.store(now_ms(), Ordering::Relaxed);
+                }
+            }
+        }
+
         // Snapshot the jobs we're actually running right now (#119) so the orchestrator can
         // clear any ghost slots. Always sent (even empty) so an idle node frees its slots.
         let active_job_ids: Vec<String> = inflight.lock().unwrap().iter().cloned().collect();
@@ -537,6 +721,7 @@ pub async fn start(
                 rc.context_size,
                 active_job_ids,
                 binary_hash.clone(),
+                effective_slots,
             )
             .await
         {
@@ -571,7 +756,9 @@ pub async fn start(
                         Arc::clone(&active_jobs),
                         Arc::clone(&inflight),
                         Arc::clone(&seen_jobs),
-                        rc.max_jobs,
+                        effective_slots,
+                        Arc::clone(&last_activity),
+                        Arc::clone(&completions),
                     );
                 }
             }

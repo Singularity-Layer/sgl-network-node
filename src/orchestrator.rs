@@ -127,6 +127,10 @@ struct HeartbeatRequest {
     // orchestrator refreshes node metadata + re-gates against the allowlist on this.
     #[serde(skip_serializing_if = "Option::is_none")]
     binary_hash: Option<String>,
+    // Continuous-batching capacity: how many requests this node serves in parallel
+    // (llama-server --parallel N). The orchestrator persists this to max_concurrent_jobs
+    // so its capacity gate dispatches up to N concurrent jobs to this node.
+    max_concurrent_jobs: u32,
 }
 
 #[derive(Serialize)]
@@ -374,6 +378,7 @@ impl OrchestratorClient {
         context_size: u32,
         active_job_ids: Vec<String>,
         binary_hash: Option<String>,
+        max_concurrent_jobs: u32,
     ) -> Result<HeartbeatResponse, String> {
         let url = format!("{}/grid/nodes/heartbeat", self.base_url);
         let token = self.get_token()?;
@@ -387,6 +392,7 @@ impl OrchestratorClient {
             capabilities: NodeCapabilities { streaming, context_size },
             active_job_ids,
             binary_hash,
+            max_concurrent_jobs,
         };
 
         let resp = self
