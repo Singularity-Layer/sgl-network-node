@@ -1,0 +1,92 @@
+#cloud-config
+# Singularity Node — headless GPU machine bootstrap (#172 one-click deploy).
+#
+# Rendered by the deploy pipeline with these variables:
+#   ${SGL_VERSION}        pinned sgl release tag (e.g. v1.4.5) — MUST be on the
+#                         orchestrator binary allowlist or the node can't serve
+#   ${SGL_SHA256}         sha256 of the linux binary for that tag (fail-closed)
+#   ${SGL_PROVISION_CODE} single-use registration code minted by the deploy API,
+#                         bound to ${SGL_WALLET} (short-lived; the only secret-ish
+#                         value here, and it's dead after first use)
+#   ${SGL_WALLET}         buyer's operator wallet (base58 — case preserved)
+#   ${SGL_TEE_TYPE}       linux_se (Standard) | tdx_cc (Confidential)
+#   ${MODEL_ID}           grid model id (e.g. llama-3.1-70b)
+#   ${MODEL_URL}          GGUF download URL
+#   ${MODEL_SHA256}       GGUF sha256 (fail-closed)
+#   ${GPU_LAYERS}         layers to offload (99 = all)
+#   ${CONTEXT_SIZE}       context window tokens
+#   ${LLAMA_CPP_TAG}      pinned llama.cpp tag (e.g. b4600)
+#   ${ORCH_URL}           https://grid.x402compute.cc
+#
+# Design notes:
+#  - Everything installs under /opt/sgl. llama-server goes to /opt/sgl/bin
+#    (the node checks that path on Linux).
+#  - The node keypair is generated ON this machine by `sgl login` — no private
+#    key material ever transits user-data.
+#  - Fail-closed: any checksum mismatch aborts the boot script; the deploy
+#    pipeline sees the machine never register and marks the deployment failed.
+
+package_update: true
+packages:
+  - build-essential
+  - cmake
+  - git
+  - curl
+
+write_files:
+  - path: /etc/systemd/system/sgl-node.service
+    permissions: "0644"
+    content: |
+      [Unit]
+      Description=Singularity Grid Node
+      After=network-online.target
+      Wants=network-online.target
+
+      [Service]
+      Type=simple
+      ExecStart=/opt/sgl/bin/sgl start \
+        --model-path /opt/sgl/models/${MODEL_ID}.gguf \
+        --model-name ${MODEL_ID} \
+        --gpu-layers ${GPU_LAYERS} \
+        --context-size ${CONTEXT_SIZE} \
+        --orchestrator-url ${ORCH_URL}
+      Restart=always
+      RestartSec=10
+      Environment=HOME=/root
+      # Hardening (server is single-purpose; keep close to the node's own systemd profile)
+      NoNewPrivileges=true
+      ProtectSystem=full
+      PrivateTmp=true
+
+      [Install]
+      WantedBy=multi-user.target
+
+runcmd:
+  # ── 1. Layout ────────────────────────────────────────────────────────────────
+  - mkdir -p /opt/sgl/bin /opt/sgl/models /opt/sgl/src
+
+  # ── 2. llama-server (pinned tag, CUDA) ──────────────────────────────────────
+  # GPU images ship the CUDA toolkit; build from source at a pinned tag for a
+  # reproducible binary. ~10 min one-time cost per machine.
+  - git clone --depth 1 --branch ${LLAMA_CPP_TAG} https://github.com/ggml-org/llama.cpp /opt/sgl/src/llama.cpp
+  - cmake -S /opt/sgl/src/llama.cpp -B /opt/sgl/src/llama.cpp/build -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release
+  - cmake --build /opt/sgl/src/llama.cpp/build --target llama-server -j "$(nproc)"
+  - cp /opt/sgl/src/llama.cpp/build/bin/llama-server /opt/sgl/bin/llama-server
+  - rm -rf /opt/sgl/src/llama.cpp
+
+  # ── 3. sgl node binary (pinned release, checksum fail-closed) ───────────────
+  - curl -fsSL -o /opt/sgl/bin/sgl "https://github.com/Singularity-Layer/sgl-network-node/releases/download/${SGL_VERSION}/sgl-linux-x86_64"
+  - echo "${SGL_SHA256}  /opt/sgl/bin/sgl" | sha256sum -c -
+  - chmod 0755 /opt/sgl/bin/sgl
+  - ln -sf /opt/sgl/bin/sgl /usr/local/bin/sgl
+
+  # ── 4. Model (pinned GGUF, checksum fail-closed) ────────────────────────────
+  - curl -fsSL -o "/opt/sgl/models/${MODEL_ID}.gguf" "${MODEL_URL}"
+  - echo "${MODEL_SHA256}  /opt/sgl/models/${MODEL_ID}.gguf" | sha256sum -c -
+
+  # ── 5. Headless registration (single-use code; keypair generated here) ──────
+  - /opt/sgl/bin/sgl login --code "${SGL_PROVISION_CODE}" --wallet "${SGL_WALLET}" --tee-type "${SGL_TEE_TYPE}" --models "${MODEL_ID}" --orchestrator-url "${ORCH_URL}"
+
+  # ── 6. Serve ─────────────────────────────────────────────────────────────────
+  - systemctl daemon-reload
+  - systemctl enable --now sgl-node.service
