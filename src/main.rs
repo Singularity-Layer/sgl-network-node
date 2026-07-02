@@ -60,6 +60,15 @@ enum Commands {
         /// Available models (comma-separated)
         #[arg(long)]
         models: Option<String>,
+
+        /// Headless: single-use provision code (skips the browser device flow;
+        /// issued by the one-click deploy pipeline, bound to --wallet)
+        #[arg(long)]
+        code: Option<String>,
+
+        /// Headless: the operator wallet the provision code is bound to (base58)
+        #[arg(long)]
+        wallet: Option<String>,
     },
 
     /// Start the node: begin heartbeating and processing jobs
@@ -267,14 +276,24 @@ async fn main() {
                 std::process::exit(1);
             }
         }
-        Commands::Login { tee_type, models } => {
+        Commands::Login { tee_type, models, code, wallet } => {
             let models_vec: Vec<String> = models
                 .map(|m| m.split(',').map(|s| s.trim().to_string()).collect())
                 .unwrap_or_default();
 
-            if let Err(e) =
-                node::login(&config_dir, &cli.orchestrator_url, &tee_type, &models_vec).await
-            {
+            let result = match (code, wallet) {
+                // Headless: provision code from the deploy pipeline, no browser.
+                (Some(c), Some(w)) => {
+                    node::login_headless(&config_dir, &cli.orchestrator_url, &tee_type, &models_vec, &c, &w).await
+                }
+                (Some(_), None) | (None, Some(_)) => {
+                    Err("Headless login needs BOTH --code and --wallet.".to_string())
+                }
+                (None, None) => {
+                    node::login(&config_dir, &cli.orchestrator_url, &tee_type, &models_vec).await
+                }
+            };
+            if let Err(e) = result {
                 tracing::error!("Login failed: {e}");
                 std::process::exit(1);
             }

@@ -594,7 +594,12 @@ fn find_llama_server() -> Result<String, String> {
         "llama-server",
         "llama-cli",
         "/usr/local/bin/llama-server",
+        #[cfg(target_os = "macos")]
         "/opt/homebrew/bin/llama-server",
+        // Headless Linux GPU machines (one-click deploys): cloud-init installs a
+        // pinned CUDA llama-server here.
+        #[cfg(target_os = "linux")]
+        "/opt/sgl/bin/llama-server",
     ];
 
     for cmd in &candidates {

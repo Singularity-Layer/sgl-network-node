@@ -322,6 +322,61 @@ pub async fn login(
     Ok(())
 }
 
+/// Headless login for one-click machine deploys (cloud-init): registers with a
+/// single-use provision code issued by the deploy pipeline and bound to the buyer's
+/// wallet, instead of the interactive browser device flow. Identical trust model to
+/// `login` — the keypair is generated ON this machine (private key never leaves it)
+/// and the orchestrator validates the code + wallet + stake server-side before
+/// returning the auth token. Only a short-lived, one-time code transits cloud-init.
+pub async fn login_headless(
+    config_dir: &Path,
+    orchestrator_url: &str,
+    tee_type: &str,
+    models: &[String],
+    code: &str,
+    wallet: &str,
+) -> Result<(), String> {
+    let cfg_path = config::config_path(config_dir);
+    if cfg_path.exists() {
+        return Err(format!(
+            "Node already initialized. Config at: {}",
+            cfg_path.display()
+        ));
+    }
+    if code.trim().is_empty() || wallet.trim().is_empty() {
+        return Err("Provision code and wallet must be non-empty.".to_string());
+    }
+
+    let caps = tee::detect();
+    tee::print_capabilities(&caps);
+
+    let keypair = NodeKeypair::generate();
+    let kp_path = config::keypair_path(config_dir);
+    keypair.save(&kp_path)?;
+    let public_key = keypair.public_key_bs58();
+
+    let client = OrchestratorClient::new(orchestrator_url, None);
+    tracing::info!("Registering node headlessly for wallet {wallet}...");
+    let registration = client
+        .register(wallet, Some(code), tee_type, models, &public_key, &caps)
+        .await?;
+
+    let node_config = NodeConfig {
+        node_id: registration.node_id,
+        auth_token: registration.auth_token,
+        wallet_address: wallet.to_string(),
+        tee_type: tee_type.to_string(),
+        orchestrator_url: orchestrator_url.to_string(),
+        keypair_path: kp_path.to_string_lossy().to_string(),
+    };
+    config::save_config(config_dir, &node_config)?;
+    tracing::info!(
+        "Linked! Node ID: {}. Run `sgl start --model-path <model.gguf>`.",
+        node_config.node_id
+    );
+    Ok(())
+}
+
 /// Continuous-batching concurrency: how many requests this node serves in parallel.
 /// llama-server runs N slots (`--parallel N --cont-batching`) over ONE loaded model — the
 /// weights load once, so the only per-slot RAM cost is the KV cache. We keep each slot's
