@@ -396,10 +396,13 @@ fn compute_parallel_slots(
     context_size: u32,
     requested_max_jobs: u32,
 ) -> u32 {
-    // Conservative first rollout: 2 slots already removes the "busy after one request"
-    // cliff; we raise this later with real telemetry. Apple Silicon is unified memory, so
-    // model weights + KV share ONE pool — we never assume 100% of RAM is ours.
-    const MAX_SLOTS: u32 = 2;
+    // Ceiling on auto-sized slots. Raised 2 → 4 (2026-07-03): the per-slot KV estimate below
+    // is deliberately HIGH and the RAM budget still gates the actual count per machine+model
+    // (a 14B on 16GB still gets 1; a 2-3B on 24GB can use the headroom). Verified locally at
+    // 3 concurrent sequences on a 16GB M4 (in-process, gemma-2-2b) with correct outputs and
+    // deterministic token counts. Apple Silicon is unified memory, so model weights + KV
+    // share ONE pool — we never assume 100% of RAM is ours.
+    const MAX_SLOTS: u32 = 4;
     const OVERHEAD_GB: f64 = 4.0; // OS + llama runtime + node app + mmap slack
     const MIN_RAM_FOR_BATCHING_GB: f64 = 16.0;
     const USABLE_FRACTION: f64 = 0.85; // headroom for the rest of the machine
@@ -430,21 +433,23 @@ fn compute_parallel_slots(
 /// as wedged. MUST exceed the orchestrator's model-aware stuck-job SLA (≈360s for 7–12B,
 /// 900s for 13–34B, 1800s for 65B+) so a legitimately slow large-model inference is never
 /// killed early. Tiered by GGUF size (a node serves one model) + margin over the SLA.
-/// In-process concurrency (advertised capacity). Defaults to 1: local benchmarking showed
-/// multi-sequence batching is a net latency loss for small models on Apple Silicon Metal
-/// (see the note at the call site). Operators on GPU/CUDA boxes can opt into batching with
-/// `SGL_INPROCESS_SLOTS=<n>`; the value is still capped by the same RAM-aware budget the
-/// server engine uses so an override can never exceed what memory can hold.
+/// In-process concurrency (advertised capacity). DYNAMIC by default: the same machine- and
+/// model-aware budget the server engine uses (total RAM, model file size, per-request
+/// context) decides how many sequences batch concurrently — a small model on a big box gets
+/// more slots, a big model on a small box gets 1. `SGL_INPROCESS_SLOTS=<n>` is a manual
+/// override for operators/benchmarks, still capped by the RAM budget so a custom value can
+/// never exceed what memory can safely hold.
 fn inprocess_slots(
     memory_gb: f64,
     model_path: &Path,
     context_size: u32,
     requested_max_jobs: u32,
 ) -> u32 {
-    let ram_cap = compute_parallel_slots(memory_gb, model_path, context_size, requested_max_jobs);
+    let ram_cap =
+        compute_parallel_slots(memory_gb, model_path, context_size, requested_max_jobs).max(1);
     match std::env::var("SGL_INPROCESS_SLOTS").ok().and_then(|s| s.trim().parse::<u32>().ok()) {
-        Some(n) if n >= 1 => n.min(ram_cap.max(1)),
-        _ => 1, // safe default: concurrency-1 (optimal latency + anti-zombie)
+        Some(n) if n >= 1 => n.min(ram_cap), // custom, RAM-capped
+        _ => ram_cap,                        // dynamic default (machine + model aware)
     }
 }
 
@@ -522,18 +527,10 @@ pub async fn start(
         };
 
         let model_pb = PathBuf::from(path);
-        // Slot count depends on the engine:
-        //   * Server (llama-server --parallel --cont-batching): RAM-aware multi-slot.
-        //   * In-process: continuous batching IS implemented (one shared context, one token
-        //     per active sequence per decode step), but LOCAL BENCHMARKS on Apple Silicon
-        //     show multi-sequence decode is a NET LOSS for small models on Metal — a batched
-        //     N-token step costs well over N× a single-token step (memory-bandwidth-bound
-        //     decode gets no batching win, only overhead), so concurrency actually raises
-        //     latency. We therefore default the in-process engine to concurrency-1 (optimal
-        //     latency + the anti-zombie property, which is the whole point of in-process) and
-        //     leave multi-slot batching as an OPT-IN (SGL_INPROCESS_SLOTS) for GPU/CUDA boxes
-        //     where the memory-bandwidth headroom makes batching pay off — to be measured on
-        //     that hardware before we raise the default.
+        // Continuous batching applies to BOTH engines, sized by the same machine+model-aware
+        // budget (RAM, model size, per-request context) so a node advertises the same honest
+        // capacity whichever engine it runs. In-process additionally honors the
+        // SGL_INPROCESS_SLOTS override (custom, still RAM-capped) — see inprocess_slots().
         effective_slots = match engine_mode {
             crate::inference::EngineMode::Server => {
                 compute_parallel_slots(tee::detect().memory_gb, &model_pb, rc.context_size, rc.max_jobs)
