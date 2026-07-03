@@ -58,10 +58,11 @@ write_files:
       test -n "$SRV"
       cp "$SRV" /opt/sgl/bin/llama-server
       chmod +x /opt/sgl/bin/llama-server
-      # The prebuilt links its own shared libs (libggml*, libllama*, libmtmd*) — put them
-      # on the loader path so llama-server (spawned by the node) resolves them.
-      find /opt/sgl/dist -type f -name '*.so*' -exec cp -a {} /usr/local/lib/ \;
-      ldconfig
+      # ALL shared libs AND ggml backends (libggml-vulkan.so, libggml-cpu*.so, libllama*,
+      # libmtmd*) must sit NEXT TO the binary: newer llama.cpp dlopens its backends from the
+      # executable's own directory (ggml_backend_load_all). Splitting them out = "no backends
+      # loaded / no usable GPU". LD_LIBRARY_PATH (systemd unit) also points here for linking.
+      find /opt/sgl/dist -type f -name '*.so*' -exec cp -a {} /opt/sgl/bin/ \;
 
       # ── 2. sgl node binary (pinned release, checksum fail-closed) ──
       curl -fsSL -o /opt/sgl/bin/sgl \
@@ -103,9 +104,9 @@ write_files:
       Restart=always
       RestartSec=10
       Environment=HOME=/root
-      # The node spawns llama-server as a child; it inherits this so the Vulkan build
-      # finds its bundled shared libs.
-      Environment=LD_LIBRARY_PATH=/usr/local/lib
+      # The node spawns llama-server as a child; it inherits this so the Vulkan build finds
+      # its bundled libs AND dlopens its GPU/CPU backends from this same directory.
+      Environment=LD_LIBRARY_PATH=/opt/sgl/bin
       NoNewPrivileges=true
       PrivateTmp=true
 
