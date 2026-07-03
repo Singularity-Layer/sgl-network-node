@@ -779,7 +779,58 @@ fn finish_admit_err(kind: JobKind, msg: String) -> AdmitOutcome {
 /// `add_generation_prompt=true`, the model's `bos_token`, plus `strftime_now` so Llama-3's
 /// "Today Date" preamble matches. This closes the legacy-vs-jinja parity gap (prompt token
 /// counts + output) so billing is identical across the server and in-process engines.
+///
+/// SYSTEM-ROLE FALLBACK: some templates (e.g. Gemma) `raise_exception` on a `system`
+/// message. llama.cpp's legacy path handles those models by MERGING the system prompt
+/// into the first user message — so if the faithful render fails and the conversation
+/// has system messages, we fold them into the first user turn and render once more.
+/// Matches llama-server behavior instead of failing every chat that sets a system prompt.
 fn render_chat_prompt(model: &LlamaModel, messages: &[ChatMessage]) -> Result<String, String> {
+    match try_render_chat_prompt(model, messages) {
+        Ok(p) => Ok(p),
+        Err(first_err) => {
+            if !messages.iter().any(|m| m.role == "system") {
+                return Err(first_err);
+            }
+            let folded = fold_system_into_first_user(messages);
+            try_render_chat_prompt(model, &folded).map_err(|_| first_err)
+        }
+    }
+}
+
+/// Merge all `system` messages into the first non-system message as a prefixed preamble
+/// (mirrors llama.cpp's legacy handling for templates without a system role). If the
+/// conversation is ONLY system messages, they become a single user message.
+fn fold_system_into_first_user(messages: &[ChatMessage]) -> Vec<ChatMessage> {
+    let system_text = messages
+        .iter()
+        .filter(|m| m.role == "system")
+        .map(|m| m.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let mut out: Vec<ChatMessage> = Vec::with_capacity(messages.len());
+    let mut injected = false;
+    for m in messages {
+        if m.role == "system" {
+            continue;
+        }
+        if !injected {
+            out.push(ChatMessage {
+                role: m.role.clone(),
+                content: format!("{system_text}\n\n{}", m.content),
+            });
+            injected = true;
+        } else {
+            out.push(m.clone());
+        }
+    }
+    if !injected {
+        out.push(ChatMessage { role: "user".to_string(), content: system_text });
+    }
+    out
+}
+
+fn try_render_chat_prompt(model: &LlamaModel, messages: &[ChatMessage]) -> Result<String, String> {
     let tmpl_str = model
         .meta_val_str("tokenizer.chat_template")
         .map_err(|e| format!("model has no chat_template metadata: {e}"))?;

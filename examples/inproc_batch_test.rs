@@ -178,6 +178,20 @@ async fn main() {
     // Delta tokens should cover all but possibly the terminal stop token.
     assert!(delta_tokens >= ct.saturating_sub(1), "streamed deltas ({delta_tokens}) < completion_tokens ({ct})");
 
+    // ---- 4b. SYSTEM PROMPT (Gemma's template rejects the system role; the engine must
+    // fold it into the first user turn like llama-server's legacy path — regression test
+    // for the chat-UI "System role not supported" failure) -------------------------------
+    let sys_messages = vec![
+        ChatMessage { role: "system".into(), content: "You are a pirate. Always answer in pirate speak.".into() },
+        ChatMessage { role: "user".into(), content: "Say hello in one short sentence.".into() },
+    ];
+    let out = engine
+        .chat_completion(&sys_messages, 48, 0.0)
+        .await
+        .expect("system-prompt completion must succeed (fold-into-user fallback)");
+    println!("\n[4b] system-prompt: pt={} ct={} -> {:?}", out.prompt_tokens, out.completion_tokens, out.content.trim());
+    assert!(out.completion_tokens > 0, "system-prompt completion produced no tokens");
+
     // ---- 5. oversized prompt rejected cleanly -----------------------------------------
     let huge = "word ".repeat(per_slot_ctx as usize + 200);
     let r = engine.chat_completion(&user(&huge), 16, 0.0).await;
