@@ -519,10 +519,16 @@ pub async fn start(
                 .unwrap_or_else(|| "unknown".to_string())
         });
 
-        // Engine selection: SGL_ENGINE=server|inprocess (default server during the
-        // in-process rollout). `inprocess` requires a build with the `inprocess` feature.
+        // Engine selection: SGL_ENGINE=server|inprocess. DEFAULT = in-process on builds
+        // that ship it (macOS: the model runs INSIDE this attested process — no separate
+        // llama-server child that can die while the wrapper heartbeats "healthy", killing
+        // the zombie-node class by design). SGL_ENGINE=server remains the escape hatch.
+        // Builds without the feature (Linux, for now) default to the server engine.
         let engine_mode = match std::env::var("SGL_ENGINE").ok().as_deref() {
             Some(s) if !s.is_empty() => crate::inference::EngineMode::parse(s)?,
+            #[cfg(feature = "inprocess")]
+            _ => crate::inference::EngineMode::InProcess,
+            #[cfg(not(feature = "inprocess"))]
             _ => crate::inference::EngineMode::Server,
         };
 
