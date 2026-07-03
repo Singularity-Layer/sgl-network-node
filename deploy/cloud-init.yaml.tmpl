@@ -56,13 +56,16 @@ write_files:
       tar xzf /opt/sgl/dist/llama.tgz -C /opt/sgl/dist
       SRV="$(find /opt/sgl/dist -type f -name llama-server | head -1)"
       test -n "$SRV"
-      cp "$SRV" /opt/sgl/bin/llama-server
+      # Copy the ENTIRE release dir (flat: llama-server + every .so) into /opt/sgl/bin,
+      # PRESERVING SYMLINKS. The release ships soname symlinks (libggml.so.0 ->
+      # libggml.so.0.15.3, libllama.so.0 -> ..., libmtmd.so.0 -> ...) that llama-server
+      # links against via DT_NEEDED; a `find -type f` copy skips those symlinks and the
+      # binary dies with "libggml.so.0: cannot open shared object file". `cp -a` keeps them.
+      # All backends (libggml-vulkan.so, libggml-cpu*.so) also land here so llama.cpp's
+      # ggml_backend_load_all finds them in the executable's own dir. LD_LIBRARY_PATH
+      # (systemd unit) points here too.
+      cp -a "$(dirname "$SRV")"/. /opt/sgl/bin/
       chmod +x /opt/sgl/bin/llama-server
-      # ALL shared libs AND ggml backends (libggml-vulkan.so, libggml-cpu*.so, libllama*,
-      # libmtmd*) must sit NEXT TO the binary: newer llama.cpp dlopens its backends from the
-      # executable's own directory (ggml_backend_load_all). Splitting them out = "no backends
-      # loaded / no usable GPU". LD_LIBRARY_PATH (systemd unit) also points here for linking.
-      find /opt/sgl/dist -type f -name '*.so*' -exec cp -a {} /opt/sgl/bin/ \;
 
       # ── 2. sgl node binary (pinned release, checksum fail-closed) ──
       curl -fsSL -o /opt/sgl/bin/sgl \
