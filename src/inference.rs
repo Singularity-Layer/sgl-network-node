@@ -493,11 +493,18 @@ impl InferenceEngine {
             EngineMode::InProcess => {
                 #[cfg(feature = "inprocess")]
                 {
+                    // `config.context_size` is the TOTAL context (slots × per-slot). Recover
+                    // the per-slot window so the engine enforces per-request limits and does
+                    // continuous batching across `parallel_slots` sequences.
+                    let max_slots = config.parallel_slots.max(1);
+                    let per_slot_ctx = (config.context_size / max_slots).max(1);
                     let e = crate::inprocess::InProcessEngine::start(crate::inprocess::InProcessConfig {
                         model_path: config.model_path,
                         model_name: config.model_name,
                         n_ctx: config.context_size,
                         n_gpu_layers: config.gpu_layers,
+                        max_slots,
+                        per_slot_ctx,
                     })
                     .await?;
                     Ok(InferenceEngine::InProcess(e))
@@ -530,10 +537,19 @@ impl InferenceEngine {
     pub async fn restart(&self) -> Result<(), String> {
         match self {
             InferenceEngine::Server(e) => e.restart().await,
-            // In-process: a fatal fault aborts the whole process (panic=abort) so the OS
-            // service relaunches it clean — there is no child process to restart here.
+            // In-process: there is no child process to restart — the engine IS this process,
+            // and a wedged native llama.cpp call can never be recovered from Rust. The node
+            // only calls restart() after a sustained unhealthy streak, so the correct (and
+            // only) recovery is a clean process relaunch by the OS service / desktop app —
+            // the anti-zombie property. Returning Ok(()) here would make the health loop
+            // believe a "restart" happened and let a wedged process linger unadvertised.
             #[cfg(feature = "inprocess")]
-            InferenceEngine::InProcess(_) => Ok(()),
+            InferenceEngine::InProcess(_) => {
+                tracing::error!(
+                    "in-process engine unhealthy — aborting for a clean OS relaunch (in-place restart is not possible)"
+                );
+                std::process::abort();
+            }
         }
     }
 

@@ -430,6 +430,24 @@ fn compute_parallel_slots(
 /// as wedged. MUST exceed the orchestrator's model-aware stuck-job SLA (≈360s for 7–12B,
 /// 900s for 13–34B, 1800s for 65B+) so a legitimately slow large-model inference is never
 /// killed early. Tiered by GGUF size (a node serves one model) + margin over the SLA.
+/// In-process concurrency (advertised capacity). Defaults to 1: local benchmarking showed
+/// multi-sequence batching is a net latency loss for small models on Apple Silicon Metal
+/// (see the note at the call site). Operators on GPU/CUDA boxes can opt into batching with
+/// `SGL_INPROCESS_SLOTS=<n>`; the value is still capped by the same RAM-aware budget the
+/// server engine uses so an override can never exceed what memory can hold.
+fn inprocess_slots(
+    memory_gb: f64,
+    model_path: &Path,
+    context_size: u32,
+    requested_max_jobs: u32,
+) -> u32 {
+    let ram_cap = compute_parallel_slots(memory_gb, model_path, context_size, requested_max_jobs);
+    match std::env::var("SGL_INPROCESS_SLOTS").ok().and_then(|s| s.trim().parse::<u32>().ok()) {
+        Some(n) if n >= 1 => n.min(ram_cap.max(1)),
+        _ => 1, // safe default: concurrency-1 (optimal latency + anti-zombie)
+    }
+}
+
 fn wedge_timeout_ms(model_path: &Path) -> u64 {
     let gb = std::fs::metadata(model_path)
         .map(|m| m.len() as f64 / 1e9)
@@ -504,13 +522,28 @@ pub async fn start(
         };
 
         let model_pb = PathBuf::from(path);
-        // Continuous batching applies only to the server (llama-server) engine; the
-        // in-process engine is concurrency-1 by design (single worker thread).
+        // Slot count depends on the engine:
+        //   * Server (llama-server --parallel --cont-batching): RAM-aware multi-slot.
+        //   * In-process: continuous batching IS implemented (one shared context, one token
+        //     per active sequence per decode step), but LOCAL BENCHMARKS on Apple Silicon
+        //     show multi-sequence decode is a NET LOSS for small models on Metal — a batched
+        //     N-token step costs well over N× a single-token step (memory-bandwidth-bound
+        //     decode gets no batching win, only overhead), so concurrency actually raises
+        //     latency. We therefore default the in-process engine to concurrency-1 (optimal
+        //     latency + the anti-zombie property, which is the whole point of in-process) and
+        //     leave multi-slot batching as an OPT-IN (SGL_INPROCESS_SLOTS) for GPU/CUDA boxes
+        //     where the memory-bandwidth headroom makes batching pay off — to be measured on
+        //     that hardware before we raise the default.
         effective_slots = match engine_mode {
             crate::inference::EngineMode::Server => {
                 compute_parallel_slots(tee::detect().memory_gb, &model_pb, rc.context_size, rc.max_jobs)
             }
-            _ => 1,
+            crate::inference::EngineMode::InProcess => inprocess_slots(
+                tee::detect().memory_gb,
+                &model_pb,
+                rc.context_size,
+                rc.max_jobs,
+            ),
         };
         wedge_ms = wedge_timeout_ms(&model_pb);
         // llama-server divides its total `-c` across slots, so pass slots × context_size
