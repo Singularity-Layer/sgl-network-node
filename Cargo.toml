@@ -1,6 +1,6 @@
 [package]
 name = "sgl-node"
-version = "1.6.1"
+version = "1.7.0"
 edition = "2021"
 description = "SGL Network node agent — confidential AI compute provider for the Singularity grid"
 
@@ -38,11 +38,22 @@ llama-cpp-2 = { version = "=0.1.150", optional = true }  # pin exact: crate trac
 # preamble — see the parity finding). minijinja + chrono give byte-identical prompts.
 minijinja = { version = "2", optional = true }
 chrono = { version = "0.4", optional = true, default-features = false, features = ["clock", "std"] }
+# Persistent per-request UTF-8 decoder for token_to_piece (multi-byte chars split across
+# tokens — e.g. emoji — decode correctly instead of being dropped at token boundaries).
+encoding_rs = { version = "0.8", optional = true }
 
 [features]
-inprocess = ["dep:llama-cpp-2", "dep:minijinja", "dep:chrono"]
+inprocess = ["dep:llama-cpp-2", "dep:minijinja", "dep:chrono", "dep:encoding_rs"]
 metal = ["llama-cpp-2/metal"]
 
 [[example]]
 name = "inproc_poc"
+required-features = ["inprocess"]
+
+[[example]]
+name = "inproc_batch_test"
+required-features = ["inprocess"]
+
+[[example]]
+name = "inproc_shutdown_test"
 required-features = ["inprocess"]

@@ -1586,7 +1586,7 @@ dependencies = [
 
 [[package]]
 name = "sgl-node"
-version = "1.6.1"
+version = "1.7.0"
 dependencies = [
  "bs58",
  "chacha20poly1305",
@@ -1594,6 +1594,7 @@ dependencies = [
  "clap",
  "dirs",
  "ed25519-dalek",
+ "encoding_rs",
  "futures-util",
  "hex",
  "hkdf",
