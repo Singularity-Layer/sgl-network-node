@@ -1,15 +1,22 @@
 # Release pipeline — builds official binaries on GitHub's own runners.
 #
 # Trigger: push a version tag (v1.2.0, v1.3.0, …).
-# Output: a GitHub Release with one binary + .sha256 per platform:
-#   sgl-darwin-arm64   (macOS Apple Silicon)
-#   sgl-linux-x86_64   (Linux x86_64 — Intel TDX / AMD SEV hosts)
-#   sgl-linux-arm64    (Linux arm64)
+# Output: ONE GitHub PRERELEASE with one binary + .sha256 per platform:
+#   sgl-darwin-arm64        (macOS Apple Silicon)
+#   sgl-linux-x86_64        (Linux x86_64 — Intel TDX / AMD SEV hosts)
+#   sgl-linux-arm64         (Linux arm64)
+#   sgl-windows-x86_64.exe  (Windows x64 — non-confidential node)
 #
 # Why CI builds: binaries are produced from the public source on GitHub's
 # infrastructure, not a developer laptop — a verifiable supply chain. After a
 # release, each new sha256 must be appended to the orchestrator's
 # ALLOWED_NODE_BINARY_HASHES (add-before-remove) or the build cannot serve.
+#
+# NON-PUBLIC BY DESIGN: the release is a `--prerelease` and this repo is PRIVATE,
+# so assets are not anonymously downloadable. Nothing reaches the public download
+# endpoint (cloud.x402compute.cc/downloads/node/) until the owner syncs manually.
+# The Windows binary additionally does nothing until the owner allowlists its
+# sha256 — see WINDOWS.md / RELEASING.md.
 
 name: release
 
@@ -82,9 +89,63 @@ jobs:
             ${{ matrix.asset }}.sha256
           if-no-files-found: error
 
+  # Windows is a separate job (MSVC toolchain + NASM for `ring`; PowerShell
+  # checksum). Mirrors windows.yml's build so the Windows node binary rides the
+  # same release. Non-confidential (no TEE/App Attest), which matches the product
+  # framing — see WINDOWS.md.
+  build-windows:
+    name: build (sgl-windows-x86_64)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (MSVC)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      # `ring` (via rustls → reqwest rustls-tls + tokio-tungstenite) assembles its
+      # crypto with NASM on the MSVC target. Pin it so the build can't go red if
+      # the runner image ever drops nasm.
+      - name: Install NASM (for ring's assembly)
+        uses: ilammy/setup-nasm@v1
+
+      - name: Cargo cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Build (release, MSVC)
+        run: cargo build --release --target x86_64-pc-windows-msvc
+
+      - name: Package + checksum
+        shell: pwsh
+        run: |
+          $bin = "target/x86_64-pc-windows-msvc/release/sgl.exe"
+          if (-not (Test-Path $bin)) { throw "sgl.exe was not produced at $bin" }
+          Copy-Item $bin "sgl-windows-x86_64.exe"
+          $hash = (Get-FileHash -Algorithm SHA256 "sgl-windows-x86_64.exe").Hash.ToLower()
+          "$hash  sgl-windows-x86_64.exe" | Out-File -Encoding ascii "sgl-windows-x86_64.exe.sha256"
+          Get-Content "sgl-windows-x86_64.exe.sha256"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sgl-windows-x86_64
+          path: |
+            sgl-windows-x86_64.exe
+            sgl-windows-x86_64.exe.sha256
+          if-no-files-found: error
+
   release:
     name: publish release
-    needs: build
+    needs: [build, build-windows]
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/download-artifact@v4
@@ -94,7 +155,7 @@ jobs:
       - name: Show checksums (paste these into the allowlist)
         run: cat ./*.sha256
 
-      - name: Create release with assets
+      - name: Create prerelease with assets
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ github.ref_name }}
@@ -104,6 +165,8 @@ jobs:
             --repo "$REPO" \
             --title "sgl-node $TAG" \
             --generate-notes \
+            --prerelease \
             sgl-darwin-arm64 sgl-darwin-arm64.sha256 \
             sgl-linux-x86_64 sgl-linux-x86_64.sha256 \
-            sgl-linux-arm64 sgl-linux-arm64.sha256
+            sgl-linux-arm64 sgl-linux-arm64.sha256 \
+            sgl-windows-x86_64.exe sgl-windows-x86_64.exe.sha256

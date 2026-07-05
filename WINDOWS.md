@@ -97,11 +97,45 @@ foreground node path works. None of them block running a node in the foreground.
 5. **Confidential tier** — decide whether Windows ever gets an attestation path
    (likely stays non-confidential).
 
-## Fetching the CI artifact
+## Windows release + allowlist (owner-manual go-live)
 
-The `windows` workflow (`.github/workflows/windows.yml`) runs on
-`workflow_dispatch`, every PR, and on `v*` tags. It uploads an artifact named
-**`sgl-windows-x86_64`** containing `sgl-windows-x86_64.exe` and its `.sha256`.
+On a `v*` tag, `.github/workflows/release.yml` now builds Windows too (its
+`build-windows` job, MSVC + NASM) and attaches **`sgl-windows-x86_64.exe`** +
+**`sgl-windows-x86_64.exe.sha256`** to the **same GitHub prerelease** as the
+macOS/Linux binaries. The release is a **`--prerelease`** and this repo is
+**private**, so the binary is not anonymously downloadable and no Windows node can
+serve until the owner does BOTH of these:
+
+1. **Sync** `sgl-windows-x86_64.exe` (rename to your download convention) to the
+   public endpoint `https://cloud.x402compute.cc/downloads/node/` alongside the
+   mac/linux binaries. (Owner-manual; CI never touches it.)
+2. **Allowlist the sha256.** A node's binary hash is checked against the
+   orchestrator's `ALLOWED_NODE_BINARY_HASHES` env var. If the Windows binary's
+   sha256 is not in that list, a Windows node is **rejected from serving**
+   (masquerades as a stake/binary error at the orchestrator).
+
+   - **Where the sha256 comes from:** the published **`sgl-windows-x86_64.exe.sha256`**
+     release asset (also printed by the release run's *"Show checksums"* step, and
+     by the `build-windows` job's checksum step). It's the lowercase hex before the
+     filename, e.g.:
+
+     ```text
+     3f8a…<64 hex chars>…c1  sgl-windows-x86_64.exe
+     ```
+
+   - **What to set:** append that 64-char hex to `ALLOWED_NODE_BINARY_HASHES`
+     (comma-separated, add-before-remove — keep the existing mac/linux hashes) on
+     the orchestrator (`sgl-network-orchestrator` Cloudflare Worker env / secret).
+     Do NOT remove old hashes until every node is on the new build.
+
+Nothing above is automated. The tag build only produces the private prerelease.
+
+## Fetching the build-only CI artifact
+
+The `windows` workflow (`.github/workflows/windows.yml`) is **build-only** and runs
+on `workflow_dispatch` and every PR (no `v*` tag trigger — the release build lives
+in `release.yml`). It uploads an artifact named **`sgl-windows-x86_64`** containing
+`sgl-windows-x86_64.exe` and its `.sha256`.
 
 - **Web:** open the run under the repo's *Actions → windows*, scroll to
   *Artifacts*, download `sgl-windows-x86_64`.
@@ -111,6 +145,6 @@ The `windows` workflow (`.github/workflows/windows.yml`) runs on
   gh run download <run-id> -n sgl-windows-x86_64
   ```
 
-The build is **build-only** — it compiles and packages `sgl.exe` but does not run
-it and does not publish a GitHub Release (release publishing stays owned by
-`release.yml`, which is macOS/Linux only and untouched by this workflow).
+This workflow compiles and packages `sgl.exe` but does not run it and does not
+publish a GitHub Release. Release publishing (mac + linux + windows) is owned by
+`release.yml`; the macOS/Linux publish there is unchanged in behavior.

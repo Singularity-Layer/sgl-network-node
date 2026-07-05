@@ -7,10 +7,8 @@
 #
 # Triggers:
 #   - pull_request / workflow_dispatch → BUILD ONLY (compile + upload sgl.exe).
-#   - push tag v*                       → build + checksum (publishing releases
-#                                         stays owned by release.yml; this job
-#                                         just uploads the Windows artifact so a
-#                                         tagged build has an sgl.exe to grab).
+#   (No `v*` tag trigger: release.yml's build-windows job builds + publishes the
+#    Windows binary onto the release, so a tag doesn't double-build here.)
 #
 # Deliberately BUILD-ONLY: we compile + package, we do NOT run the node (a real
 # Windows box is an owner follow-up). The `inprocess` feature is NOT enabled on
@@ -23,9 +21,6 @@ name: windows
 on:
   workflow_dispatch:
   pull_request:
-  push:
-    tags:
-      - "v*"
 
 permissions:
   contents: read
