@@ -30,6 +30,15 @@ fn platform_asset() -> Result<&'static str, String> {
     return Ok("sgl-linux-x86_64");
     #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
     return Ok("sgl-linux-arm64");
+    // Windows self-update is intentionally not supported: an .exe can't be renamed
+    // over while it's running, and the release pipeline doesn't publish a Windows
+    // asset on the allowlist yet. Update via the installer / desktop shell instead.
+    #[cfg(windows)]
+    return Err(
+        "sgl update is not supported on Windows — a running .exe can't self-replace.\n\
+         Update by re-running the installer (or the Singularity Node desktop app)."
+            .to_string(),
+    );
     #[allow(unreachable_code)]
     Err("sgl update has no prebuilt binary for this platform.\n\
          Update from source: git pull && cargo build --release"

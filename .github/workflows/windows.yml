@@ -1,0 +1,83 @@
+# Windows build pipeline — proves the `sgl` node agent compiles + packages on
+# Windows (x86_64-pc-windows-msvc) using GitHub's own Windows runners.
+#
+# This is the runtime half of shipping a Windows node app: the desktop shell
+# builds on Windows in its own repo; this workflow proves the actual node binary
+# it drives (`sgl.exe`) compiles and can be packaged as a verifiable artifact.
+#
+# Triggers:
+#   - pull_request / workflow_dispatch → BUILD ONLY (compile + upload sgl.exe).
+#   - push tag v*                       → build + checksum (publishing releases
+#                                         stays owned by release.yml; this job
+#                                         just uploads the Windows artifact so a
+#                                         tagged build has an sgl.exe to grab).
+#
+# Deliberately BUILD-ONLY: we compile + package, we do NOT run the node (a real
+# Windows box is an owner follow-up). The `inprocess` feature is NOT enabled on
+# Windows yet (it vendors + builds llama.cpp via cmake; Windows nodes use the
+# child-process `--engine=server` path with llama-server.exe). Windows nodes are
+# non-confidential (no TEE/App Attest), which matches the product framing.
+
+name: windows
+
+on:
+  workflow_dispatch:
+  pull_request:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build (sgl-windows-x86_64)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (MSVC)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      # `ring` (pulled in transitively by rustls, via reqwest rustls-tls +
+      # tokio-tungstenite) assembles its crypto with NASM on the MSVC target.
+      # windows-latest usually ships nasm, but pin it so the build can't go red
+      # if the runner image drops it.
+      - name: Install NASM (for ring's assembly)
+        uses: ilammy/setup-nasm@v1
+
+      - name: Cargo cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Build (release, MSVC)
+        run: cargo build --release --target x86_64-pc-windows-msvc
+
+      - name: Checksum
+        shell: pwsh
+        run: |
+          $bin = "target/x86_64-pc-windows-msvc/release/sgl.exe"
+          if (-not (Test-Path $bin)) { throw "sgl.exe was not produced at $bin" }
+          $hash = (Get-FileHash -Algorithm SHA256 $bin).Hash.ToLower()
+          "$hash  sgl-windows-x86_64.exe" | Out-File -Encoding ascii "sgl-windows-x86_64.exe.sha256"
+          Get-Content "sgl-windows-x86_64.exe.sha256"
+          Copy-Item $bin "sgl-windows-x86_64.exe"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sgl-windows-x86_64
+          path: |
+            sgl-windows-x86_64.exe
+            sgl-windows-x86_64.exe.sha256
+          if-no-files-found: error
