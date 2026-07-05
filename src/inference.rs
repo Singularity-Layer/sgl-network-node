@@ -606,25 +606,62 @@ pub fn find_available_port(preferred: u16) -> u16 {
 }
 
 fn find_llama_server() -> Result<String, String> {
-    let candidates = [
-        "llama-server",
-        "llama-cli",
-        "/usr/local/bin/llama-server",
-        #[cfg(target_os = "macos")]
-        "/opt/homebrew/bin/llama-server",
-        // Headless Linux GPU machines (one-click deploys): cloud-init installs a
-        // pinned CUDA llama-server here.
-        #[cfg(target_os = "linux")]
-        "/opt/sgl/bin/llama-server",
-    ];
-
-    for cmd in &candidates {
-        if Command::new(cmd).arg("--help").output().is_ok() {
-            return Ok(cmd.to_string());
+    // Windows: llama.cpp ships `llama-server.exe`. Look on PATH and in the usual
+    // per-user install locations (%LOCALAPPDATA%\sgl-node\bin is where the desktop
+    // shell / one-click installer drops the bundled build).
+    #[cfg(windows)]
+    {
+        let mut candidates: Vec<String> = vec![
+            "llama-server.exe".to_string(),
+            "llama-cli.exe".to_string(),
+        ];
+        if let Some(local) = dirs::data_local_dir() {
+            candidates.push(
+                local
+                    .join("sgl-node")
+                    .join("bin")
+                    .join("llama-server.exe")
+                    .to_string_lossy()
+                    .into_owned(),
+            );
         }
+        if let Ok(pf) = std::env::var("ProgramFiles") {
+            candidates.push(format!(r"{pf}\llama.cpp\llama-server.exe"));
+        }
+        for cmd in &candidates {
+            if Command::new(cmd).arg("--help").output().is_ok() {
+                return Ok(cmd.clone());
+            }
+        }
+        return Err(
+            "llama-server.exe not found. Install llama.cpp for Windows (https://github.com/ggerganov/llama.cpp/releases) \
+             and put llama-server.exe on PATH or in %LOCALAPPDATA%\\sgl-node\\bin. \
+             Or run with --engine=inprocess on a build compiled with the `inprocess` feature.".to_string()
+        );
     }
 
-    Err(
-        "llama-server not found. Install llama.cpp:\n  brew install llama.cpp\n  # or build from source: https://github.com/ggerganov/llama.cpp".to_string()
-    )
+    #[cfg(not(windows))]
+    {
+        let candidates = [
+            "llama-server",
+            "llama-cli",
+            "/usr/local/bin/llama-server",
+            #[cfg(target_os = "macos")]
+            "/opt/homebrew/bin/llama-server",
+            // Headless Linux GPU machines (one-click deploys): cloud-init installs a
+            // pinned CUDA llama-server here.
+            #[cfg(target_os = "linux")]
+            "/opt/sgl/bin/llama-server",
+        ];
+
+        for cmd in &candidates {
+            if Command::new(cmd).arg("--help").output().is_ok() {
+                return Ok(cmd.to_string());
+            }
+        }
+
+        Err(
+            "llama-server not found. Install llama.cpp:\n  brew install llama.cpp\n  # or build from source: https://github.com/ggerganov/llama.cpp".to_string()
+        )
+    }
 }

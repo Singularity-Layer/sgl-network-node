@@ -12,9 +12,13 @@
 //! `sgl service install --model-path ... --resource-percent 50` reproduces
 //! their chosen config every launch.
 
+#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
 const SERVICE_LABEL: &str = "cc.x402compute.sglnode";
 
 /// Options captured from the CLI and embedded into the generated service.
+// On platforms without a service installer (Windows), the fields are constructed
+// but never read — that's the documented stub path, not a bug.
+#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
 pub struct ServiceStartOptions {
     pub model_path: Option<String>,
     pub model_name: Option<String>,
@@ -32,6 +36,9 @@ pub struct ServiceStartOptions {
 
 impl ServiceStartOptions {
     /// Build the `sgl start ...` argument vector (without the binary itself).
+    // Consumed only by the macOS/Linux installers; on other platforms (Windows)
+    // service install is a stub, so this is dead code there.
+    #[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
     fn start_args(&self) -> Vec<String> {
         let mut args = vec!["start".to_string()];
         if let Some(mp) = &self.model_path {
@@ -61,6 +68,7 @@ impl ServiceStartOptions {
     }
 }
 
+#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
 fn current_exe() -> Result<String, String> {
     std::env::current_exe()
         .map_err(|e| format!("Cannot resolve current executable path: {e}"))?
@@ -69,6 +77,7 @@ fn current_exe() -> Result<String, String> {
         .ok_or_else(|| "Executable path is not valid UTF-8".to_string())
 }
 
+#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
 fn log_path() -> Result<String, String> {
     let home = dirs::home_dir().ok_or("Cannot resolve home directory")?;
     Ok(home
@@ -91,7 +100,9 @@ pub fn install(opts: &ServiceStartOptions) -> Result<(), String> {
     {
         let _ = opts;
         Err(
-            "Service install is only supported on macOS and Linux. Run `sgl start ...` manually."
+            "Windows service install is not wired up yet. Run the node in the foreground with \
+             `sgl start ...` (the Singularity Node desktop app supervises it), or register it \
+             yourself with `sc.exe create`. Native Windows-service support is a follow-up."
                 .to_string(),
         )
     }
@@ -108,7 +119,9 @@ pub fn uninstall() -> Result<(), String> {
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
-        Err("Service uninstall is only supported on macOS and Linux.".to_string())
+        Err("Windows service uninstall is not wired up yet (no service is installed). \
+             If you created one manually, remove it with `sc.exe delete`."
+            .to_string())
     }
 }
 
@@ -123,7 +136,9 @@ pub fn status() -> Result<(), String> {
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
-        Err("Service status is only supported on macOS and Linux.".to_string())
+        Err("Windows service status is not available yet — the node runs in the foreground on \
+             Windows (`sgl start ...`). Native Windows-service support is a follow-up."
+            .to_string())
     }
 }
 
