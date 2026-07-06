@@ -99,6 +99,11 @@ enum Commands {
         #[arg(long)]
         gpu_layers: Option<u32>,
 
+        /// Auto-fit GPU layers to available VRAM (llama.cpp sizes the offload; omits -ngl).
+        /// Overrides --gpu-layers. The universal replacement for per-model VRAM tuning.
+        #[arg(long)]
+        gpu_layers_auto: bool,
+
         /// Context window size in tokens
         #[arg(long, default_value = "4096", value_parser = clap::value_parser!(u32).range(512..=131072))]
         context_size: u32,
@@ -305,12 +310,16 @@ async fn main() {
             resource_percent,
             threads,
             gpu_layers,
+            gpu_layers_auto,
             context_size,
             max_jobs,
             batch_size,
             heartbeat_interval,
             enable_streaming,
         } => {
+            // --gpu-layers-auto → sentinel (u32::MAX) so the inference engine lets llama.cpp
+            // auto-fit the GPU offload to the card's VRAM (see inference::GPU_LAYERS_AUTO).
+            let gpu_layers = if gpu_layers_auto { Some(u32::MAX) } else { gpu_layers };
             let rc = node::ResourceConfig::from_args(
                 resource_percent,
                 threads,

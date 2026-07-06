@@ -4,6 +4,12 @@ use std::path::PathBuf;
 use std::process::{Child, Command};
 use tokio::time::{sleep, Duration};
 
+/// Sentinel for `gpu_layers` meaning "auto-fit": the server engine omits `-ngl` so llama.cpp
+/// sizes the GPU offload to available VRAM (spilling the rest to system RAM — it can't OOM),
+/// and the in-process engine offloads all layers (Mac unified memory). Set by `sgl start
+/// --gpu-layers-auto`. This is the universal replacement for hardcoded per-model VRAM caps.
+pub const GPU_LAYERS_AUTO: u32 = u32::MAX;
+
 pub struct InferenceEngineConfig {
     pub model_path: PathBuf,
     pub model_name: String,
@@ -148,29 +154,28 @@ impl ServerEngine {
         let batch_str = self.config.batch_size.to_string();
         let parallel_str = self.config.parallel_slots.to_string();
 
+        let model_str = self.config.model_path.to_string_lossy();
+        let mut args: Vec<&str> = vec![
+            "-m", &model_str,
+            "--host", "127.0.0.1",
+            "--port", &port_str,
+            "-c", &ctx_str,
+            "-t", &threads_str,
+            "-b", &batch_str,
+            "--parallel", &parallel_str,
+            // Continuous batching: interleave multiple in-flight requests in one
+            // decode loop so the node serves `--parallel` jobs concurrently instead
+            // of one-at-a-time. This is what stops "busy after a single request".
+            "--cont-batching",
+        ];
+        // Auto-fit: OMIT -ngl so llama.cpp sizes the GPU offload to available VRAM (can't OOM —
+        // spills the rest to system RAM). Otherwise pin the requested layer count.
+        if self.config.gpu_layers != GPU_LAYERS_AUTO {
+            args.push("-ngl");
+            args.push(&gpu_layers_str);
+        }
         let child = Command::new(&llama_server)
-            .args([
-                "-m",
-                &self.config.model_path.to_string_lossy(),
-                "--host",
-                "127.0.0.1",
-                "--port",
-                &port_str,
-                "-ngl",
-                &gpu_layers_str,
-                "-c",
-                &ctx_str,
-                "-t",
-                &threads_str,
-                "-b",
-                &batch_str,
-                "--parallel",
-                &parallel_str,
-                // Continuous batching: interleave multiple in-flight requests in one
-                // decode loop so the node serves `--parallel` jobs concurrently instead
-                // of one-at-a-time. This is what stops "busy after a single request".
-                "--cont-batching",
-            ])
+            .args(&args)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::piped())
             .spawn()
@@ -502,7 +507,8 @@ impl InferenceEngine {
                         model_path: config.model_path,
                         model_name: config.model_name,
                         n_ctx: config.context_size,
-                        n_gpu_layers: config.gpu_layers,
+                        // Auto-fit on the in-process engine (Mac unified memory): offload all layers.
+                        n_gpu_layers: if config.gpu_layers == GPU_LAYERS_AUTO { 999 } else { config.gpu_layers },
                         max_slots,
                         per_slot_ctx,
                     })
