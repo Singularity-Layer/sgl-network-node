@@ -58,6 +58,7 @@ pub fn detect() -> TeeCapabilities {
     let chip = detect_chip_name();
     let secure_enclave = detect_secure_enclave();
     let metal = detect_metal();
+    let gpu = detect_gpu_name();
 
     TeeCapabilities {
         tee_type: if secure_enclave {
@@ -69,7 +70,7 @@ pub fn detect() -> TeeCapabilities {
         chip,
         cpu_cores,
         memory_gb,
-        gpu: "apple_metal".to_string(),
+        gpu,
         metal_support: metal,
     }
 }
@@ -77,7 +78,7 @@ pub fn detect() -> TeeCapabilities {
 pub fn generate_attestation_report() -> HardwareAttestationReport {
     let caps = detect();
     let sip = detect_sip_status();
-    let os_version = run_cmd("sw_vers", &["-productVersion"]);
+    let os_version = detect_os_version();
     let kernel_version = run_cmd("uname", &["-r"]);
     let boot_uuid = detect_boot_uuid();
     let hw_uuid = detect_hardware_uuid();
@@ -122,18 +123,94 @@ pub fn detect_binary_hash() -> String {
 }
 
 fn detect_memory_gb() -> f64 {
-    let s = run_cmd("sysctl", &["-n", "hw.memsize"]);
-    s.parse::<u64>()
-        .map(|b| b as f64 / (1024.0 * 1024.0 * 1024.0))
-        .unwrap_or(16.0)
+    #[cfg(target_os = "macos")]
+    {
+        let s = run_cmd("sysctl", &["-n", "hw.memsize"]);
+        return s.parse::<u64>()
+            .map(|b| b as f64 / (1024.0 * 1024.0 * 1024.0))
+            .unwrap_or(16.0);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(meminfo) = std::fs::read_to_string("/proc/meminfo") {
+            for line in meminfo.lines() {
+                if let Some(rest) = line.strip_prefix("MemTotal:") {
+                    let kb = rest.split_whitespace().next()
+                        .and_then(|v| v.parse::<u64>().ok())
+                        .unwrap_or(0);
+                    if kb > 0 {
+                        return kb as f64 / (1024.0 * 1024.0);
+                    }
+                }
+            }
+        }
+        16.0
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        16.0
+    }
 }
 
 fn detect_chip_name() -> String {
-    let s = run_cmd("sysctl", &["-n", "machdep.cpu.brand_string"]);
-    if s.is_empty() {
-        "Apple Silicon".to_string()
-    } else {
-        s
+    #[cfg(target_os = "macos")]
+    {
+        let s = run_cmd("sysctl", &["-n", "machdep.cpu.brand_string"]);
+        return if s.is_empty() { "Apple Silicon".to_string() } else { s };
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(cpuinfo) = std::fs::read_to_string("/proc/cpuinfo") {
+            for key in ["model name", "Hardware", "Processor"] {
+                for line in cpuinfo.lines() {
+                    if let Some((k, v)) = line.split_once(':') {
+                        if k.trim() == key {
+                            let value = v.trim();
+                            if !value.is_empty() {
+                                return value.to_string();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return run_cmd("uname", &["-m"]);
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        "unknown".to_string()
+    }
+}
+
+fn detect_gpu_name() -> String {
+    #[cfg(target_os = "macos")]
+    {
+        return "apple_metal".to_string();
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let nvidia = run_cmd("nvidia-smi", &["--query-gpu=name", "--format=csv,noheader"]);
+        if let Some(first) = nvidia.lines().map(str::trim).find(|line| !line.is_empty()) {
+            return first.to_string();
+        }
+        let lspci = run_cmd("lspci", &[]);
+        for line in lspci.lines() {
+            let lower = line.to_ascii_lowercase();
+            if lower.contains("vga compatible controller")
+                || lower.contains("3d controller")
+                || lower.contains("display controller")
+            {
+                if let Some((_, value)) = line.split_once(": ") {
+                    return value.trim().to_string();
+                }
+                return line.trim().to_string();
+            }
+        }
+        return "unknown".to_string();
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        "unknown".to_string()
     }
 }
 
@@ -167,6 +244,35 @@ fn detect_sip_status() -> bool {
     false
 }
 
+fn detect_os_version() -> String {
+    #[cfg(target_os = "macos")]
+    {
+        return run_cmd("sw_vers", &["-productVersion"]);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(os_release) = std::fs::read_to_string("/etc/os-release") {
+            for key in ["PRETTY_NAME", "VERSION_ID", "NAME"] {
+                for line in os_release.lines() {
+                    if let Some((k, v)) = line.split_once('=') {
+                        if k == key {
+                            let value = v.trim().trim_matches('"');
+                            if !value.is_empty() {
+                                return value.to_string();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return run_cmd("uname", &["-sr"]);
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        String::new()
+    }
+}
+
 fn detect_boot_uuid() -> String {
     #[cfg(target_os = "macos")]
     {
@@ -191,7 +297,13 @@ fn detect_hardware_uuid() -> String {
         String::new()
     }
     #[cfg(not(target_os = "macos"))]
-    String::new()
+    {
+        read_first_existing(&[
+            "/sys/class/dmi/id/product_uuid",
+            "/sys/devices/virtual/dmi/id/product_uuid",
+            "/etc/machine-id",
+        ])
+    }
 }
 
 fn detect_firmware_version() -> String {
@@ -211,7 +323,12 @@ fn detect_firmware_version() -> String {
         run_cmd("sysctl", &["-n", "kern.osversion"])
     }
     #[cfg(not(target_os = "macos"))]
-    String::new()
+    {
+        read_first_existing(&[
+            "/sys/class/dmi/id/bios_version",
+            "/sys/devices/virtual/dmi/id/bios_version",
+        ])
+    }
 }
 
 fn detect_serial_hash() -> String {
@@ -232,7 +349,21 @@ fn detect_serial_hash() -> String {
         String::new()
     }
     #[cfg(not(target_os = "macos"))]
-    String::new()
+    {
+        let serial = read_first_existing(&[
+            "/sys/class/dmi/id/product_serial",
+            "/sys/devices/virtual/dmi/id/product_serial",
+            "/sys/class/dmi/id/board_serial",
+            "/sys/devices/virtual/dmi/id/board_serial",
+        ]);
+        if serial.is_empty() {
+            String::new()
+        } else {
+            let mut hasher = Sha256::new();
+            hasher.update(serial.as_bytes());
+            hex::encode(hasher.finalize())
+        }
+    }
 }
 
 fn run_cmd(cmd: &str, args: &[&str]) -> String {
@@ -240,6 +371,19 @@ fn run_cmd(cmd: &str, args: &[&str]) -> String {
         Ok(out) => String::from_utf8_lossy(&out.stdout).trim().to_string(),
         Err(_) => String::new(),
     }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn read_first_existing(paths: &[&str]) -> String {
+    for path in paths {
+        if let Ok(value) = std::fs::read_to_string(path) {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() && trimmed != "None" && trimmed != "Not Specified" {
+                return trimmed.to_string();
+            }
+        }
+    }
+    String::new()
 }
 
 pub fn print_capabilities(caps: &TeeCapabilities) {

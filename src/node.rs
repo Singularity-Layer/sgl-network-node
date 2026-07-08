@@ -388,8 +388,8 @@ pub async fn login_headless(
 ///   fixed    = model weights (≈ GGUF file size) + headroom for OS/runtime/app
 ///   per-slot = KV cache at `context_size` (estimated from model size, rounded up)
 ///   slots    = clamp(free_for_kv / per_slot_kv, 1, MAX_SLOTS)
-/// Boxes under MIN_RAM stay at 1. An explicit `--max-jobs N>1` caps (never raises) the auto
-/// value; the baked default of 1 means "auto".
+/// Boxes under MIN_RAM stay at 1. An explicit `--max-jobs N>0` caps (never raises) the auto
+/// value; the baked default of 0 means "auto". This keeps `--max-jobs 1` literal.
 fn compute_parallel_slots(
     memory_gb: f64,
     model_path: &Path,
@@ -422,7 +422,7 @@ fn compute_parallel_slots(
     let free_for_kv = (usable - model_gb - OVERHEAD_GB).max(0.0);
     let auto = ((free_for_kv / per_slot_kv_gb).floor() as u32).clamp(1, MAX_SLOTS);
 
-    if requested_max_jobs > 1 {
+    if requested_max_jobs > 0 {
         auto.min(requested_max_jobs) // explicit override caps, never raises past RAM-safe
     } else {
         auto
@@ -498,7 +498,10 @@ pub async fn start(
     tracing::info!("  GPU layers:   {}", rc.gpu_layers);
     tracing::info!("  Context:      {} tokens", rc.context_size);
     tracing::info!("  Batch size:   {}", rc.batch_size);
-    tracing::info!("  Max jobs:     {}", rc.max_jobs);
+    tracing::info!(
+        "  Max jobs:     {}",
+        if rc.max_jobs == 0 { "auto".to_string() } else { rc.max_jobs.to_string() }
+    );
     tracing::info!("  Streaming:    {}", if rc.streaming_enabled { "enabled" } else { "disabled" });
 
     let mut engine: Option<Arc<InferenceEngine>> = None;

@@ -108,8 +108,8 @@ enum Commands {
         #[arg(long, default_value = "4096", value_parser = clap::value_parser!(u32).range(512..=131072))]
         context_size: u32,
 
-        /// Max concurrent jobs this node will accept
-        #[arg(long, default_value = "1")]
+        /// Max concurrent jobs this node will accept (0 = auto, 1 = strictly one job)
+        #[arg(long, default_value = "0")]
         max_jobs: u32,
 
         /// Prompt batch size for processing
@@ -212,8 +212,8 @@ enum ServiceAction {
         #[arg(long, default_value = "8081")]
         inference_port: u16,
 
-        /// Max concurrent jobs this node will accept
-        #[arg(long, default_value = "1")]
+        /// Max concurrent jobs this node will accept (0 = auto, 1 = strictly one job)
+        #[arg(long, default_value = "0")]
         max_jobs: u32,
 
         /// Context window size in tokens (bigger handles longer conversations but

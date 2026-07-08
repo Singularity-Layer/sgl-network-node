@@ -1,5 +1,6 @@
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use std::io::BufRead;
 use std::path::PathBuf;
 use std::process::{Child, Command};
 use tokio::time::{sleep, Duration};
@@ -174,12 +175,30 @@ impl ServerEngine {
             args.push("-ngl");
             args.push(&gpu_layers_str);
         }
-        let child = Command::new(&llama_server)
+        let mut child = Command::new(&llama_server)
             .args(&args)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::piped())
             .spawn()
             .map_err(|e| format!("Failed to start llama-server: {e}"))?;
+
+        if let Some(stderr) = child.stderr.take() {
+            std::thread::spawn(move || {
+                let reader = std::io::BufReader::new(stderr);
+                for line in reader.lines() {
+                    match line {
+                        Ok(line) if !line.trim().is_empty() => {
+                            tracing::warn!(target: "llama_server", "{line}");
+                        }
+                        Ok(_) => {}
+                        Err(err) => {
+                            tracing::warn!(target: "llama_server", "stderr read failed: {err}");
+                            break;
+                        }
+                    }
+                }
+            });
+        }
 
         // Store the new child (replacing any prior handle). Lock is dropped before the
         // await loop below — never hold a std Mutex guard across .await.
