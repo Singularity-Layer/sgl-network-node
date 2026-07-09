@@ -36,10 +36,20 @@ pub struct ServerEngine {
 
 #[derive(Serialize)]
 struct ChatCompletionRequest {
-    messages: Vec<ChatMessage>,
+    // Opaque JSON array, forwarded verbatim to llama-server. Passing it through (rather than
+    // re-serializing a strict {role,content}) preserves tool-calling round-trips: assistant
+    // messages carrying `tool_calls`, `tool`-role messages with `tool_call_id`/`name`, and
+    // null `content` all survive — which is what an agent loop (OpenCode/Cline) needs.
+    messages: serde_json::Value,
     temperature: f64,
     max_tokens: i32,
     stream: bool,
+    // OpenAI tool-calling passthrough (needs llama-server `--jinja`). Omitted when absent so
+    // non-tool requests are byte-identical to before.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<serde_json::Value>,
 }
 
 #[derive(Serialize)]
@@ -102,7 +112,20 @@ struct ChatCompletionResponse {
 
 #[derive(Deserialize)]
 struct ChatChoice {
-    message: ChatMessage,
+    message: RespMessage,
+    #[serde(default)]
+    finish_reason: Option<String>,
+}
+
+/// Assistant reply from llama-server. `content` is Option because a tool-call-only reply sets
+/// it to null; `tool_calls` carries the OpenAI function-call array verbatim when the model
+/// invokes a tool (populated only when the server ran with `--jinja`).
+#[derive(Deserialize)]
+struct RespMessage {
+    #[serde(default)]
+    content: Option<String>,
+    #[serde(default)]
+    tool_calls: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -174,6 +197,13 @@ impl ServerEngine {
             // `none`, DeepSeek-R1 / QwQ etc. stream their thinking inline and the playground's
             // reasoning parser renders the "Thinking" box. No-op for non-reasoning models.
             "--reasoning-format", "none",
+            // Use the model's embedded chat template (minijinja) so OpenAI `tools`/`tool_choice`
+            // activate the tool grammar and the reply carries structured `tool_calls` — the
+            // unlock for agentic coding clients (OpenCode/Cline/Roo). Without --jinja, tool
+            // definitions are ignored and the model answers as plain text. NOTE: this switches
+            // EVERY served model to its GGUF-embedded template, so each model must be verified
+            // on a real build before release (chat parity + reasoning-inline + tool_calls).
+            "--jinja",
         ];
         // Auto-fit: OMIT -ngl so llama.cpp sizes the GPU offload to available VRAM (can't OOM —
         // spills the rest to system RAM). Otherwise pin the requested layer count.
@@ -286,9 +316,11 @@ impl ServerEngine {
 
     pub async fn chat_completion(
         &self,
-        messages: Vec<ChatMessage>,
+        messages: serde_json::Value,
         temperature: f64,
         max_tokens: i32,
+        tools: Option<serde_json::Value>,
+        tool_choice: Option<serde_json::Value>,
     ) -> Result<InferenceResult, String> {
         let url = format!("{}/v1/chat/completions", self.base_url);
 
@@ -297,6 +329,8 @@ impl ServerEngine {
             temperature,
             max_tokens,
             stream: false,
+            tools,
+            tool_choice,
         };
 
         let resp = self
@@ -320,7 +354,8 @@ impl ServerEngine {
         let choice = result.choices.first().ok_or("No completion returned")?;
 
         Ok(InferenceResult {
-            content: choice.message.content.clone(),
+            // A tool-call-only reply has null content — normalise to "" so downstream stays simple.
+            content: choice.message.content.clone().unwrap_or_default(),
             model: self.config.model_name.clone(),
             prompt_tokens: result
                 .usage
@@ -332,6 +367,8 @@ impl ServerEngine {
                 .as_ref()
                 .and_then(|u| u.completion_tokens)
                 .unwrap_or(0),
+            tool_calls: choice.message.tool_calls.clone(),
+            finish_reason: choice.finish_reason.clone(),
         })
     }
 
@@ -480,6 +517,12 @@ pub struct InferenceResult {
     pub model: String,
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
+    /// OpenAI `tool_calls` array when the model invoked a tool (else None). Forwarded verbatim
+    /// to the orchestrator → client so agentic clients can drive the tool loop.
+    pub tool_calls: Option<serde_json::Value>,
+    /// llama-server's `finish_reason` ("stop" | "tool_calls" | "length" | ...). None on the
+    /// in-process engine (which doesn't surface it).
+    pub finish_reason: Option<String>,
 }
 
 /// Which inference backend the node runs (`--engine`).
@@ -586,20 +629,32 @@ impl InferenceEngine {
 
     pub async fn chat_completion(
         &self,
-        messages: Vec<ChatMessage>,
+        messages: serde_json::Value,
         temperature: f64,
         max_tokens: i32,
+        tools: Option<serde_json::Value>,
+        tool_choice: Option<serde_json::Value>,
     ) -> Result<InferenceResult, String> {
         match self {
-            InferenceEngine::Server(e) => e.chat_completion(messages, temperature, max_tokens).await,
+            InferenceEngine::Server(e) => {
+                e.chat_completion(messages, temperature, max_tokens, tools, tool_choice).await
+            }
             #[cfg(feature = "inprocess")]
             InferenceEngine::InProcess(e) => {
-                let out = e.chat_completion(&messages, max_tokens, temperature as f32).await?;
+                // In-process (macOS unified-memory) engine is chat-only for v1 — tool-calling is
+                // a server-engine (Linux GPU) feature. Deserialize the opaque messages into the
+                // strict {role,content} shape it renders; tools are ignored here.
+                let _ = (&tools, &tool_choice);
+                let msgs: Vec<ChatMessage> = serde_json::from_value(messages)
+                    .map_err(|e| format!("Invalid messages format: {e}"))?;
+                let out = e.chat_completion(&msgs, max_tokens, temperature as f32).await?;
                 Ok(InferenceResult {
                     content: out.content,
                     model: e.model_name().to_string(),
                     prompt_tokens: out.prompt_tokens,
                     completion_tokens: out.completion_tokens,
+                    tool_calls: None,
+                    finish_reason: None,
                 })
             }
         }

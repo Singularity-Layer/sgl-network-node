@@ -1177,18 +1177,31 @@ async fn process_job(
 
 /// Parse + bound the inference parameters from a (decrypted) job payload. Shared
 /// by the non-streaming and streaming paths so both apply identical validation.
+/// Validated inference request pulled off a job payload. `messages` is kept as opaque JSON so
+/// tool-calling round-trips survive verbatim (assistant `tool_calls`, `tool`-role messages,
+/// null content); `tools`/`tool_choice` are forwarded to llama-server (which needs `--jinja`).
+struct InferenceParams {
+    messages: serde_json::Value,
+    temperature: f64,
+    max_tokens: i32,
+    tools: Option<serde_json::Value>,
+    tool_choice: Option<serde_json::Value>,
+}
+
 fn parse_inference_params(
     payload: Option<&serde_json::Value>,
-) -> Result<(Vec<ChatMessage>, f64, i32), String> {
+) -> Result<InferenceParams, String> {
     let payload = payload.ok_or("Job has no input payload")?;
 
-    let messages: Vec<ChatMessage> = if let Some(msgs) = payload.get("messages") {
-        serde_json::from_value(msgs.clone()).map_err(|e| format!("Invalid messages format: {e}"))?
+    // Forward messages opaquely (don't destructure to {role,content} — that would drop tool
+    // fields on agent-loop turns). Accept a `prompt` string as a convenience shorthand.
+    let messages: serde_json::Value = if let Some(msgs) = payload.get("messages") {
+        if !msgs.is_array() {
+            return Err("'messages' must be an array".to_string());
+        }
+        msgs.clone()
     } else if let Some(prompt) = payload.get("prompt").and_then(|p| p.as_str()) {
-        vec![ChatMessage {
-            role: "user".to_string(),
-            content: prompt.to_string(),
-        }]
+        serde_json::json!([{ "role": "user", "content": prompt }])
     } else {
         return Err("Payload must contain 'messages' array or 'prompt' string".to_string());
     };
@@ -1196,16 +1209,15 @@ fn parse_inference_params(
     // Bound untrusted input before handing it to the inference server.
     const MAX_MESSAGES: usize = 256;
     const MAX_TOTAL_PROMPT_BYTES: usize = 4 * 1024 * 1024; // 4 MiB
-    if messages.len() > MAX_MESSAGES {
-        return Err(format!(
-            "too many messages ({} > {MAX_MESSAGES})",
-            messages.len()
-        ));
+    let msg_count = messages.as_array().map(|a| a.len()).unwrap_or(0);
+    if msg_count == 0 {
+        return Err("'messages' must not be empty".to_string());
     }
-    let total_bytes: usize = messages
-        .iter()
-        .map(|m| m.content.len() + m.role.len())
-        .sum();
+    if msg_count > MAX_MESSAGES {
+        return Err(format!("too many messages ({msg_count} > {MAX_MESSAGES})"));
+    }
+    // Serialized size is a safe upper bound on the prompt bytes (incl. tool_calls / tool results).
+    let total_bytes = messages.to_string().len();
     if total_bytes > MAX_TOTAL_PROMPT_BYTES {
         return Err(format!(
             "prompt too large ({total_bytes} bytes > {MAX_TOTAL_PROMPT_BYTES})"
@@ -1224,7 +1236,25 @@ fn parse_inference_params(
         .unwrap_or(2048)
         .clamp(1, 8192) as i32;
 
-    Ok((messages, temperature, max_tokens))
+    // Tool-calling passthrough: forward `tools` only when it's a non-empty array (ignore junk so
+    // we never confuse the chat template), and `tool_choice` only alongside it.
+    let tools = payload
+        .get("tools")
+        .filter(|t| t.as_array().map(|a| !a.is_empty()).unwrap_or(false))
+        .cloned();
+    let tool_choice = if tools.is_some() {
+        payload.get("tool_choice").cloned()
+    } else {
+        None
+    };
+
+    Ok(InferenceParams {
+        messages,
+        temperature,
+        max_tokens,
+        tools,
+        tool_choice,
+    })
 }
 
 async fn execute_inference(
@@ -1235,13 +1265,13 @@ async fn execute_inference(
         .as_ref()
         .ok_or("No inference engine configured — start with --model-path")?;
 
-    let (messages, temperature, max_tokens) = parse_inference_params(job.input_payload.as_ref())?;
+    let p = parse_inference_params(job.input_payload.as_ref())?;
 
     let result = engine
-        .chat_completion(messages, temperature, max_tokens)
+        .chat_completion(p.messages, p.temperature, p.max_tokens, p.tools, p.tool_choice)
         .await?;
 
-    Ok(serde_json::json!({
+    let mut out = serde_json::json!({
         "content": result.content,
         "model": result.model,
         "usage": {
@@ -1249,7 +1279,15 @@ async fn execute_inference(
             "completion_tokens": result.completion_tokens,
             "total_tokens": result.prompt_tokens + result.completion_tokens,
         }
-    }))
+    });
+    // Surface tool-calling fields only when present (keeps plain-chat replies byte-identical).
+    if let Some(tc) = result.tool_calls {
+        out["tool_calls"] = tc;
+    }
+    if let Some(fr) = result.finish_reason {
+        out["finish_reason"] = serde_json::Value::String(fr);
+    }
+    Ok(out)
 }
 
 /// Streaming inference: run llama-server with streaming, seal each token batch as
@@ -1299,14 +1337,25 @@ async fn process_inference_stream(
         }
     };
 
-    let (messages, temperature, max_tokens) =
-        match parse_inference_params(job.input_payload.as_ref()) {
-            Ok(v) => v,
-            Err(e) => {
-                let _ = client.fail_job(&job.id, &e).await;
-                return;
-            }
-        };
+    let p = match parse_inference_params(job.input_payload.as_ref()) {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = client.fail_job(&job.id, &e).await;
+            return;
+        }
+    };
+    let (temperature, max_tokens) = (p.temperature, p.max_tokens);
+    // Streaming is chat-only in v1 (tool-calling uses the non-streaming path), so render the
+    // opaque messages into the {role,content} shape the stream engine consumes.
+    let messages: Vec<ChatMessage> = match serde_json::from_value(p.messages) {
+        Ok(m) => m,
+        Err(e) => {
+            let _ = client
+                .fail_job(&job.id, &format!("Invalid messages format: {e}"))
+                .await;
+            return;
+        }
+    };
 
     // Per-request nonce chosen by the client (inside the sealed prompt) — bound
     // into every chunk's AAD so a stream can't be spliced into another request.
