@@ -1242,6 +1242,21 @@ fn parse_inference_params(
         .get("tools")
         .filter(|t| t.as_array().map(|a| !a.is_empty()).unwrap_or(false))
         .cloned();
+    if let Some(t) = &tools {
+        // Bound the tool schema independently of the prompt — an unbounded `tools` array would
+        // otherwise sail past the message-size guard above and OOM the server. Tool defs are
+        // small in practice; 512 KiB / 128 tools is generous.
+        const MAX_TOOLS: usize = 128;
+        const MAX_TOOLS_BYTES: usize = 512 * 1024;
+        let n = t.as_array().map(|a| a.len()).unwrap_or(0);
+        if n > MAX_TOOLS {
+            return Err(format!("too many tools ({n} > {MAX_TOOLS})"));
+        }
+        let bytes = t.to_string().len();
+        if bytes > MAX_TOOLS_BYTES {
+            return Err(format!("tools schema too large ({bytes} bytes > {MAX_TOOLS_BYTES})"));
+        }
+    }
     let tool_choice = if tools.is_some() {
         payload.get("tool_choice").cloned()
     } else {
