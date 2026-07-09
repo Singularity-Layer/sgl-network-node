@@ -168,6 +168,12 @@ impl ServerEngine {
             // decode loop so the node serves `--parallel` jobs concurrently instead
             // of one-at-a-time. This is what stops "busy after a single request".
             "--cont-batching",
+            // Keep reasoning-model thought tags INLINE in `content` (<think>...</think>)
+            // instead of the default, which extracts them into a separate `reasoning_content`
+            // field that we don't forward — so the browser never saw the reasoning. With
+            // `none`, DeepSeek-R1 / QwQ etc. stream their thinking inline and the playground's
+            // reasoning parser renders the "Thinking" box. No-op for non-reasoning models.
+            "--reasoning-format", "none",
         ];
         // Auto-fit: OMIT -ngl so llama.cpp sizes the GPU offload to available VRAM (can't OOM —
         // spills the rest to system RAM). Otherwise pin the requested layer count.
