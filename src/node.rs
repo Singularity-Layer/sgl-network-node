@@ -1272,6 +1272,63 @@ fn parse_inference_params(
     })
 }
 
+/// Fallback tool-call extraction. Some models (verified live: Qwen2.5-Coder) wrap tool calls in
+/// nonstandard tags — `<function-call>`, `<function_call>`, `<xml>`, ```json fences — that
+/// llama.cpp's parser doesn't recognise (it extracts only `<tool_call>`), so the call arrives as
+/// TEXT in `content` and agentic clients (OpenCode/Cline) see "no tool call" and stall
+/// (upstream: ggml-org/llama.cpp#12279). When tools were requested and no structured tool_calls
+/// came back, scan the text for `{"name": ..., "arguments": ...}` objects whose name matches a
+/// REQUESTED tool (never invent calls) and synthesize the OpenAI tool_calls array.
+fn extract_text_tool_calls(
+    content: &str,
+    allowed: &[String],
+    job_id: &str,
+) -> Option<serde_json::Value> {
+    if allowed.is_empty() || content.is_empty() {
+        return None;
+    }
+    let id8 = job_id.get(..8).unwrap_or(job_id);
+    let mut calls: Vec<serde_json::Value> = Vec::new();
+    let mut from = 0usize;
+    // Walk every '{' and try to parse a JSON value there; serde stops at the value's end, so
+    // surrounding tags/fences/prose don't matter. '{' is ASCII → indices stay on char bounds.
+    while let Some(rel) = content[from..].find('{') {
+        let start = from + rel;
+        let mut iter =
+            serde_json::Deserializer::from_str(&content[start..]).into_iter::<serde_json::Value>();
+        match iter.next() {
+            Some(Ok(v)) => {
+                let consumed = iter.byte_offset().max(1);
+                let name = v.get("name").and_then(|n| n.as_str());
+                let args = v.get("arguments").or_else(|| v.get("parameters"));
+                if let (Some(name), Some(args)) = (name, args) {
+                    if allowed.iter().any(|a| a == name) {
+                        // OpenAI shape: arguments is a STRING of JSON.
+                        let args_str = match args.as_str() {
+                            Some(s) => s.to_string(),
+                            None => args.to_string(),
+                        };
+                        calls.push(serde_json::json!({
+                            "id": format!("call_{id8}_{}", calls.len()),
+                            "type": "function",
+                            "function": { "name": name, "arguments": args_str },
+                        }));
+                    }
+                }
+                from = start + consumed;
+            }
+            _ => {
+                from = start + 1;
+            }
+        }
+    }
+    if calls.is_empty() {
+        None
+    } else {
+        Some(serde_json::Value::Array(calls))
+    }
+}
+
 async fn execute_inference(
     engine: &Option<Arc<InferenceEngine>>,
     job: &PendingJob,
@@ -1281,13 +1338,45 @@ async fn execute_inference(
         .ok_or("No inference engine configured — start with --model-path")?;
 
     let p = parse_inference_params(job.input_payload.as_ref())?;
+    // Names of the requested tools — kept for the fallback extractor (only synthesizes calls to
+    // tools the CLIENT asked for; a hallucinated name never becomes a tool_call).
+    let tool_names: Vec<String> = p
+        .tools
+        .as_ref()
+        .and_then(|t| t.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|t| {
+                    t.get("function")
+                        .and_then(|f| f.get("name"))
+                        .and_then(|n| n.as_str())
+                        .map(str::to_string)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let tools_requested = p.tools.is_some();
 
     let result = engine
         .chat_completion(p.messages, p.temperature, p.max_tokens, p.tools, p.tool_choice)
         .await?;
 
+    let mut content = result.content;
+    let mut tool_calls = result.tool_calls;
+    let mut finish_reason = result.finish_reason;
+    // Tolerant fallback: model emitted the tool call as text → synthesize structured tool_calls.
+    if tools_requested && tool_calls.is_none() {
+        if let Some(tc) = extract_text_tool_calls(&content, &tool_names, &job.id) {
+            tracing::info!("job {}: extracted tool_calls from text reply (nonstandard format)", job.id);
+            tool_calls = Some(tc);
+            finish_reason = Some("tool_calls".to_string());
+            // OpenAI semantics: a tool-call turn carries no user-facing content.
+            content = String::new();
+        }
+    }
+
     let mut out = serde_json::json!({
-        "content": result.content,
+        "content": content,
         "model": result.model,
         "usage": {
             "prompt_tokens": result.prompt_tokens,
@@ -1296,13 +1385,54 @@ async fn execute_inference(
         }
     });
     // Surface tool-calling fields only when present (keeps plain-chat replies byte-identical).
-    if let Some(tc) = result.tool_calls {
+    if let Some(tc) = tool_calls {
         out["tool_calls"] = tc;
     }
-    if let Some(fr) = result.finish_reason {
+    if let Some(fr) = finish_reason {
         out["finish_reason"] = serde_json::Value::String(fr);
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tool_extract_tests {
+    use super::extract_text_tool_calls;
+
+    fn allowed() -> Vec<String> {
+        vec!["get_weather".to_string()]
+    }
+
+    #[test]
+    fn extracts_from_function_call_tags() {
+        let c = "<function-call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Tokyo\"}}\n</function-call>";
+        let tc = extract_text_tool_calls(c, &allowed(), "jobid123").unwrap();
+        assert_eq!(tc[0]["function"]["name"], "get_weather");
+        assert!(tc[0]["function"]["arguments"].as_str().unwrap().contains("Tokyo"));
+    }
+
+    #[test]
+    fn extracts_from_xml_and_fences() {
+        for c in [
+            "<xml>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}\n</xml>",
+            "```json\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}\n```",
+            "{\"name\": \"get_weather\", \"arguments\": \"{\\\"city\\\": \\\"Paris\\\"}\"}",
+        ] {
+            let tc = extract_text_tool_calls(c, &allowed(), "jobid123").unwrap();
+            assert_eq!(tc.as_array().unwrap().len(), 1, "case: {c}");
+        }
+    }
+
+    #[test]
+    fn ignores_unrequested_tool_names_and_plain_text() {
+        assert!(extract_text_tool_calls(
+            "{\"name\": \"rm_rf\", \"arguments\": {}}",
+            &allowed(),
+            "j"
+        )
+        .is_none());
+        assert!(extract_text_tool_calls("Here is code: `{}` and {\"a\":1}", &allowed(), "j").is_none());
+        assert!(extract_text_tool_calls("no braces at all", &allowed(), "j").is_none());
+    }
 }
 
 /// Streaming inference: run llama-server with streaming, seal each token batch as
