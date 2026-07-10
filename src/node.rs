@@ -1322,11 +1322,68 @@ fn extract_text_tool_calls(
             }
         }
     }
+    // Fallback B — XML-attribute style: `<function name="X" arguments='{...}' />`.
+    // Under tool_choice:auto (no forced grammar), some Qwen-Coder builds emit the call as this
+    // tag instead of a JSON `{"name":..,"arguments":..}` block, so Fallback A above misses it
+    // (the only `{...}` present is the arguments value, which has no `name` key). This is what
+    // OpenCode hit. Only runs when the JSON walk found nothing, and still gated to allowed names.
+    if calls.is_empty() {
+        let mut fpos = 0usize;
+        while let Some(rel) = content[fpos..].find("<function") {
+            let tstart = fpos + rel;
+            let tend = content[tstart..]
+                .find('>')
+                .map(|e| tstart + e + 1)
+                .unwrap_or(content.len());
+            let tag = &content[tstart..tend];
+            if let (Some(name), Some(args)) = (
+                xml_attr(tag, "name"),
+                xml_attr(tag, "arguments").or_else(|| xml_attr(tag, "parameters")),
+            ) {
+                if allowed.iter().any(|a| a == name) {
+                    // arguments is a JSON string; keep verbatim if it parses, else JSON-encode it.
+                    let args_str = if serde_json::from_str::<serde_json::Value>(args).is_ok() {
+                        args.to_string()
+                    } else {
+                        serde_json::Value::String(args.to_string()).to_string()
+                    };
+                    calls.push(serde_json::json!({
+                        "id": format!("call_{id8}_{}", calls.len()),
+                        "type": "function",
+                        "function": { "name": name, "arguments": args_str },
+                    }));
+                }
+            }
+            fpos = tend;
+        }
+    }
     if calls.is_empty() {
         None
     } else {
         Some(serde_json::Value::Array(calls))
     }
+}
+
+/// Extract an XML attribute value (`attr="..."` or `attr='...'`) from a tag slice. Returns the
+/// raw inner string. Tolerant of surrounding whitespace around `=`. ASCII quotes only.
+fn xml_attr<'a>(tag: &'a str, attr: &str) -> Option<&'a str> {
+    let mut search = 0usize;
+    while let Some(rel) = tag[search..].find(attr) {
+        let i = search + rel;
+        let after = tag[i + attr.len()..].trim_start();
+        if let Some(rest) = after.strip_prefix('=') {
+            let rest = rest.trim_start();
+            let q = rest.chars().next();
+            if q == Some('"') || q == Some('\'') {
+                let quote = q.unwrap();
+                if let Some(end) = rest[1..].find(quote) {
+                    return Some(&rest[1..1 + end]);
+                }
+            }
+        }
+        search = i + attr.len();
+    }
+    None
 }
 
 async fn execute_inference(
@@ -1432,6 +1489,36 @@ mod tool_extract_tests {
         .is_none());
         assert!(extract_text_tool_calls("Here is code: `{}` and {\"a\":1}", &allowed(), "j").is_none());
         assert!(extract_text_tool_calls("no braces at all", &allowed(), "j").is_none());
+    }
+
+    #[test]
+    fn extracts_xml_attribute_function_tags() {
+        // The exact shape Qwen-Coder emitted under tool_choice:auto (OpenCode's default).
+        // Real emitted shape: double-quoted name, single-quoted JSON arguments (JSON needs "").
+        for c in [
+            "<function name=\"get_weather\" arguments='{\"city\": \"Tokyo\"}' />",
+            "<function name='get_weather' arguments='{\"city\": \"Tokyo\"}'>",
+            "Sure, I'll check.\n<function name=\"get_weather\" arguments='{\"city\":\"Tokyo\"}'/>",
+        ] {
+            let tc = extract_text_tool_calls(c, &allowed(), "jobid123").unwrap();
+            assert_eq!(tc.as_array().unwrap().len(), 1, "case: {c}");
+            assert_eq!(tc[0]["function"]["name"], "get_weather", "case: {c}");
+            assert!(
+                tc[0]["function"]["arguments"].as_str().unwrap().contains("Tokyo"),
+                "case: {c}"
+            );
+        }
+    }
+
+    #[test]
+    fn xml_tags_still_gate_on_allowed_names() {
+        // An unrequested tool in XML form is never synthesized.
+        assert!(extract_text_tool_calls(
+            "<function name=\"rm_rf\" arguments='{}' />",
+            &allowed(),
+            "j"
+        )
+        .is_none());
     }
 }
 
