@@ -8,6 +8,7 @@ mod node;
 mod orchestrator;
 mod runtime_hardening;
 mod service;
+mod setup;
 mod tee;
 mod update;
 mod ws;
@@ -138,6 +139,17 @@ enum Commands {
     /// match the published checksum AND be on the grid's approved-binary
     /// allowlist before it replaces this binary.
     Update,
+
+    /// Install the llama.cpp inference backend (llama-server) for this node.
+    /// Downloads a pinned, sha256-verified build into the per-user bin dir.
+    /// Required on Windows before serving; on Linux/macOS the deploy usually
+    /// installs it, but this works there too. Defaults to the Vulkan build
+    /// (runs on any GPU); use --cpu for a CPU-only machine.
+    Setup {
+        /// Install the CPU-only build instead of the GPU (Vulkan) build.
+        #[arg(long)]
+        cpu: bool,
+    },
 
     /// Go off-grid (maintenance): stop receiving jobs without being penalized.
     /// Use for planned downtime. Tamper slashing is unaffected.
@@ -369,6 +381,12 @@ async fn main() {
         Commands::Update => {
             if let Err(e) = update::run(&cli.orchestrator_url).await {
                 tracing::error!("Update failed: {e}");
+                std::process::exit(1);
+            }
+        }
+        Commands::Setup { cpu } => {
+            if let Err(e) = setup::run(cpu).await {
+                tracing::error!("Setup failed: {e}");
                 std::process::exit(1);
             }
         }

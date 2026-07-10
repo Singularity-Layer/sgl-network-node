@@ -792,15 +792,13 @@ pub fn find_available_port(preferred: u16) -> u16 {
 }
 
 fn find_llama_server() -> Result<String, String> {
-    // Windows: llama.cpp ships `llama-server.exe`. Look on PATH and in the usual
-    // per-user install locations (%LOCALAPPDATA%\sgl-node\bin is where the desktop
-    // shell / one-click installer drops the bundled build).
+    // Windows: llama.cpp ships `llama-server.exe`. Prefer the `sgl setup`-installed, hash-VERIFIED
+    // build (%LOCALAPPDATA%\sgl-node\bin) FIRST, so a stale/incompatible llama-server.exe on PATH
+    // can't shadow it (Codex MED). Fall back to PATH / ProgramFiles only if the verified one is
+    // absent.
     #[cfg(windows)]
     {
-        let mut candidates: Vec<String> = vec![
-            "llama-server.exe".to_string(),
-            "llama-cli.exe".to_string(),
-        ];
+        let mut candidates: Vec<String> = Vec::new();
         if let Some(local) = dirs::data_local_dir() {
             candidates.push(
                 local
@@ -811,6 +809,8 @@ fn find_llama_server() -> Result<String, String> {
                     .into_owned(),
             );
         }
+        candidates.push("llama-server.exe".to_string());
+        candidates.push("llama-cli.exe".to_string());
         if let Ok(pf) = std::env::var("ProgramFiles") {
             candidates.push(format!(r"{pf}\llama.cpp\llama-server.exe"));
         }
