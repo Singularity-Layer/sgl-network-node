@@ -165,6 +165,27 @@ impl ServerEngine {
             ));
         }
 
+        // Qwen-family GGUFs (verified live on qwen-coder) ship chat templates WITHOUT a tools
+        // section, so llama-server can't grammar-constrain or parse tool calls — the model
+        // freestyles `<function-call>`/`<xml>` text (upstream ggml-org/llama.cpp#12279). Override
+        // with the official Qwen2.5 tool-enabled template (teaches `<tool_call>`, which the
+        // server parses natively into structured tool_calls). Excludes R1/QwQ distills — those
+        // need their own reasoning templates. Written to a temp file each start.
+        let template_file: Option<String> = if qwen_template_override(&self.config.model_path) {
+            match write_qwen_tools_template() {
+                Ok(p) => {
+                    tracing::info!("using Qwen2.5 tool-enabled chat template override");
+                    Some(p)
+                }
+                Err(e) => {
+                    tracing::warn!("failed to write Qwen template override (continuing without): {e}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         let llama_server = find_llama_server()?;
         tracing::info!(
             "Starting llama-server with model: {}",
@@ -210,6 +231,10 @@ impl ServerEngine {
         if self.config.gpu_layers != GPU_LAYERS_AUTO {
             args.push("-ngl");
             args.push(&gpu_layers_str);
+        }
+        if let Some(p) = &template_file {
+            args.push("--chat-template-file");
+            args.push(p);
         }
         let mut child = Command::new(&llama_server)
             .args(&args)
@@ -676,6 +701,44 @@ impl InferenceEngine {
                 e.chat_completion_stream(&messages, max_tokens, temperature as f32, tx).await
             }
         }
+    }
+}
+
+/// Official Qwen2.5 tool-enabled chat template (from llama.cpp `models/templates/`, Apache-2.0).
+/// Embedded so the override needs no network or extra release asset.
+const QWEN25_TOOLS_TEMPLATE: &str = include_str!("templates/qwen2.5-tools.jinja");
+
+/// Should this model get the Qwen tool-template override? Qwen chat/coder models: yes (their
+/// GGUF templates lack a tools branch). R1/QwQ distills: NO — they carry reasoning templates
+/// that the override would clobber (breaking `<think>` output).
+fn qwen_template_override(model_path: &std::path::Path) -> bool {
+    let name = model_path
+        .file_name()
+        .map(|s| s.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    name.contains("qwen") && !name.contains("r1") && !name.contains("qwq")
+}
+
+/// Write the embedded template to a temp file for `--chat-template-file`.
+fn write_qwen_tools_template() -> Result<String, String> {
+    let p = std::env::temp_dir().join("sgl-qwen25-tools.jinja");
+    std::fs::write(&p, QWEN25_TOOLS_TEMPLATE).map_err(|e| e.to_string())?;
+    Ok(p.to_string_lossy().into_owned())
+}
+
+#[cfg(test)]
+mod template_override_tests {
+    use super::qwen_template_override;
+    use std::path::Path;
+
+    #[test]
+    fn qwen_models_get_override_but_reasoning_distills_do_not() {
+        assert!(qwen_template_override(Path::new("/opt/sgl/models/qwen-coder-7b.gguf")));
+        assert!(qwen_template_override(Path::new("/opt/sgl/models/qwen-2.5-14b.gguf")));
+        assert!(!qwen_template_override(Path::new("/opt/sgl/models/r1-qwen-14b.gguf")));
+        assert!(!qwen_template_override(Path::new("/opt/sgl/models/r1-llama-8b.gguf")));
+        assert!(!qwen_template_override(Path::new("/opt/sgl/models/qwq-32b.gguf")));
+        assert!(!qwen_template_override(Path::new("/opt/sgl/models/gemma-2-2b.gguf")));
     }
 }
 
