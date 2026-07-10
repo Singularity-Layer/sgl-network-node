@@ -11,6 +11,20 @@ use tokio::time::{sleep, Duration};
 /// --gpu-layers-auto`. This is the universal replacement for hardcoded per-model VRAM caps.
 pub const GPU_LAYERS_AUTO: u32 = u32::MAX;
 
+fn inference_transport_error(err: reqwest::Error) -> String {
+    tracing::warn!("local inference backend request failed: {err}");
+
+    if err.is_connect() || err.is_timeout() {
+        "Inference backend unavailable; retry shortly".to_string()
+    } else {
+        "Inference backend request failed".to_string()
+    }
+}
+
+fn retryable_inference_transport_error(err: &reqwest::Error) -> bool {
+    err.is_connect() || err.is_timeout()
+}
+
 pub struct InferenceEngineConfig {
     pub model_path: PathBuf,
     pub model_name: String,
@@ -358,13 +372,24 @@ impl ServerEngine {
             tool_choice,
         };
 
-        let resp = self
-            .client
-            .post(&url)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| format!("Inference request failed: {e}"))?;
+        let mut resp = None;
+        for attempt in 0..3 {
+            match self.client.post(&url).json(&body).send().await {
+                Ok(r) => {
+                    resp = Some(r);
+                    break;
+                }
+                Err(e) if retryable_inference_transport_error(&e) && attempt < 2 => {
+                    tracing::warn!(
+                        "local inference backend transient request failure (attempt {}/3): {e}",
+                        attempt + 1
+                    );
+                    sleep(Duration::from_millis(250 * (attempt + 1) as u64)).await;
+                }
+                Err(e) => return Err(inference_transport_error(e)),
+            }
+        }
+        let resp = resp.ok_or_else(|| "Inference backend unavailable; retry shortly".to_string())?;
 
         if !resp.status().is_success() {
             let text = resp.text().await.unwrap_or_default();
@@ -428,13 +453,25 @@ impl ServerEngine {
             },
         };
 
-        let mut resp = self
-            .client
-            .post(&url)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| format!("Inference request failed: {e}"))?;
+        let mut resp = None;
+        for attempt in 0..3 {
+            match self.client.post(&url).json(&body).send().await {
+                Ok(r) => {
+                    resp = Some(r);
+                    break;
+                }
+                Err(e) if retryable_inference_transport_error(&e) && attempt < 2 => {
+                    tracing::warn!(
+                        "local inference backend transient stream request failure (attempt {}/3): {e}",
+                        attempt + 1
+                    );
+                    sleep(Duration::from_millis(250 * (attempt + 1) as u64)).await;
+                }
+                Err(e) => return Err(inference_transport_error(e)),
+            }
+        }
+        let mut resp =
+            resp.ok_or_else(|| "Inference backend unavailable; retry shortly".to_string())?;
 
         if !resp.status().is_success() {
             let text = resp.text().await.unwrap_or_default();
