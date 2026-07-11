@@ -10,9 +10,13 @@ your own machine. This is a **private beta**: please don't reshare the download 
 - A GPU helps a lot but isn't required (there's a CPU-only mode).
 - ~3 GB free disk (llama.cpp + one small model).
 
+**Private download link** (don't reshare):
+`https://cloud.x402compute.cc/downloads/node/sgl-win-beta-caa3e3c481b784570734aacc.exe`
+
 ## Fastest path (one click)
-1. Put the `sgl.exe` you were given (or download it from your private link) into
-   `%LOCALAPPDATA%\sgl-node\` — i.e. `C:\Users\<you>\AppData\Local\sgl-node\sgl.exe`.
+1. Download **`sgl-beta-setup.bat`** (below) — it pulls the node from the private link
+   above automatically. Or, if you prefer, download the exe yourself and put it at
+   `%LOCALAPPDATA%\sgl-node\sgl.exe` (`C:\Users\<you>\AppData\Local\sgl-node\sgl.exe`).
 2. Double-click **`sgl-beta-setup.bat`**.
 3. Windows will warn *"Windows protected your PC"* (the app isn't code-signed yet) →
    click **More info → Run anyway**. This is expected for the beta.

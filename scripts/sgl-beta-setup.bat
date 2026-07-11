@@ -14,9 +14,8 @@ set "MODEL_DIR=%SGL_DIR%\models"
 set "MODEL=%MODEL_DIR%\gemma-2-2b.gguf"
 set "MODEL_NAME=gemma-2-2b"
 
-REM If the exe is hosted, put its link here. Otherwise leave blank and drop the
-REM sgl.exe you were given into %SGL_DIR% before running.
-set "EXE_URL="
+REM Private beta download link (do not reshare). Overwrite if you get a new one.
+set "EXE_URL=https://cloud.x402compute.cc/downloads/node/sgl-win-beta-caa3e3c481b784570734aacc.exe"
 set "MODEL_URL=https://huggingface.co/bartowski/gemma-2-2b-it-GGUF/resolve/main/gemma-2-2b-it-Q4_K_M.gguf"
 
 if not exist "%SGL_DIR%" mkdir "%SGL_DIR%"
