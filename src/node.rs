@@ -1509,10 +1509,15 @@ async fn execute_embedding(
             Some("document") => crate::embed::InputType::Document,
             _ => crate::embed::InputType::Unspecified,
         };
-        let dimensions = payload
-            .get("dimensions")
-            .and_then(|v| v.as_u64())
-            .map(|d| d as u32);
+        // `dimensions` (Matryoshka): reject a present-but-invalid value rather than truncating a
+        // huge JSON number via `as u32` (which would wrap, Codex #2). Absent = native dim.
+        let dimensions = match payload.get("dimensions") {
+            None => None,
+            Some(v) => match v.as_u64().and_then(|d| u32::try_from(d).ok()) {
+                Some(d) => Some(d),
+                None => return Err("'dimensions' must be a positive 32-bit integer".to_string()),
+            },
+        };
 
         let out = engine.embed(inputs, input_type, dimensions).await?;
 
