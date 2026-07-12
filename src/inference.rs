@@ -614,11 +614,28 @@ pub enum InferenceEngine {
     Server(ServerEngine),
     #[cfg(feature = "inprocess")]
     InProcess(crate::inprocess::InProcessEngine),
+    /// Dedicated embedding engine (#231). A node is embeddings-OR-chat; when the configured model
+    /// is a known embedding model this variant is created instead of a chat engine. Requires the
+    /// `inprocess` feature (llama-cpp-2 with pooling).
+    #[cfg(feature = "inprocess")]
+    Embed(crate::embed::EmbedEngine),
 }
 
 impl InferenceEngine {
     /// Build + start the chosen engine.
     pub async fn create(config: InferenceEngineConfig, mode: EngineMode) -> Result<Self, String> {
+        // Embedding models get the dedicated pooling engine regardless of `--engine` (they can't
+        // run through the chat path). Only available on an `inprocess` build.
+        #[cfg(feature = "inprocess")]
+        if crate::embed::is_embedding_model(&config.model_name) {
+            let e = crate::embed::EmbedEngine::start(crate::embed::EmbedConfig {
+                model_path: config.model_path,
+                model_name: config.model_name,
+                n_gpu_layers: if config.gpu_layers == GPU_LAYERS_AUTO { 999 } else { config.gpu_layers },
+            })
+            .await?;
+            return Ok(InferenceEngine::Embed(e));
+        }
         match mode {
             EngineMode::Server => {
                 let e = ServerEngine::new(config);
@@ -659,6 +676,27 @@ impl InferenceEngine {
             InferenceEngine::Server(e) => e.is_healthy().await,
             #[cfg(feature = "inprocess")]
             InferenceEngine::InProcess(e) => e.is_healthy(),
+            #[cfg(feature = "inprocess")]
+            InferenceEngine::Embed(e) => e.is_healthy(),
+        }
+    }
+
+    /// True iff this engine serves embeddings (routes `/v1/embeddings` jobs) rather than chat.
+    pub fn is_embedding(&self) -> bool {
+        match self {
+            #[cfg(feature = "inprocess")]
+            InferenceEngine::Embed(_) => true,
+            _ => false,
+        }
+    }
+
+    /// Native embedding dimension when this is an embedding engine (else None) — advertised to the
+    /// orchestrator so it can meter + surface `dim` per model.
+    pub fn embedding_dim(&self) -> Option<u32> {
+        match self {
+            #[cfg(feature = "inprocess")]
+            InferenceEngine::Embed(e) => Some(e.dim()),
+            _ => None,
         }
     }
 
@@ -667,6 +705,22 @@ impl InferenceEngine {
             InferenceEngine::Server(e) => e.stop(),
             #[cfg(feature = "inprocess")]
             InferenceEngine::InProcess(_) => { /* worker stops when the engine is dropped */ }
+            #[cfg(feature = "inprocess")]
+            InferenceEngine::Embed(_) => { /* worker stops when the engine is dropped */ }
+        }
+    }
+
+    /// Embed a batch of inputs (only valid on an embedding engine).
+    #[cfg(feature = "inprocess")]
+    pub async fn embed(
+        &self,
+        inputs: Vec<String>,
+        input_type: crate::embed::InputType,
+        dimensions: Option<u32>,
+    ) -> Result<crate::embed::EmbedOut, String> {
+        match self {
+            InferenceEngine::Embed(e) => e.embed(inputs, input_type, dimensions).await,
+            _ => Err("this node is not an embedding node".to_string()),
         }
     }
 
@@ -683,6 +737,15 @@ impl InferenceEngine {
             InferenceEngine::InProcess(_) => {
                 tracing::error!(
                     "in-process engine unhealthy — aborting for a clean OS relaunch (in-place restart is not possible)"
+                );
+                std::process::abort();
+            }
+            // Same anti-zombie recovery as the in-process chat engine: a wedged native call can't
+            // be recovered from Rust, so abort for a clean OS relaunch.
+            #[cfg(feature = "inprocess")]
+            InferenceEngine::Embed(_) => {
+                tracing::error!(
+                    "embedding engine unhealthy — aborting for a clean OS relaunch (in-place restart is not possible)"
                 );
                 std::process::abort();
             }
@@ -719,6 +782,10 @@ impl InferenceEngine {
                     finish_reason: None,
                 })
             }
+            #[cfg(feature = "inprocess")]
+            InferenceEngine::Embed(_) => {
+                Err("this node serves embeddings, not chat completions".to_string())
+            }
         }
     }
 
@@ -736,6 +803,11 @@ impl InferenceEngine {
             #[cfg(feature = "inprocess")]
             InferenceEngine::InProcess(e) => {
                 e.chat_completion_stream(&messages, max_tokens, temperature as f32, tx).await
+            }
+            #[cfg(feature = "inprocess")]
+            InferenceEngine::Embed(_) => {
+                let _ = tx;
+                Err("this node serves embeddings, not chat completions".to_string())
             }
         }
     }

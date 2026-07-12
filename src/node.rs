@@ -711,6 +711,13 @@ pub async fn start(
     const MAX_WEDGE_RESTARTS: u32 = 3; // restart up to this many times, THEN abort the process
     let mut wedge_restarts: u32 = 0;
     let mut last_completions: u64 = 0;
+
+    // #231: advertise the node's modality once (static per engine). An embedding node reports
+    // kind="embedding" + its native dim so the orchestrator routes embeddings vs chat correctly
+    // and can surface embeddings separately in /v1/models. Chat nodes send neither (byte-identical).
+    let embed_dim: Option<u32> = engine.as_ref().and_then(|e| e.embedding_dim());
+    let node_kind: Option<&str> = if embed_dim.is_some() { Some("embedding") } else { None };
+
     loop {
         // ── #159 inference-progress watchdog ──────────────────────────────
         // The /health restart below only fires when llama-server stops answering /health.
@@ -816,6 +823,8 @@ pub async fn start(
                 active_job_ids,
                 binary_hash.clone(),
                 effective_slots,
+                node_kind,
+                embed_dim,
             )
             .await
         {
@@ -1096,6 +1105,7 @@ async fn process_job(
 
     let result = match effective_job.job_type.as_str() {
         "inference" => execute_inference(engine, &effective_job).await,
+        "embedding" => execute_embedding(engine, &effective_job).await,
         _ => {
             tracing::warn!("Unsupported job type: {}", effective_job.job_type);
             Err(format!("Unsupported job type: {}", effective_job.job_type))
@@ -1449,6 +1459,82 @@ async fn execute_inference(
         out["finish_reason"] = serde_json::Value::String(fr);
     }
     Ok(out)
+}
+
+/// Execute an embedding job (#231). Parses the (decrypted) payload's `input` (string | string[]),
+/// optional `input_type` (query/document) + `dimensions` (Matryoshka), runs the dedicated
+/// embedding engine, and returns an OpenAI-compatible embeddings response. The orchestrator
+/// structurally validates every vector (dim/finite/non-zero) before it bills, so a wrong shape
+/// here fails the job (input-only billing → nothing charged), never a silently-wrong embedding.
+#[allow(unused_variables)]
+async fn execute_embedding(
+    engine: &Option<Arc<InferenceEngine>>,
+    job: &PendingJob,
+) -> Result<serde_json::Value, String> {
+    #[cfg(not(feature = "inprocess"))]
+    {
+        Err("this node build cannot serve embeddings (requires the `inprocess` feature)".to_string())
+    }
+    #[cfg(feature = "inprocess")]
+    {
+        let engine = engine
+            .as_ref()
+            .ok_or("No embedding engine configured — start with an embedding --model-path")?;
+        if !engine.is_embedding() {
+            return Err("this node is not an embedding node".to_string());
+        }
+        let payload = job.input_payload.as_ref().ok_or("Job has no input payload")?;
+
+        // `input`: string | string[] (OpenAI shape). Reject anything else.
+        let inputs: Vec<String> = match payload.get("input") {
+            Some(serde_json::Value::String(s)) => vec![s.clone()],
+            Some(serde_json::Value::Array(a)) => {
+                let mut v = Vec::with_capacity(a.len());
+                for item in a {
+                    let s = item
+                        .as_str()
+                        .ok_or("'input' array must contain only strings")?;
+                    v.push(s.to_string());
+                }
+                v
+            }
+            _ => return Err("'input' must be a string or an array of strings".to_string()),
+        };
+        if inputs.is_empty() {
+            return Err("'input' must not be empty".to_string());
+        }
+
+        let input_type = match payload.get("input_type").and_then(|v| v.as_str()) {
+            Some("query") => crate::embed::InputType::Query,
+            Some("document") => crate::embed::InputType::Document,
+            _ => crate::embed::InputType::Unspecified,
+        };
+        let dimensions = payload
+            .get("dimensions")
+            .and_then(|v| v.as_u64())
+            .map(|d| d as u32);
+
+        let out = engine.embed(inputs, input_type, dimensions).await?;
+
+        let data: Vec<serde_json::Value> = out
+            .vectors
+            .iter()
+            .enumerate()
+            .map(|(i, v)| serde_json::json!({ "object": "embedding", "index": i, "embedding": v }))
+            .collect();
+
+        Ok(serde_json::json!({
+            "object": "list",
+            "data": data,
+            "model": job.model.clone().unwrap_or_default(),
+            // Input-only billing: total_tokens == prompt_tokens (no output). The orchestrator
+            // caps the billed count at its pre-quoted upper bound regardless.
+            "usage": {
+                "prompt_tokens": out.prompt_tokens,
+                "total_tokens": out.prompt_tokens,
+            }
+        }))
+    }
 }
 
 #[cfg(test)]

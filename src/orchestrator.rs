@@ -139,6 +139,13 @@ struct NodeCapabilities {
     // Context window this node serves with (llama-server -c). The grid uses it to
     // size the pre-dispatch prompt check per node instead of assuming a default.
     context_size: u32,
+    // Modality this node serves: "chat" (default, omitted) or "embedding" (#231). Lets the
+    // orchestrator split embedding vs chat routing + surface embeddings separately in /v1/models.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    kind: Option<String>,
+    // Native embedding dimension when kind == "embedding" (else omitted).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dim: Option<u32>,
 }
 
 #[derive(Deserialize)]
@@ -379,6 +386,9 @@ impl OrchestratorClient {
         active_job_ids: Vec<String>,
         binary_hash: Option<String>,
         max_concurrent_jobs: u32,
+        // #231: "embedding" for an embedding node (else None → chat), + its native output dim.
+        kind: Option<&str>,
+        dim: Option<u32>,
     ) -> Result<HeartbeatResponse, String> {
         let url = format!("{}/grid/nodes/heartbeat", self.base_url);
         let token = self.get_token()?;
@@ -389,7 +399,12 @@ impl OrchestratorClient {
             encryption_public_key: encryption_public_key.map(|s| s.to_string()),
             encryption_public_key_signature: encryption_public_key_signature.map(|s| s.to_string()),
             key_version,
-            capabilities: NodeCapabilities { streaming, context_size },
+            capabilities: NodeCapabilities {
+                streaming,
+                context_size,
+                kind: kind.map(|s| s.to_string()),
+                dim,
+            },
             active_job_ids,
             binary_hash,
             max_concurrent_jobs,

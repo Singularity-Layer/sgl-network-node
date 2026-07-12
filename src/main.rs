@@ -1,5 +1,7 @@
 mod config;
 mod crypto;
+#[cfg(feature = "inprocess")]
+mod embed;
 mod encryption;
 mod inference;
 #[cfg(feature = "inprocess")]
