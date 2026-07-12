@@ -545,20 +545,25 @@ fn run_embed_job(
         }
         prompt_tokens = prompt_tokens.saturating_add(tokens.len() as u32);
 
-        // Fresh sequence: clear any KV from the previous input, then decode this whole sequence in
-        // one batch (output flag set on every token so pooled embeddings are computed).
+        // Fresh sequence: clear any KV from the previous input, then run this whole sequence in
+        // one batch. EVERY token is marked as an output so pooling covers the full sequence
+        // (llama.cpp otherwise warns "some input tokens were not marked as outputs -> overriding").
         let _ = ctx.clear_kv_cache_seq(Some(0), None, None);
         batch.clear();
-        let last = tokens.len() - 1;
         for (i, tok) in tokens.iter().enumerate() {
-            if let Err(e) = batch.add(*tok, i as i32, &[0], i == last) {
+            if let Err(e) = batch.add(*tok, i as i32, &[0], true) {
                 let _ = reply.send(Err(format!("batch add failed: {e}")));
                 return;
             }
         }
-        if let Err(e) = ctx.decode(batch) {
-            let _ = reply.send(Err(format!("decode failed: {e}")));
-            return;
+        // Encoder (non-causal, BERT-style) embedding models are run with encode(); decode() would
+        // auto-redirect but logs a warning. Fall back to decode() for any (causal) embedding model
+        // where encode() isn't the right call, so the engine works for both families.
+        if let Err(enc_err) = ctx.encode(batch) {
+            if let Err(dec_err) = ctx.decode(batch) {
+                let _ = reply.send(Err(format!("embed compute failed (encode: {enc_err}; decode: {dec_err})")));
+                return;
+            }
         }
         progress.store(now_ms(), Ordering::Relaxed);
 

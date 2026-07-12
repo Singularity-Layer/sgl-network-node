@@ -60,3 +60,7 @@ required-features = ["inprocess"]
 [[example]]
 name = "inproc_shutdown_test"
 required-features = ["inprocess"]
+
+[[example]]
+name = "embed_poc"
+required-features = ["inprocess"]
