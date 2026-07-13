@@ -6,8 +6,9 @@
 //! Like the chat engine, a single dedicated OS worker thread owns the `!Send` model + context
 //! for its whole life; a fatal native fault takes the process down so the OS service relaunches
 //! it clean (the anti-zombie property). Embeddings are stateless one-shots (no streaming, no KV
-//! reuse across requests), so the worker is much simpler than the batching chat scheduler: it
-//! pulls a job (a batch of input strings), embeds each input, and replies.
+//! reuse across requests), so the worker is simpler than the chat scheduler: it pulls a job (a
+//! batch of input strings), INPUT-BATCHES them (packs many sequences into one encode pass, capped
+//! to the model's context so KV memory is unchanged), and replies with one vector per input.
 //!
 //! The node-side model manifest (pooling / normalize / dim / prefix) MUST match the orchestrator
 //! catalog (`SGLNetwork_Orchestrator/src/lib/embeddings.ts`) — the orchestrator structurally
@@ -241,6 +242,12 @@ const WEDGE_MS: u64 = 60_000;
 /// Hard cap on inputs per job (defense-in-depth; the orchestrator already caps the batch).
 const MAX_INPUTS_PER_JOB: usize = 4096;
 
+/// Max sequences packed into a single `encode()` pass (input batching). The real limiter is the
+/// per-group token budget (== `n_ctx`), so this is just an upper bound on the pooled-output buffer
+/// (n_seq_max × n_embd floats — a few MB at most). It never raises KV-cache memory, so batching
+/// here is safe on tight 16GB Macs — a group is still capped to the model's existing context.
+const MAX_SEQS_PER_BATCH: usize = 256;
+
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -434,12 +441,15 @@ fn worker_main(
 
     // Non-causal embedding models (BERT-style: bge/e5/minilm) require the WHOLE sequence in one
     // ubatch, so size n_batch == n_ubatch == n_ctx to the model's max input. Pooling produces one
-    // vector per sequence, read via embeddings_seq_ith.
+    // vector per sequence, read via embeddings_seq_ith. `n_seq_max` lets us pack MULTIPLE input
+    // sequences into ONE encode() pass (input batching) — the group is still capped to n_ctx tokens
+    // so KV-cache memory is unchanged; only the tiny pooled-output buffer scales with n_seq_max.
     let n_ctx = spec.max_input_tokens.max(512);
     let ctx_params = LlamaContextParams::default()
         .with_n_ctx(NonZeroU32::new(n_ctx))
         .with_n_batch(n_ctx)
         .with_n_ubatch(n_ctx)
+        .with_n_seq_max(MAX_SEQS_PER_BATCH as u32)
         .with_embeddings(true)
         .with_pooling_type(spec.pooling.to_llama());
     let mut ctx = match model.new_context(&backend, ctx_params) {
@@ -482,8 +492,12 @@ fn worker_main(
     busy.store(false, Ordering::Relaxed);
 }
 
-/// Embed one job (a batch of inputs), replying on its oneshot. Each input is embedded in its own
-/// decode (one sequence, seq_id 0) — simple + correct; throughput batching is a later refinement.
+/// Embed one job (a batch of inputs), replying on its oneshot. Inputs are INPUT-BATCHED: multiple
+/// sequences are packed into one `encode()` pass (distinct seq_id per input), greedily grouped so
+/// each group's total tokens stay within `n_ctx`. This turns an N-input request from N model passes
+/// into ~N/(seqs-per-group) passes — the batching win — at no extra KV memory (a group never
+/// exceeds the model's existing context). Pooled vectors are read per-seq via embeddings_seq_ith
+/// and returned in the original input order.
 fn run_embed_job(
     model: &LlamaModel,
     ctx: &mut llama_cpp_2::context::LlamaContext,
@@ -515,11 +529,12 @@ fn run_embed_job(
         InputType::Document | InputType::Unspecified => spec.prefix_document,
     };
 
-    let mut vectors: Vec<Vec<f32>> = Vec::with_capacity(inputs.len());
+    // Tokenize + validate EVERY input up front (with the family prefix + special tokens). Doing this
+    // before any compute lets us reject a bad/oversized input without half-embedding the batch, and
+    // gives us the per-input token counts needed to pack groups.
+    let mut tokenized: Vec<Vec<llama_cpp_2::token::LlamaToken>> = Vec::with_capacity(inputs.len());
     let mut prompt_tokens: u32 = 0;
-
     for input in &inputs {
-        // Apply the family prefix, then tokenize with special tokens (CLS/BOS/EOS per the model).
         let text = if prefix.is_empty() {
             input.clone()
         } else {
@@ -544,47 +559,77 @@ fn run_embed_job(
             return;
         }
         prompt_tokens = prompt_tokens.saturating_add(tokens.len() as u32);
+        tokenized.push(tokens);
+    }
 
-        // Fresh sequence: clear any KV from the previous input, then run this whole sequence in
-        // one batch. EVERY token is marked as an output so pooling covers the full sequence
-        // (llama.cpp otherwise warns "some input tokens were not marked as outputs -> overriding").
-        let _ = ctx.clear_kv_cache_seq(Some(0), None, None);
+    let mut vectors: Vec<Vec<f32>> = Vec::with_capacity(tokenized.len());
+
+    // Walk the inputs, packing each greedy group up to (n_ctx tokens, MAX_SEQS_PER_BATCH seqs), then
+    // encode the whole group in one pass. A single input longer than the remaining budget always
+    // starts its own group (the `end > start` guard), so a big input degrades to one-per-pass rather
+    // than being wrongly rejected.
+    let mut start = 0usize;
+    while start < tokenized.len() {
+        let mut end = start;
+        let mut group_tokens = 0usize;
+        while end < tokenized.len() {
+            let t = tokenized[end].len();
+            if end - start >= MAX_SEQS_PER_BATCH {
+                break;
+            }
+            if group_tokens + t > n_ctx as usize && end > start {
+                break;
+            }
+            group_tokens += t;
+            end += 1;
+        }
+
+        // Fresh group: clear ALL sequence KV, then add each input as its own seq_id (0..group_len).
+        // EVERY token is marked as an output so pooling covers the full sequence (llama.cpp otherwise
+        // warns "some input tokens were not marked as outputs -> overriding").
+        let _ = ctx.clear_kv_cache_seq(None, None, None);
         batch.clear();
-        for (i, tok) in tokens.iter().enumerate() {
-            if let Err(e) = batch.add(*tok, i as i32, &[0], true) {
-                let _ = reply.send(Err(format!("batch add failed: {e}")));
-                return;
+        for (local, seq) in tokenized[start..end].iter().enumerate() {
+            for (pos, tok) in seq.iter().enumerate() {
+                if let Err(e) = batch.add(*tok, pos as i32, &[local as i32], true) {
+                    let _ = reply.send(Err(format!("batch add failed: {e}")));
+                    return;
+                }
             }
         }
         // Encoder (non-causal, BERT-style) embedding models are run with encode(); decode() would
         // auto-redirect but logs a warning. Fall back to decode() for any (causal) embedding model
         // where encode() isn't the right call, so the engine works for both families.
-        if let Err(enc_err) = ctx.encode(batch) {
-            if let Err(dec_err) = ctx.decode(batch) {
+        if let Err(enc_err) = ctx.encode(&mut *batch) {
+            if let Err(dec_err) = ctx.decode(&mut *batch) {
                 let _ = reply.send(Err(format!("embed compute failed (encode: {enc_err}; decode: {dec_err})")));
                 return;
             }
         }
         progress.store(now_ms(), Ordering::Relaxed);
 
-        // Read the pooled sequence embedding (seq_id 0).
-        let raw = match ctx.embeddings_seq_ith(0) {
-            Ok(v) => v,
-            Err(e) => {
-                let _ = reply.send(Err(format!("read embedding failed: {e:?}")));
-                return;
-            }
-        };
-        let mut vec: Vec<f32> = raw.to_vec();
+        // Read each sequence's pooled embedding (seq_id == local index within the group), in order.
+        for local in 0..(end - start) {
+            let raw = match ctx.embeddings_seq_ith(local as i32) {
+                Ok(v) => v,
+                Err(e) => {
+                    let _ = reply.send(Err(format!("read embedding failed: {e:?}")));
+                    return;
+                }
+            };
+            let mut vec: Vec<f32> = raw.to_vec();
 
-        // Matryoshka: truncate to the requested dim, then renormalize the shortened vector.
-        if (eff_dim as usize) < vec.len() {
-            vec.truncate(eff_dim as usize);
+            // Matryoshka: truncate to the requested dim, then renormalize the shortened vector.
+            if (eff_dim as usize) < vec.len() {
+                vec.truncate(eff_dim as usize);
+            }
+            if spec.normalize {
+                l2_normalize(&mut vec);
+            }
+            vectors.push(vec);
         }
-        if spec.normalize {
-            l2_normalize(&mut vec);
-        }
-        vectors.push(vec);
+
+        start = end;
     }
 
     let _ = reply.send(Ok(EmbedOut { vectors, prompt_tokens }));
