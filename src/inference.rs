@@ -278,6 +278,18 @@ impl ServerEngine {
             }
             rows.push((idx, vec));
         }
+        // `index` must be an exact permutation of 0..n — a duplicate/out-of-range index
+        // would silently misalign vectors with inputs (Codex MED).
+        let mut seen = vec![false; n];
+        for (idx, _) in &rows {
+            if *idx >= n || seen[*idx] {
+                return Err(
+                    "llama-server embedding response has duplicate or out-of-range indexes"
+                        .to_string(),
+                );
+            }
+            seen[*idx] = true;
+        }
         rows.sort_by_key(|(i, _)| *i);
         let mut vectors = Vec::with_capacity(n);
         for (_, mut vec) in rows {

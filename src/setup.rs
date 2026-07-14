@@ -87,7 +87,17 @@ fn sha256_hex(bytes: &[u8]) -> String {
 /// Windows antivirus scans freshly-extracted executables and can hold them for
 /// seconds, failing the rename with "Access is denied (os error 5)".
 fn promote_staging(staging: &Path, bin_dir: &Path) -> Result<(), String> {
-    let _ = std::fs::remove_dir_all(bin_dir);
+    // Never delete a live install before its replacement is in place (Codex HIGH):
+    // park it at bin.prev, promote staging, then drop the parked copy. If promotion
+    // fails the parked install is restored, so a blocked rename can't strand the
+    // node with no engine at all.
+    let prev = bin_dir.with_extension("prev");
+    let _ = std::fs::remove_dir_all(&prev);
+    let had_prev = bin_dir.exists();
+    if had_prev {
+        std::fs::rename(bin_dir, &prev)
+            .map_err(|e| format!("couldn't move the existing install aside: {e}"))?;
+    }
     let mut last_err = String::new();
     for attempt in 0..6u32 {
         if attempt > 0 {
@@ -96,9 +106,16 @@ fn promote_staging(staging: &Path, bin_dir: &Path) -> Result<(), String> {
             let _ = std::fs::remove_dir_all(bin_dir);
         }
         match std::fs::rename(staging, bin_dir) {
-            Ok(_) => return Ok(()),
+            Ok(_) => {
+                let _ = std::fs::remove_dir_all(&prev);
+                return Ok(());
+            }
             Err(e) => last_err = e.to_string(),
         }
+    }
+    // Promotion failed — put the previous install back so the node keeps serving.
+    if had_prev {
+        let _ = std::fs::rename(&prev, bin_dir);
     }
     Err(last_err)
 }
@@ -125,11 +142,15 @@ pub async fn run(cpu_only: bool) -> Result<(), String> {
         if let Some(parent) = bin_dir.parent() {
             let staging = parent.join("bin.staging");
             let staged_server = staging.join(server_exe());
+            // `output().is_ok()` only proves the process SPAWNED — an exe with a missing
+            // DLL spawns and dies nonzero (0xC0000135), so require a successful exit
+            // (Codex HIGH: never adopt a broken staging dir).
             if staged_server.exists()
                 && std::process::Command::new(&staged_server)
                     .arg("--version")
                     .output()
-                    .is_ok()
+                    .map(|o| o.status.success())
+                    .unwrap_or(false)
             {
                 println!("Found a verified install from a previous run — finishing it…");
                 match promote_staging(&staging, &bin_dir) {
@@ -259,13 +280,23 @@ pub async fn run(cpu_only: bool) -> Result<(), String> {
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(&staged_server, std::fs::Permissions::from_mode(0o755));
     }
-    // Smoke-check the STAGED binary before it replaces anything.
+    // Smoke-check the STAGED binary before it replaces anything. A nonzero exit is a
+    // failure too (missing-DLL exes spawn then die 0xC0000135 — `is_ok()` would pass).
     match std::process::Command::new(&staged_server).arg("--version").output() {
-        Ok(_) => {}
+        Ok(o) if o.status.success() => {}
+        Ok(o) => {
+            let stderr = String::from_utf8_lossy(&o.stderr).trim().to_string();
+            return Err(fail(&staging, format!(
+                "Downloaded llama-server exited with {} during the launch check{}\n\
+                 (Missing runtime libs? On Windows a GPU driver may be needed.) Nothing installed.",
+                o.status,
+                if stderr.is_empty() { String::new() } else { format!(": {stderr}") },
+            )));
+        }
         Err(e) => {
             return Err(fail(&staging, format!(
                 "Downloaded llama-server failed to launch: {e}\n\
-                 (Missing runtime libs? On Windows a GPU driver / VC++ runtime may be needed.) Nothing installed.",
+                 (Missing runtime libs? On Windows a GPU driver may be needed.) Nothing installed.",
             )));
         }
     }
