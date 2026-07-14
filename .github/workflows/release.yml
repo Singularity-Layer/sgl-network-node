@@ -122,6 +122,11 @@ jobs:
             ${{ runner.os }}-cargo-
 
       - name: Build (release, MSVC)
+        # Static CRT: link the MSVC C runtime into the binary so sgl.exe has zero DLL
+        # dependencies. Without this, clean Windows installs (no VC++ Redistributable)
+        # die at launch with "VCRUNTIME140.dll was not found".
+        env:
+          RUSTFLAGS: -C target-feature=+crt-static
         run: cargo build --release --target x86_64-pc-windows-msvc
 
       - name: Package + checksum
