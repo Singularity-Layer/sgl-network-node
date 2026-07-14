@@ -1131,7 +1131,16 @@ async fn process_job(
                 };
                 match sealed {
                     Ok((sealed, ephemeral_pub)) => {
-                        let ciphertext_b58 = bs58::encode(&sealed).into_string();
+                        // base64 (linear-time), NOT base58 (O(n^2) big-int math): an embedding
+                        // batch result is ~100KB of ciphertext, which base58 took ~13s to encode
+                        // and the orchestrator another ~13s to decode — dwarfing the ~100ms
+                        // compute and 503-ing large batches. `encoding` tells decoders which
+                        // alphabet this envelope uses; old envelopes (no field) remain base58.
+                        // The envelope signature covers the encoded string verbatim, so the
+                        // orchestrator's verify (hash of the received string) is unchanged.
+                        use base64::Engine as _;
+                        let ciphertext_b64 =
+                            base64::engine::general_purpose::STANDARD.encode(&sealed);
                         // Sign an envelope over the *public* ciphertext + job id so the
                         // orchestrator can prove which node produced this result for this
                         // job (anti-replay) without ever seeing the plaintext.
@@ -1139,10 +1148,11 @@ async fn process_job(
                             node_secret,
                             &job.id,
                             "sealed",
-                            ciphertext_b58.as_bytes(),
+                            ciphertext_b64.as_bytes(),
                         );
                         let sealed_result = serde_json::json!({
-                            "ciphertext": ciphertext_b58,
+                            "ciphertext": ciphertext_b64,
+                            "encoding": "base64",
                             "ephemeral_public_key": bs58::encode(ephemeral_pub).into_string(),
                             "algorithm": algo,
                         });

@@ -109,9 +109,27 @@ pub fn unseal_input(
         .and_then(|v| v.as_str())
         .ok_or("enc.client_response_pubkey missing")?;
 
-    let ciphertext = bs58::decode(ciphertext_b58)
-        .into_vec()
-        .map_err(|e| format!("bad ciphertext base58: {e}"))?;
+    // Encoding negotiation (mirrors the fail-closed algorithm negotiation below):
+    // `encoding: "base64"` = linear-time base64 for large payloads; ABSENT = legacy
+    // base58; anything else is rejected rather than guessed. Pubkeys stay base58
+    // always (32 bytes — base58 is fine there and they feed the AAD strings verbatim).
+    // Match on the raw value so a PRESENT-but-non-string `encoding` (null, 123, {})
+    // is rejected too — only a truly ABSENT field means legacy base58 (Codex caveat:
+    // `.and_then(as_str)` would have silently treated `encoding: null` as absent).
+    let ciphertext = match enc.get("encoding") {
+        Some(v) => match v.as_str() {
+            Some("base64") => {
+                use base64::Engine as _;
+                base64::engine::general_purpose::STANDARD
+                    .decode(ciphertext_b58)
+                    .map_err(|e| format!("bad ciphertext base64: {e}"))?
+            }
+            _ => return Err(format!("unsupported enc.encoding: {v}")),
+        },
+        None => bs58::decode(ciphertext_b58)
+            .into_vec()
+            .map_err(|e| format!("bad ciphertext base58: {e}"))?,
+    };
     let ephemeral = bs58_to_32(ephemeral_b58)?;
     let response_pub = bs58_to_32(response_b58)?;
 

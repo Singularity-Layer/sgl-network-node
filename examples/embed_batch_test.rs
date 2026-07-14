@@ -52,6 +52,19 @@ async fn main() {
     .map(String::from)
     .collect();
 
+    // ── 0) COLD batch first (no warmup) — replicates the live "first multi-seq batch" case.
+    //    If this is slow but a repeat is fast, Metal is compiling pipelines per batch shape. ──
+    {
+        let t = Instant::now();
+        let cold = engine.embed(inputs.clone(), InputType::Document, None).await.expect("cold batch");
+        let cold_ms = t.elapsed().as_millis();
+        assert_eq!(cold.vectors.len(), inputs.len());
+        let t2 = Instant::now();
+        let _warm = engine.embed(inputs.clone(), InputType::Document, None).await.expect("warm batch");
+        let warm_ms = t2.elapsed().as_millis();
+        println!("COLD batch({}) = {}ms | WARM batch({}) = {}ms  (compile-per-shape if cold>>warm)", inputs.len(), cold_ms, inputs.len(), warm_ms);
+    }
+
     // ── 1) Reference: embed each input ALONE (one input per job → no packing). ──
     let t_serial = Instant::now();
     let mut singles: Vec<Vec<f32>> = Vec::new();

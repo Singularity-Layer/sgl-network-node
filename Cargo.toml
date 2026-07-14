@@ -1,6 +1,6 @@
 [package]
 name = "sgl-node"
-version = "1.8.1"
+version = "1.8.2"
 edition = "2021"
 description = "SGL Network node agent — confidential AI compute provider for the Singularity grid"
 
@@ -17,6 +17,10 @@ clap = { version = "4", features = ["derive"] }
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 rand = "0.8"
 bs58 = "0.5"
+# Linear-time encoding for LARGE sealed blobs (embedding results / long outputs).
+# base58 is O(n^2) big-int math — fine for 32-byte keys, catastrophic for ~100KB
+# ciphertexts (~13s at 96KB). Sealed envelopes carry `encoding: "base64"`; absent = base58.
+base64 = "0.22"
 dirs = "5"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
