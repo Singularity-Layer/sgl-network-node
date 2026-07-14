@@ -1493,16 +1493,10 @@ async fn execute_inference(
 /// embedding engine, and returns an OpenAI-compatible embeddings response. The orchestrator
 /// structurally validates every vector (dim/finite/non-zero) before it bills, so a wrong shape
 /// here fails the job (input-only billing → nothing charged), never a silently-wrong embedding.
-#[allow(unused_variables)]
 async fn execute_embedding(
     engine: &Option<Arc<InferenceEngine>>,
     job: &PendingJob,
 ) -> Result<serde_json::Value, String> {
-    #[cfg(not(feature = "inprocess"))]
-    {
-        Err("this node build cannot serve embeddings (requires the `inprocess` feature)".to_string())
-    }
-    #[cfg(feature = "inprocess")]
     {
         let engine = engine
             .as_ref()
@@ -1532,9 +1526,9 @@ async fn execute_embedding(
         }
 
         let input_type = match payload.get("input_type").and_then(|v| v.as_str()) {
-            Some("query") => crate::embed::InputType::Query,
-            Some("document") => crate::embed::InputType::Document,
-            _ => crate::embed::InputType::Unspecified,
+            Some("query") => crate::embed_catalog::InputType::Query,
+            Some("document") => crate::embed_catalog::InputType::Document,
+            _ => crate::embed_catalog::InputType::Unspecified,
         };
         // `dimensions` (Matryoshka): reject a present-but-invalid value rather than truncating a
         // huge JSON number via `as u32` (which would wrap, Codex #2). Absent = native dim.

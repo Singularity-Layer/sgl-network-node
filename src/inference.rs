@@ -46,6 +46,12 @@ pub struct ServerEngine {
     client: Client,
     base_url: String,
     config: InferenceEngineConfig,
+    /// Set when the configured model is a known embedding model: llama-server is then
+    /// launched in `--embedding` mode with the catalog's pooling, and embedding jobs are
+    /// forwarded to its native /v1/embeddings endpoint. This is what lets NON-`inprocess`
+    /// builds (Windows) serve embedding models — the in-process engine handles them on
+    /// macOS/Linux builds and takes priority in InferenceEngine::create.
+    embed_spec: Option<&'static crate::embed_catalog::EmbedModelSpec>,
 }
 
 #[derive(Serialize)]
@@ -160,12 +166,136 @@ impl ServerEngine {
         let port = find_available_port(config.port);
         config.port = port;
         let base_url = format!("http://127.0.0.1:{}", port);
+        let embed_spec = crate::embed_catalog::embed_model_spec(&config.model_name);
         Self {
             server_process: std::sync::Mutex::new(None),
             client: Client::new(),
             base_url,
             config,
+            embed_spec,
         }
+    }
+
+    /// True iff this server engine runs llama-server in embedding mode.
+    pub fn is_embedding(&self) -> bool {
+        self.embed_spec.is_some()
+    }
+
+    /// Native embedding dimension (catalog value) when in embedding mode.
+    pub fn embedding_dim(&self) -> Option<u32> {
+        self.embed_spec.map(|s| s.dim)
+    }
+
+    /// Forward an embedding batch to llama-server's native /v1/embeddings (embedding mode
+    /// only). Mirrors the in-process engine's contract: catalog prefixes by input_type,
+    /// Matryoshka truncate + renormalize, L2-normalize per the spec, input-only usage.
+    /// The orchestrator structurally validates every vector (dim/finite/non-zero) before
+    /// billing, so any mismatch here fails the job — never a silently-wrong embedding.
+    pub async fn embed(
+        &self,
+        inputs: Vec<String>,
+        input_type: crate::embed_catalog::InputType,
+        dimensions: Option<u32>,
+    ) -> Result<crate::embed_catalog::EmbedOut, String> {
+        use crate::embed_catalog::{l2_normalize, InputType};
+        let spec = self.embed_spec.ok_or("this node is not an embedding node")?;
+        // Resolve the effective output dim (Matryoshka truncation). Reject an unsupported
+        // request rather than guessing (mirrors the in-process engine + orchestrator).
+        let eff_dim = match dimensions {
+            None => spec.dim,
+            Some(d) if d == spec.dim || spec.allowed_dimensions.contains(&d) => d,
+            Some(d) => {
+                return Err(format!(
+                    "unsupported dimensions {d} for {} (native {}, allowed {:?})",
+                    spec.id, spec.dim, spec.allowed_dimensions
+                ))
+            }
+        };
+        let prefix = match input_type {
+            InputType::Query => spec.prefix_query,
+            InputType::Document | InputType::Unspecified => spec.prefix_document,
+        };
+        let n = inputs.len();
+        let texts: Vec<String> = inputs
+            .into_iter()
+            .map(|i| if prefix.is_empty() { i } else { format!("{prefix}{i}") })
+            .collect();
+
+        let url = format!("{}/v1/embeddings", self.base_url);
+        let resp = self
+            .client
+            .post(&url)
+            .timeout(Duration::from_secs(120))
+            .json(&serde_json::json!({ "input": texts, "model": spec.id }))
+            .send()
+            .await
+            .map_err(|e| format!("embedding request to llama-server failed: {e}"))?;
+        let status = resp.status();
+        let body: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| format!("invalid embedding response from llama-server: {e}"))?;
+        if !status.is_success() {
+            let msg = body
+                .pointer("/error/message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("unknown error");
+            return Err(format!("llama-server embedding error ({status}): {msg}"));
+        }
+
+        let data = body
+            .get("data")
+            .and_then(|d| d.as_array())
+            .ok_or("llama-server embedding response missing 'data'")?;
+        if data.len() != n {
+            return Err(format!(
+                "llama-server returned {} embeddings for {n} inputs",
+                data.len()
+            ));
+        }
+        // Re-order by `index` (OpenAI contract) so vectors line up with inputs.
+        let mut rows: Vec<(usize, Vec<f32>)> = Vec::with_capacity(n);
+        for item in data {
+            let idx = item
+                .get("index")
+                .and_then(|i| i.as_u64())
+                .unwrap_or(rows.len() as u64) as usize;
+            let emb = item
+                .get("embedding")
+                .and_then(|e| e.as_array())
+                .ok_or("llama-server embedding item missing 'embedding'")?;
+            let mut vec: Vec<f32> = Vec::with_capacity(emb.len());
+            for v in emb {
+                vec.push(v.as_f64().ok_or("non-numeric embedding value")? as f32);
+            }
+            if vec.len() != spec.dim as usize {
+                return Err(format!(
+                    "llama-server produced dim {} but {} expects {}",
+                    vec.len(),
+                    spec.id,
+                    spec.dim
+                ));
+            }
+            rows.push((idx, vec));
+        }
+        rows.sort_by_key(|(i, _)| *i);
+        let mut vectors = Vec::with_capacity(n);
+        for (_, mut vec) in rows {
+            if eff_dim < spec.dim {
+                // Matryoshka: truncate to the requested dim, then renormalize the shortened vector.
+                vec.truncate(eff_dim as usize);
+                l2_normalize(&mut vec);
+            } else if spec.normalize {
+                // llama-server normalizes by default; keep the guarantee explicit (idempotent).
+                l2_normalize(&mut vec);
+            }
+            vectors.push(vec);
+        }
+        let prompt_tokens = body
+            .pointer("/usage/prompt_tokens")
+            .and_then(|t| t.as_u64())
+            .unwrap_or(0) as u32;
+        Ok(crate::embed_catalog::EmbedOut { vectors, prompt_tokens })
     }
 
     pub async fn start(&self) -> Result<(), String> {
@@ -185,7 +315,9 @@ impl ServerEngine {
         // with the official Qwen2.5 tool-enabled template (teaches `<tool_call>`, which the
         // server parses natively into structured tool_calls). Excludes R1/QwQ distills — those
         // need their own reasoning templates. Written to a temp file each start.
-        let template_file: Option<String> = if qwen_template_override(&self.config.model_path) {
+        let template_file: Option<String> = if self.embed_spec.is_none()
+            && qwen_template_override(&self.config.model_path)
+        {
             match write_qwen_tools_template() {
                 Ok(p) => {
                     tracing::info!("using Qwen2.5 tool-enabled chat template override");
@@ -214,6 +346,28 @@ impl ServerEngine {
         let parallel_str = self.config.parallel_slots.to_string();
 
         let model_str = self.config.model_path.to_string_lossy();
+        // Embedding mode (non-`inprocess` builds, e.g. Windows): llama-server pools the
+        // hidden states itself. c/b/ub are all sized to the model's max input — pooled
+        // (non-causal) models require the WHOLE sequence to fit in one ubatch, and BERT
+        // context is small anyway. No chat flags (--jinja/--parallel/templates).
+        let embed_ctx_str = self
+            .embed_spec
+            .map(|s| s.max_input_tokens.to_string())
+            .unwrap_or_default();
+        if let Some(spec) = self.embed_spec {
+            let args: Vec<&str> = vec![
+                "-m", &model_str,
+                "--host", "127.0.0.1",
+                "--port", &port_str,
+                "-t", &threads_str,
+                "-c", &embed_ctx_str,
+                "-b", &embed_ctx_str,
+                "-ub", &embed_ctx_str,
+                "--embedding",
+                "--pooling", spec.pooling.as_server_flag(),
+            ];
+            return self.spawn_server(&llama_server, &args).await;
+        }
         let mut args: Vec<&str> = vec![
             "-m", &model_str,
             "--host", "127.0.0.1",
@@ -250,8 +404,23 @@ impl ServerEngine {
             args.push("--chat-template-file");
             args.push(p);
         }
-        let mut child = Command::new(&llama_server)
-            .args(&args)
+        self.spawn_server(&llama_server, &args).await
+    }
+
+    /// Spawn llama-server with the given args, stream its stderr into tracing, store the
+    /// child handle, and wait (up to 30s) for /health. Shared by the chat and embedding
+    /// launch paths.
+    async fn spawn_server(&self, llama_server: &str, args: &[&str]) -> Result<(), String> {
+        let mut cmd = Command::new(llama_server);
+        cmd.args(args);
+        // Windows: the node may itself run windowless (app-spawned / Scheduled Task);
+        // without this flag each llama-server child pops a console window at the operator.
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+        }
+        let mut child = cmd
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::piped())
             .spawn()
@@ -684,9 +853,12 @@ impl InferenceEngine {
     /// True iff this engine serves embeddings (routes `/v1/embeddings` jobs) rather than chat.
     pub fn is_embedding(&self) -> bool {
         match self {
+            // Server engine in --embedding mode (the non-`inprocess`/Windows path).
+            InferenceEngine::Server(e) => e.is_embedding(),
             #[cfg(feature = "inprocess")]
             InferenceEngine::Embed(_) => true,
-            _ => false,
+            #[cfg(feature = "inprocess")]
+            InferenceEngine::InProcess(_) => false,
         }
     }
 
@@ -694,9 +866,11 @@ impl InferenceEngine {
     /// orchestrator so it can meter + surface `dim` per model.
     pub fn embedding_dim(&self) -> Option<u32> {
         match self {
+            InferenceEngine::Server(e) => e.embedding_dim(),
             #[cfg(feature = "inprocess")]
             InferenceEngine::Embed(e) => Some(e.dim()),
-            _ => None,
+            #[cfg(feature = "inprocess")]
+            InferenceEngine::InProcess(_) => None,
         }
     }
 
@@ -710,17 +884,20 @@ impl InferenceEngine {
         }
     }
 
-    /// Embed a batch of inputs (only valid on an embedding engine).
-    #[cfg(feature = "inprocess")]
+    /// Embed a batch of inputs (only valid on an embedding engine). Ungated: the server
+    /// engine forwards to llama-server's /v1/embeddings on builds without `inprocess`.
     pub async fn embed(
         &self,
         inputs: Vec<String>,
-        input_type: crate::embed::InputType,
+        input_type: crate::embed_catalog::InputType,
         dimensions: Option<u32>,
-    ) -> Result<crate::embed::EmbedOut, String> {
+    ) -> Result<crate::embed_catalog::EmbedOut, String> {
         match self {
+            InferenceEngine::Server(e) => e.embed(inputs, input_type, dimensions).await,
+            #[cfg(feature = "inprocess")]
             InferenceEngine::Embed(e) => e.embed(inputs, input_type, dimensions).await,
-            _ => Err("this node is not an embedding node".to_string()),
+            #[cfg(feature = "inprocess")]
+            InferenceEngine::InProcess(_) => Err("this node is not an embedding node".to_string()),
         }
     }
 
@@ -887,7 +1064,14 @@ fn find_llama_server() -> Result<String, String> {
             candidates.push(format!(r"{pf}\llama.cpp\llama-server.exe"));
         }
         for cmd in &candidates {
-            if Command::new(cmd).arg("--help").output().is_ok() {
+            // CREATE_NO_WINDOW: each probe is a console app — without the flag every probe
+            // flashes a console window at the operator (seen live on the Windows beta).
+            use std::os::windows::process::CommandExt;
+            let probe = Command::new(cmd)
+                .arg("--help")
+                .creation_flags(0x0800_0000)
+                .output();
+            if probe.is_ok() {
                 return Ok(cmd.clone());
             }
         }

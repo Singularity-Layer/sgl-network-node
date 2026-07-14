@@ -81,3 +81,30 @@ jobs:
             sgl-windows-x86_64.exe
             sgl-windows-x86_64.exe.sha256
           if-no-files-found: error
+
+      # The MSVC runtime trio (officially redistributable) — hosted on our R2 and dropped
+      # by `sgl setup` NEXT TO llama-server.exe, so upstream llama.cpp builds run on clean
+      # Windows installs without the VC++ Redistributable (beta testers hit
+      # "VCRUNTIME140.dll was not found" otherwise). Packaged from the runner's VS redist.
+      - name: Package MSVC runtime DLLs (vccrt-x64.zip)
+        shell: pwsh
+        run: |
+          $redist = Get-ChildItem "C:\Program Files\Microsoft Visual Studio\2022\*\VC\Redist\MSVC\*\x64\Microsoft.VC143.CRT" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $redist) { throw "VC143.CRT redist dir not found on the runner" }
+          New-Item -ItemType Directory -Path vccrt-x64 | Out-Null
+          foreach ($d in "msvcp140.dll","vcruntime140.dll","vcruntime140_1.dll") {
+            Copy-Item (Join-Path $redist.FullName $d) vccrt-x64
+          }
+          Compress-Archive -Path "vccrt-x64\*" -DestinationPath "vccrt-x64.zip"
+          $hash = (Get-FileHash -Algorithm SHA256 "vccrt-x64.zip").Hash.ToLower()
+          "$hash  vccrt-x64.zip" | Out-File -Encoding ascii "vccrt-x64.zip.sha256"
+          Get-Content "vccrt-x64.zip.sha256"
+
+      - name: Upload CRT artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vccrt-x64
+          path: |
+            vccrt-x64.zip
+            vccrt-x64.zip.sha256
+          if-no-files-found: error

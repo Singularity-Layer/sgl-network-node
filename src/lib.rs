@@ -5,6 +5,7 @@
 
 #[cfg(feature = "inprocess")]
 pub mod embed;
+pub mod embed_catalog;
 // Exposed for examples/seal_b64_check.rs (cross-language sealed-encoding proof).
 pub mod encryption;
 pub mod inference;

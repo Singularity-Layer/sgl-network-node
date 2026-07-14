@@ -83,6 +83,26 @@ fn sha256_hex(bytes: &[u8]) -> String {
     hex::encode(h.finalize())
 }
 
+/// Promote the staging dir to the live bin dir, retrying the rename with backoff.
+/// Windows antivirus scans freshly-extracted executables and can hold them for
+/// seconds, failing the rename with "Access is denied (os error 5)".
+fn promote_staging(staging: &Path, bin_dir: &Path) -> Result<(), String> {
+    let _ = std::fs::remove_dir_all(bin_dir);
+    let mut last_err = String::new();
+    for attempt in 0..6u32 {
+        if attempt > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(500 * u64::from(attempt)));
+            // The target may exist again (partial recreate by a racing process); clear it.
+            let _ = std::fs::remove_dir_all(bin_dir);
+        }
+        match std::fs::rename(staging, bin_dir) {
+            Ok(_) => return Ok(()),
+            Err(e) => last_err = e.to_string(),
+        }
+    }
+    Err(last_err)
+}
+
 pub async fn run(cpu_only: bool) -> Result<(), String> {
     let asset = asset_for(cpu_only).ok_or_else(|| {
         "`sgl setup` has no llama.cpp package for this platform.\n\
@@ -96,6 +116,36 @@ pub async fn run(cpu_only: bool) -> Result<(), String> {
         println!("llama-server already installed at {}", server_path.display());
         println!("Re-run to reinstall, or delete that file first.");
         // Not an error — idempotent. Verify it launches so a corrupt install is still caught below.
+    }
+
+    // Adopt a valid leftover staging dir (a prior run that downloaded + verified but lost
+    // the final swap to an AV race) instead of re-downloading ~100MB. Only when there's no
+    // live install to protect and the staged server actually launches.
+    if !server_path.exists() {
+        if let Some(parent) = bin_dir.parent() {
+            let staging = parent.join("bin.staging");
+            let staged_server = staging.join(server_exe());
+            if staged_server.exists()
+                && std::process::Command::new(&staged_server)
+                    .arg("--version")
+                    .output()
+                    .is_ok()
+            {
+                println!("Found a verified install from a previous run — finishing it…");
+                match promote_staging(&staging, &bin_dir) {
+                    Ok(_) => {
+                        println!("✅ llama.cpp installed (recovered previous download)");
+                        println!("   Server: {}", server_path.display());
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        // Couldn't promote; fall through to a fresh download attempt.
+                        println!("  (couldn't finish the previous install: {e} — reinstalling)");
+                        let _ = std::fs::remove_dir_all(&staging);
+                    }
+                }
+            }
+        }
     }
 
     let url = format!(
@@ -184,12 +234,18 @@ pub async fn run(cpu_only: bool) -> Result<(), String> {
         }
     }
 
-    // Atomic-ish swap: drop the old dir, promote staging. (During `sgl setup` the node isn't
-    // serving yet, so no llama-server is holding these files open.)
-    let _ = std::fs::remove_dir_all(&bin_dir);
-    std::fs::rename(&staging, &bin_dir).map_err(|e| {
-        format!("Verified the download but couldn't install into {}: {e}", bin_dir.display())
-    })?;
+    // Atomic-ish swap: drop the old dir, promote staging (retry inside — AV scan race).
+    // On final failure KEEP staging: the adopt-staging path above finishes the install on
+    // the next run without re-downloading (previously this stranded testers with no bin).
+    if let Err(e) = promote_staging(&staging, &bin_dir) {
+        return Err(format!(
+            "Verified the download but couldn't install into {}: {e}\n\
+             (The verified files were kept at {} — close anything using that folder and \
+             re-run `sgl setup` to finish without re-downloading.)",
+            bin_dir.display(),
+            staging.display()
+        ));
+    }
 
     println!();
     println!("✅ llama.cpp installed ({LLAMA_TAG}, {} files)", extracted);

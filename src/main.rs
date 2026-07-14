@@ -1,4 +1,5 @@
 mod config;
+mod embed_catalog;
 mod crypto;
 #[cfg(feature = "inprocess")]
 mod embed;
