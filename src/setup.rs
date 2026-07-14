@@ -218,6 +218,42 @@ pub async fn run(cpu_only: bool) -> Result<(), String> {
             server_exe()
         )));
     }
+
+    // ── Windows: drop the MSVC runtime trio beside llama-server.exe ───────────────
+    // Upstream llama.cpp builds dynamically link the VC++ runtime; clean Windows
+    // installs lack it ("VCRUNTIME140.dll was not found" — hit live in the beta). We
+    // bundle the officially redistributable DLLs (packaged by our CI from the build
+    // runner), hash-pinned and hosted on our origin. Windows loads DLLs from the exe's
+    // own directory first, so this removes the VC++ Redistributable install entirely —
+    // and the smoke test below then validates EXACTLY what a clean machine runs.
+    #[cfg(windows)]
+    {
+        const VCCRT_URL: &str =
+            "https://cloud.x402compute.cc/downloads/node/vccrt-x64-20f7ee2e8e81.zip";
+        const VCCRT_SHA256: &str =
+            "20f7ee2e8e81db01cb11d7f343114302bfd9a4f817e00a51e99fd24530adb358";
+        println!("Downloading MSVC runtime bundle…");
+        let crt_bytes = client
+            .get(VCCRT_URL)
+            .send()
+            .await
+            .map_err(|e| fail(&staging, format!("Runtime bundle download failed: {e}")))?
+            .error_for_status()
+            .map_err(|e| fail(&staging, format!("Runtime bundle download failed: {e}")))?
+            .bytes()
+            .await
+            .map_err(|e| fail(&staging, format!("Runtime bundle download failed: {e}")))?;
+        let actual = sha256_hex(&crt_bytes);
+        if actual != VCCRT_SHA256 {
+            return Err(fail(&staging, format!(
+                "Runtime bundle checksum mismatch — refusing to install.\n  expected: {VCCRT_SHA256}\n  got:      {actual}"
+            )));
+        }
+        println!("  Runtime checksum verified ✓ ({})", &actual[..12]);
+        if let Err(e) = extract_zip(&crt_bytes, &staging) {
+            return Err(fail(&staging, format!("Runtime bundle extract failed: {e}")));
+        }
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
