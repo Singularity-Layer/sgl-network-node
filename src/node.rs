@@ -261,12 +261,12 @@ pub async fn login(
     if session.verify_url.starts_with("https://") || session.verify_url.starts_with("http://") {
         #[cfg(target_os = "windows")]
         {
-            // `explorer.exe <url>` launches the default browser via the shell-open verb.
-            // The URL is passed as a single CreateProcess argument (NOT through `cmd`),
-            // so query separators like `&` are preserved and there is no shell parsing
-            // or injection — unlike `cmd /C start`.
-            let _ = std::process::Command::new("explorer")
-                .arg(&session.verify_url)
+            // `rundll32 url.dll,FileProtocolHandler <url>` hands the URL to the OS URL
+            // handler (default browser) as a single CreateProcess argument — no `cmd`
+            // shell parsing/injection, and unlike `explorer.exe <url>` it still works on
+            // Windows 11 24H2+ (explorer there ignores URLs and opens a file window).
+            let _ = std::process::Command::new("rundll32")
+                .args(["url.dll,FileProtocolHandler", &session.verify_url])
                 .spawn();
         }
         #[cfg(not(target_os = "windows"))]
