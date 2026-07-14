@@ -89,11 +89,15 @@ jobs:
       - name: Package MSVC runtime DLLs (vccrt-x64.zip)
         shell: pwsh
         run: |
-          $redist = Get-ChildItem "C:\Program Files\Microsoft Visual Studio\2022\*\VC\Redist\MSVC\*\x64\Microsoft.VC143.CRT" -ErrorAction SilentlyContinue | Select-Object -First 1
-          if (-not $redist) { throw "VC143.CRT redist dir not found on the runner" }
+          # System32 carries the same (newest-installed) redistributable DLLs and exists on
+          # every runner image — unlike the VS Redist folder layout, which moves around.
+          $src = Join-Path $env:SystemRoot "System32"
           New-Item -ItemType Directory -Path vccrt-x64 | Out-Null
           foreach ($d in "msvcp140.dll","vcruntime140.dll","vcruntime140_1.dll") {
-            Copy-Item (Join-Path $redist.FullName $d) vccrt-x64
+            $p = Join-Path $src $d
+            if (-not (Test-Path $p)) { throw "$d not found in System32" }
+            Copy-Item $p vccrt-x64
+            Write-Host "$d $((Get-Item $p).VersionInfo.ProductVersion)"
           }
           Compress-Archive -Path "vccrt-x64\*" -DestinationPath "vccrt-x64.zip"
           $hash = (Get-FileHash -Algorithm SHA256 "vccrt-x64.zip").Hash.ToLower()
