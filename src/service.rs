@@ -96,15 +96,14 @@ pub fn install(opts: &ServiceStartOptions) -> Result<(), String> {
     {
         install_linux(opts)
     }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(target_os = "windows")]
+    {
+        install_windows(opts)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
         let _ = opts;
-        Err(
-            "Windows service install is not wired up yet. Run the node in the foreground with \
-             `sgl start ...` (the Singularity Node desktop app supervises it), or register it \
-             yourself with `sc.exe create`. Native Windows-service support is a follow-up."
-                .to_string(),
-        )
+        Err("No service installer for this platform. Run `sgl start ...` in the foreground.".to_string())
     }
 }
 
@@ -117,11 +116,13 @@ pub fn uninstall() -> Result<(), String> {
     {
         uninstall_linux()
     }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(target_os = "windows")]
     {
-        Err("Windows service uninstall is not wired up yet (no service is installed). \
-             If you created one manually, remove it with `sc.exe delete`."
-            .to_string())
+        uninstall_windows()
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
+        Err("No service installer for this platform (nothing to uninstall).".to_string())
     }
 }
 
@@ -134,11 +135,148 @@ pub fn status() -> Result<(), String> {
     {
         status_linux()
     }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(target_os = "windows")]
     {
-        Err("Windows service status is not available yet — the node runs in the foreground on \
-             Windows (`sgl start ...`). Native Windows-service support is a follow-up."
-            .to_string())
+        status_windows()
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
+        Err("No service installer for this platform.".to_string())
+    }
+}
+
+// ─── Windows (Task Scheduler) ───────────────────────────────────────────────
+// The launchd-parity story on Windows: a per-user Scheduled Task (no admin) that
+//   * starts the node at logon                      (≈ LaunchAgent RunAtLoad)
+//   * restarts it if it crashes                     (≈ launchd KeepAlive)
+//   * keeps running after the desktop app closes    (independent process)
+//   * runs hidden via the S4U logon type            (no console window)
+// S4U ("service for user") runs without a stored password and non-interactively.
+// If task registration under S4U is denied (some locked-down machines), we fall
+// back to an Interactive-logon task — same lifecycle, may briefly show a window
+// at logon. All PowerShell is passed as ONE argv element (no cmd shell parsing).
+
+/// PowerShell single-quoted literal: escape embedded quotes by doubling them.
+#[cfg(target_os = "windows")]
+fn ps_squote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "''"))
+}
+
+#[cfg(target_os = "windows")]
+fn run_powershell(script: &str) -> Result<String, String> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let out = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", script])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .map_err(|e| format!("Failed to run PowerShell: {e}"))?;
+    let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+    if out.status.success() {
+        Ok(stdout)
+    } else {
+        Err(if stderr.is_empty() { stdout } else { stderr })
+    }
+}
+
+/// Quote ONE token for a Windows command line (CreateProcess rules): always wrap
+/// in double quotes, escape embedded `"` as `\"`. Our tokens are file paths and
+/// flag values — no trailing-backslash-before-quote cases (paths end in `.gguf`).
+#[cfg(target_os = "windows")]
+fn win_quote(token: &str) -> String {
+    format!("\"{}\"", token.replace('"', "\\\""))
+}
+
+#[cfg(target_os = "windows")]
+fn install_windows(opts: &ServiceStartOptions) -> Result<(), String> {
+    let exe = current_exe()?;
+    // Quote EVERY token (not just spaced ones) with CreateProcess escaping.
+    let arg_string = opts
+        .start_args()
+        .iter()
+        .map(|a| win_quote(a))
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    // Reinstall-safety: stop the old task instance and tree-kill any running node
+    // BEFORE registering, so `MultipleInstances IgnoreNew` can't leave a stale node
+    // serving the OLD model/args after Start-ScheduledTask.
+    let _ = run_powershell(&format!(
+        "Stop-ScheduledTask -TaskName {label} -ErrorAction SilentlyContinue",
+        label = ps_squote(SERVICE_LABEL),
+    ));
+    kill_node_trees();
+
+    // $ErrorActionPreference='Stop' makes non-terminating cmdlet errors fatal so a
+    // failed Register/Start can't exit 0 and report a phantom success.
+    let script = format!(
+        "$ErrorActionPreference = 'Stop'; \
+         $u = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name; \
+         $a = New-ScheduledTaskAction -Execute {exe} -Argument {args}; \
+         $t = New-ScheduledTaskTrigger -AtLogOn -User $u; \
+         $s = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries \
+              -Hidden -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 10 \
+              -RestartInterval (New-TimeSpan -Minutes 1) -MultipleInstances IgnoreNew -StartWhenAvailable; \
+         try {{ \
+           $p = New-ScheduledTaskPrincipal -UserId $u -LogonType S4U -RunLevel Limited; \
+           Register-ScheduledTask -TaskName {label} -Action $a -Trigger $t -Settings $s -Principal $p -Force -ErrorAction Stop | Out-Null; \
+           Start-ScheduledTask -TaskName {label} -ErrorAction Stop \
+         }} catch {{ \
+           $p = New-ScheduledTaskPrincipal -UserId $u -LogonType Interactive -RunLevel Limited; \
+           Register-ScheduledTask -TaskName {label} -Action $a -Trigger $t -Settings $s -Principal $p -Force -ErrorAction Stop | Out-Null; \
+           Start-ScheduledTask -TaskName {label} -ErrorAction Stop \
+         }}",
+        exe = ps_squote(&exe),
+        args = ps_squote(&arg_string),
+        label = ps_squote(SERVICE_LABEL),
+    );
+    run_powershell(&script).map_err(|e| format!("Couldn't install the background task: {e}"))?;
+    println!("Background task installed and started (Task Scheduler: {SERVICE_LABEL}).");
+    println!("The node keeps serving after the app closes and restarts at logon.");
+    Ok(())
+}
+
+/// Tree-kill every running `sgl start` node (command-line matched, so login/setup/
+/// update invocations are never touched). taskkill /T takes the llama-server.exe
+/// child down with the node — Stop-ScheduledTask alone can orphan it.
+#[cfg(target_os = "windows")]
+fn kill_node_trees() {
+    let _ = run_powershell(
+        "Get-CimInstance Win32_Process -Filter \"Name='sgl.exe'\" | \
+         Where-Object { $_.CommandLine -match '\\sstart(\\s|$)' } | \
+         ForEach-Object { & taskkill /T /F /PID $_.ProcessId 2>$null } | Out-Null",
+    );
+}
+
+#[cfg(target_os = "windows")]
+fn uninstall_windows() -> Result<(), String> {
+    let script = format!(
+        "Stop-ScheduledTask -TaskName {label} -ErrorAction SilentlyContinue; \
+         Unregister-ScheduledTask -TaskName {label} -Confirm:$false -ErrorAction SilentlyContinue",
+        label = ps_squote(SERVICE_LABEL),
+    );
+    let _ = run_powershell(&script);
+    kill_node_trees();
+    println!("Background task removed (and any running node stopped).");
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn status_windows() -> Result<(), String> {
+    let script = format!(
+        "(Get-ScheduledTask -TaskName {label} -ErrorAction Stop).State",
+        label = ps_squote(SERVICE_LABEL),
+    );
+    match run_powershell(&script) {
+        Ok(state) => {
+            println!("Background task: {state}");
+            Ok(())
+        }
+        Err(_) => {
+            println!("Background task: not installed");
+            Ok(())
+        }
     }
 }
 
