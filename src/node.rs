@@ -256,14 +256,31 @@ pub async fn login(
     let session = client.device_start().await?;
 
     println!("\n  Open to link this node:\n      {}\n  Approve with your staked Solana wallet (code: {}).\n", session.verify_url, session.user_code);
-    let opener = if cfg!(target_os = "macos") {
-        "open"
-    } else {
-        "xdg-open"
-    };
-    let _ = std::process::Command::new(opener)
-        .arg(&session.verify_url)
-        .spawn();
+    // Only hand a real web URL to the OS opener (the verify link is always https from
+    // our orchestrator). This guards the platform openers against an unexpected scheme.
+    if session.verify_url.starts_with("https://") || session.verify_url.starts_with("http://") {
+        #[cfg(target_os = "windows")]
+        {
+            // `explorer.exe <url>` launches the default browser via the shell-open verb.
+            // The URL is passed as a single CreateProcess argument (NOT through `cmd`),
+            // so query separators like `&` are preserved and there is no shell parsing
+            // or injection — unlike `cmd /C start`.
+            let _ = std::process::Command::new("explorer")
+                .arg(&session.verify_url)
+                .spawn();
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let opener = if cfg!(target_os = "macos") {
+                "open"
+            } else {
+                "xdg-open"
+            };
+            let _ = std::process::Command::new(opener)
+                .arg(&session.verify_url)
+                .spawn();
+        }
+    }
 
     let interval = session.interval.max(2);
     let max_polls = if session.expires_in > 0 {
