@@ -199,6 +199,25 @@ fn install_windows(opts: &ServiceStartOptions) -> Result<(), String> {
         .collect::<Vec<_>>()
         .join(" ");
 
+    // Interactive-fallback action: S4U runs windowless by design, but when Windows
+    // refuses S4U (seen live on a tester's Win10) the Interactive task showed a
+    // PERSISTENT sgl console. Wrap that path in a hidden PowerShell launcher that
+    // waits for the node and propagates its exit code — restart-on-failure still
+    // works, no window (PS itself is spawned hidden by -WindowStyle Hidden).
+    // Tokens are PS-single-quoted: PowerShell rejoins its post--Command argv with
+    // spaces and re-parses, so single-quote grouping survives CreateProcess splitting.
+    let ps_tokens = opts
+        .start_args()
+        .iter()
+        .map(|a| format!("'{}'", a.replace('\'', "''")))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let hidden_fallback_arg = format!(
+        "-NoProfile -WindowStyle Hidden -Command & '{}' {}; exit $LASTEXITCODE",
+        exe.replace('\'', "''"),
+        ps_tokens
+    );
+
     // Reinstall-safety: stop the old task instance and tree-kill any running node
     // BEFORE registering, so `MultipleInstances IgnoreNew` can't leave a stale node
     // serving the OLD model/args after Start-ScheduledTask.
@@ -223,12 +242,14 @@ fn install_windows(opts: &ServiceStartOptions) -> Result<(), String> {
            Register-ScheduledTask -TaskName {label} -Action $a -Trigger $t -Settings $s -Principal $p -Force -ErrorAction Stop | Out-Null; \
            Start-ScheduledTask -TaskName {label} -ErrorAction Stop \
          }} catch {{ \
+           $fa = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument {fbarg}; \
            $p = New-ScheduledTaskPrincipal -UserId $u -LogonType Interactive -RunLevel Limited; \
-           Register-ScheduledTask -TaskName {label} -Action $a -Trigger $t -Settings $s -Principal $p -Force -ErrorAction Stop | Out-Null; \
+           Register-ScheduledTask -TaskName {label} -Action $fa -Trigger $t -Settings $s -Principal $p -Force -ErrorAction Stop | Out-Null; \
            Start-ScheduledTask -TaskName {label} -ErrorAction Stop \
          }}",
         exe = ps_squote(&exe),
         args = ps_squote(&arg_string),
+        fbarg = ps_squote(&hidden_fallback_arg),
         label = ps_squote(SERVICE_LABEL),
     );
     run_powershell(&script).map_err(|e| format!("Couldn't install the background task: {e}"))?;
@@ -244,7 +265,7 @@ fn install_windows(opts: &ServiceStartOptions) -> Result<(), String> {
 fn kill_node_trees() {
     let _ = run_powershell(
         "Get-CimInstance Win32_Process -Filter \"Name='sgl.exe'\" | \
-         Where-Object { $_.CommandLine -match '\\sstart(\\s|$)' } | \
+         Where-Object { $_.CommandLine -match '(\\s|\")start(\\s|\"|$)' } | \
          ForEach-Object { & taskkill /T /F /PID $_.ProcessId 2>$null } | Out-Null",
     );
 }

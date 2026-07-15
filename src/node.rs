@@ -56,10 +56,19 @@ impl ResourceConfig {
         } else {
             (99.0 * resource_percent as f64 / 100.0).round() as u32
         };
+        // Windows default: AUTO (omit -ngl, llama.cpp fits offload itself) instead of
+        // pinning 99 layers — consumer GPU drivers there are too variable to force max
+        // offload (a pinned -ngl 99 fed the first tester's Vulkan crash loop). Explicit
+        // --gpu-layers still wins on every platform.
+        let default_gpu_layers = if cfg!(windows) {
+            crate::inference::GPU_LAYERS_AUTO
+        } else {
+            computed_gpu_layers
+        };
 
         Self {
             threads: threads.unwrap_or(computed_threads),
-            gpu_layers: gpu_layers.unwrap_or(computed_gpu_layers),
+            gpu_layers: gpu_layers.unwrap_or(default_gpu_layers),
             context_size,
             max_jobs,
             batch_size,
