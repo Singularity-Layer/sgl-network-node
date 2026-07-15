@@ -539,6 +539,11 @@ pub async fn start(
                 .unwrap_or_else(|| "unknown".to_string())
         });
 
+        // Crash-loop engine auto-swap: if the OS service keeps restarting a young-dying
+        // node on the GPU (Vulkan) engine, swap to the CPU build before creating the
+        // engine. No-op on in-process/mac installs (no engine.variant marker).
+        crate::setup::crashloop_autoswap().await;
+
         // Engine selection: SGL_ENGINE=server|inprocess. DEFAULT = in-process on builds
         // that ship it (macOS: the model runs INSIDE this attested process — no separate
         // llama-server child that can die while the wrapper heartbeats "healthy", killing

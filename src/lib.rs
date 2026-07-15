@@ -9,5 +9,7 @@ pub mod embed_catalog;
 // Exposed for examples/seal_b64_check.rs (cross-language sealed-encoding proof).
 pub mod encryption;
 pub mod inference;
+// Engine installer — inference.rs drives the crash-loop auto-swap through it.
+pub mod setup;
 #[cfg(feature = "inprocess")]
 pub mod inprocess;

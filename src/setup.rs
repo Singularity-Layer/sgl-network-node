@@ -83,6 +83,59 @@ fn sha256_hex(bytes: &[u8]) -> String {
     hex::encode(h.finalize())
 }
 
+/// Crash-loop engine auto-swap. Called once at node startup: if this process keeps
+/// dying YOUNG (the OS service restarts us within minutes — crash, watchdog abort, or
+/// driver taking the process down), and the installed engine is the GPU (Vulkan) build,
+/// swap to the CPU build automatically via the normal verified pipeline. An app tester
+/// must never run `sgl setup --cpu` by hand (learned live on the first external Windows
+/// tester: Vulkan passed --version/health but crashed the node under real inference).
+/// A boot older than 10 minutes counts as a normal run and resets the streak, so
+/// ordinary stops/updates on healthy machines never trigger a swap.
+pub async fn crashloop_autoswap() {
+    let Some(base) = dirs::data_local_dir() else { return };
+    let dir = base.join("sgl-node");
+    let _ = std::fs::create_dir_all(&dir);
+    let boot_flag = dir.join("boot.flag");
+    let young_count = dir.join("young.count");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    let died_young = std::fs::read_to_string(&boot_flag)
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .map(|prev| now.saturating_sub(prev) < 600)
+        .unwrap_or(false);
+    let count: u32 = if died_young {
+        std::fs::read_to_string(&young_count)
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(0)
+            + 1
+    } else {
+        0
+    };
+    let _ = std::fs::write(&young_count, count.to_string());
+    let _ = std::fs::write(&boot_flag, now.to_string());
+
+    let variant = std::fs::read_to_string(dir.join("bin").join("engine.variant"))
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+    if count >= 2 && variant == "vulkan" {
+        tracing::warn!(
+            "node restarted {count} times within minutes on the GPU (Vulkan) engine — auto-swapping to the CPU build"
+        );
+        match run(true).await {
+            Ok(_) => {
+                let _ = std::fs::write(&young_count, "0");
+                tracing::info!("CPU engine installed — continuing startup");
+            }
+            Err(e) => tracing::warn!("engine auto-swap failed (continuing with current build): {e}"),
+        }
+    }
+}
+
 /// Promote the staging dir to the live bin dir, retrying the rename with backoff.
 /// Windows antivirus scans freshly-extracted executables and can hold them for
 /// seconds, failing the rename with "Access is denied (os error 5)".
@@ -275,6 +328,14 @@ pub async fn run(cpu_only: bool) -> Result<(), String> {
             return Err(fail(&staging, format!("Runtime bundle extract failed: {e}")));
         }
     }
+
+    // Record which engine variant this install is — the node's crash-recovery reads it
+    // to auto-swap a GPU build that dies during inference for the CPU build (so an app
+    // tester never runs `sgl setup --cpu` by hand). Rides the staging swap atomically.
+    let _ = std::fs::write(
+        staging.join("engine.variant"),
+        if cpu_only { "cpu" } else { "vulkan" },
+    );
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;

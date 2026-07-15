@@ -52,6 +52,17 @@ pub struct ServerEngine {
     /// builds (Windows) serve embedding models — the in-process engine handles them on
     /// macOS/Linux builds and takes priority in InferenceEngine::create.
     embed_spec: Option<&'static crate::embed_catalog::EmbedModelSpec>,
+    /// Supervised-restart counter for the engine-variant auto-swap (see restart()).
+    restart_count: std::sync::atomic::AtomicU32,
+}
+
+/// Which llama.cpp variant `sgl setup` installed ("vulkan" | "cpu"), from the marker it
+/// writes beside llama-server. Unknown/legacy installs return None.
+fn installed_engine_variant() -> Option<String> {
+    let base = dirs::data_local_dir()?;
+    std::fs::read_to_string(base.join("sgl-node").join("bin").join("engine.variant"))
+        .ok()
+        .map(|s| s.trim().to_string())
 }
 
 #[derive(Serialize)]
@@ -173,6 +184,7 @@ impl ServerEngine {
             base_url,
             config,
             embed_spec,
+            restart_count: std::sync::atomic::AtomicU32::new(0),
         }
     }
 
@@ -489,6 +501,25 @@ impl ServerEngine {
     pub async fn restart(&self) -> Result<(), String> {
         tracing::warn!("llama-server unhealthy — restarting the inference engine");
         self.stop();
+        // Engine-variant auto-swap: a GPU (Vulkan) build that passes --version/health but
+        // CRASHES under real inference is a driver problem the operator can't fix — seen
+        // live on the first external Windows tester. After the 2nd supervised restart,
+        // swap to the CPU build via the same verified `sgl setup` pipeline and keep
+        // serving. One swap direction only (vulkan → cpu), once per install: if CPU also
+        // fails, the normal restart/watchdog path continues and surfaces the error.
+        let n = self
+            .restart_count
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
+        if n == 2 && installed_engine_variant().as_deref() == Some("vulkan") {
+            tracing::warn!(
+                "engine crashed twice — auto-swapping the GPU (Vulkan) build for the CPU build"
+            );
+            match crate::setup::run(true).await {
+                Ok(_) => tracing::info!("CPU engine installed — relaunching"),
+                Err(e) => tracing::warn!("engine auto-swap failed (continuing with current build): {e}"),
+            }
+        }
         // Brief pause so the OS reclaims the port + GPU/unified memory before relaunch.
         sleep(Duration::from_secs(2)).await;
         self.start().await
