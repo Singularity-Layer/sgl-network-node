@@ -424,6 +424,17 @@ impl ServerEngine {
             args.push("-ngl");
             args.push(&gpu_layers_str);
         }
+        // KV-cache quantization (opt-in, default OFF). `--cache-type-k q8_0` roughly halves
+        // K-cache memory for long contexts on RAM-tight boxes, reducing spill/pressure. V-cache
+        // quant additionally needs flash-attention (Metal head-size dependent), so we ship K-only
+        // until per-model validation and gate it behind SGL_KV_QUANT=1. No-op when unset.
+        if std::env::var("SGL_KV_QUANT")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+        {
+            args.push("--cache-type-k");
+            args.push("q8_0");
+        }
         if let Some(p) = &template_file {
             args.push("--chat-template-file");
             args.push(p);
@@ -499,7 +510,20 @@ impl ServerEngine {
     /// engine OOM'd or crashed mid-run self-heals WITHOUT the operator restarting it.
     /// Returns Ok once the new server answers /health (start() waits up to 30s).
     pub async fn restart(&self) -> Result<(), String> {
-        tracing::warn!("llama-server unhealthy — restarting the inference engine");
+        self.restart_inner(true).await
+    }
+
+    /// Restart WITHOUT counting toward the crash restart budget / Vulkan→CPU auto-swap.
+    /// Used by the empty-completion self-heal: an engine that stays up and answers /health
+    /// but PRODUCES EMPTY output (canary-confirmed) is a different failure from a crash, and
+    /// must never trip the GPU→CPU downgrade — otherwise a user could weaponize crafted empty
+    /// replies to permanently degrade a healthy GPU node. Same kill+relaunch, no swap counter.
+    pub async fn restart_no_swap(&self) -> Result<(), String> {
+        self.restart_inner(false).await
+    }
+
+    async fn restart_inner(&self, allow_variant_swap: bool) -> Result<(), String> {
+        tracing::warn!("restarting the inference engine (variant_swap={allow_variant_swap})");
         self.stop();
         // Engine-variant auto-swap: a GPU (Vulkan) build that passes --version/health but
         // CRASHES under real inference is a driver problem the operator can't fix — seen
@@ -507,17 +531,21 @@ impl ServerEngine {
         // swap to the CPU build via the same verified `sgl setup` pipeline and keep
         // serving. One swap direction only (vulkan → cpu), once per install: if CPU also
         // fails, the normal restart/watchdog path continues and surfaces the error.
-        let n = self
-            .restart_count
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-            + 1;
-        if n == 2 && installed_engine_variant().as_deref() == Some("vulkan") {
-            tracing::warn!(
-                "engine crashed twice — auto-swapping the GPU (Vulkan) build for the CPU build"
-            );
-            match crate::setup::run(true).await {
-                Ok(_) => tracing::info!("CPU engine installed — relaunching"),
-                Err(e) => tracing::warn!("engine auto-swap failed (continuing with current build): {e}"),
+        // ONLY crash/wedge restarts feed this counter — empty-completion restarts pass
+        // allow_variant_swap=false so a produce-nothing engine can't force the downgrade.
+        if allow_variant_swap {
+            let n = self
+                .restart_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                + 1;
+            if n == 2 && installed_engine_variant().as_deref() == Some("vulkan") {
+                tracing::warn!(
+                    "engine crashed twice — auto-swapping the GPU (Vulkan) build for the CPU build"
+                );
+                match crate::setup::run(true).await {
+                    Ok(_) => tracing::info!("CPU engine installed — relaunching"),
+                    Err(e) => tracing::warn!("engine auto-swap failed (continuing with current build): {e}"),
+                }
             }
         }
         // Brief pause so the OS reclaims the port + GPU/unified memory before relaunch.
@@ -969,6 +997,21 @@ impl InferenceEngine {
                 );
                 std::process::abort();
             }
+        }
+    }
+
+    /// Restart driven by the empty-completion self-heal (canary-confirmed produce-nothing).
+    /// Server engine: kill+relaunch WITHOUT feeding the Vulkan→CPU auto-swap counter (a
+    /// produce-nothing engine is not a crash, and empties are attacker-inducible). In-process /
+    /// embedding engines have no child to bounce, so recovery is the same clean OS relaunch
+    /// (abort) as `restart()` — the canary + cooldown in the heartbeat loop gate it.
+    pub async fn restart_empty(&self) -> Result<(), String> {
+        match self {
+            InferenceEngine::Server(e) => e.restart_no_swap().await,
+            #[cfg(feature = "inprocess")]
+            InferenceEngine::InProcess(_) => self.restart().await,
+            #[cfg(feature = "inprocess")]
+            InferenceEngine::Embed(_) => self.restart().await,
         }
     }
 

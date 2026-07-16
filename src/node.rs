@@ -11,6 +11,225 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// Empty-completion self-heal state (the one zombie mode the /health + wedge watchdogs miss:
+/// a llama-server that stays up and answers /health but returns a FAST 0-token reply, so it
+/// keeps advertising and serving empties). The two chat job-outcome sites advance `consecutive`
+/// on an empty reply to a request that SHOULD have produced output; any real (or legitimately
+/// empty/exempt) reply clears it. The heartbeat loop reads `consecutive`, and past a threshold
+/// CANARY-CONFIRMS with its own probe before restarting — so crafted empties from one client
+/// can't be weaponized into a node kill switch. `restarts`/`last_restart_ms` cap + cooldown the
+/// self-heal independently of the crash/wedge restart budgets (which reset on /health OK and so
+/// give this mode zero protection). All engine-agnostic: recorded at the node.rs layer, so it
+/// covers the in-process (Mac) engine and the subprocess (Linux/Windows) engine alike.
+struct EmptyHealth {
+    consecutive: AtomicU32,
+    restarts: AtomicU32,
+    last_restart_ms: AtomicU64,
+    /// Sticky "empty-suspect" flag. Set when a streak trips, held while we canary-probe and while a
+    /// canary-confirmed-dead engine is parked, cleared only when a canary produces real output.
+    /// Consulted by both the advertise decision AND `maybe_spawn_job` (refuse new work while set),
+    /// so a suspect engine is truly taken out of rotation — not just left off the next heartbeat.
+    quarantined: std::sync::atomic::AtomicBool,
+    /// Unix-ms of the first entry into the current quarantine (0 when not quarantined). Bounds the
+    /// park: if only INCONCLUSIVE probes come back for too long (an alive-but-canary-slow engine
+    /// that /health can't restart), release quarantine so real traffic re-tests it instead of the
+    /// node going dark forever.
+    quarantined_since_ms: AtomicU64,
+    /// On-disk mirror of `restarts`/`last_restart_ms`. The in-process (Mac) restart is a whole
+    /// `std::process::abort()`, which would wipe an in-memory budget and let a broken model
+    /// abort-loop forever; persisting makes the cap + cooldown bind across relaunches.
+    state_path: PathBuf,
+}
+
+impl EmptyHealth {
+    /// Load the persisted restart budget from disk (so it survives the in-process abort recovery).
+    fn load(config_dir: &Path) -> Self {
+        let state_path = config_dir.join("empty_restart_state.json");
+        let (restarts, last_restart_ms) = std::fs::read_to_string(&state_path)
+            .ok()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+            .map(|v| {
+                (
+                    v.get("restarts").and_then(|x| x.as_u64()).unwrap_or(0) as u32,
+                    v.get("last_restart_ms").and_then(|x| x.as_u64()).unwrap_or(0),
+                )
+            })
+            .unwrap_or((0, 0));
+        Self {
+            consecutive: AtomicU32::new(0),
+            restarts: AtomicU32::new(restarts),
+            last_restart_ms: AtomicU64::new(last_restart_ms),
+            quarantined: std::sync::atomic::AtomicBool::new(false),
+            quarantined_since_ms: AtomicU64::new(0),
+            state_path,
+        }
+    }
+    /// A chat completion produced output — or was a legitimate/exempt empty. Clears the streak.
+    fn record_ok(&self) {
+        self.consecutive.store(0, Ordering::Relaxed);
+    }
+    /// A chat completion returned empty content when it should have produced output. Advances the streak.
+    fn record_empty(&self) {
+        let n = self.consecutive.fetch_add(1, Ordering::Relaxed) + 1;
+        tracing::warn!("empty chat completion ({n} consecutive) — engine may be producing nothing");
+    }
+    #[cfg(test)]
+    fn consecutive(&self) -> u32 {
+        self.consecutive.load(Ordering::Relaxed)
+    }
+    /// Atomically consume a trip: reset the streak to 0 ONLY if it's still exactly the observed
+    /// value, so an increment that lands between the read and the reset is preserved (a concurrent
+    /// job's empty is not silently lost — it re-accumulates and re-trips next cycle).
+    fn take_trip(&self, threshold: u32) -> bool {
+        let v = self.consecutive.load(Ordering::Relaxed);
+        if v < threshold {
+            return false;
+        }
+        self.consecutive
+            .compare_exchange(v, 0, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+    }
+    fn is_quarantined(&self) -> bool {
+        self.quarantined.load(Ordering::Relaxed)
+    }
+    /// Enter (or stay in) quarantine, stamping the entry time only on the first transition so the
+    /// max-age escape measures from when parking actually began — not from each re-probe cycle.
+    fn enter_quarantine(&self, now: u64) {
+        let was = self.quarantined.swap(true, Ordering::Relaxed);
+        if !was {
+            self.quarantined_since_ms.store(now, Ordering::Relaxed);
+        }
+    }
+    fn clear_quarantine(&self) {
+        self.quarantined.store(false, Ordering::Relaxed);
+        self.quarantined_since_ms.store(0, Ordering::Relaxed);
+    }
+    fn quarantined_since(&self) -> u64 {
+        self.quarantined_since_ms.load(Ordering::Relaxed)
+    }
+    /// Empty-triggered restarts within `window_ms`. Older restarts don't count (a node that was
+    /// flaky an hour ago isn't capped forever); when the window lapses the persisted count is
+    /// decayed to 0 so the budget genuinely resets.
+    fn effective_restarts(&self, now: u64, window_ms: u64) -> u32 {
+        let last = self.last_restart_ms.load(Ordering::Relaxed);
+        if last != 0 && now.saturating_sub(last) > window_ms {
+            self.restarts.store(0, Ordering::Relaxed);
+            self.persist();
+            0
+        } else {
+            self.restarts.load(Ordering::Relaxed)
+        }
+    }
+    fn last_restart_ms(&self) -> u64 {
+        self.last_restart_ms.load(Ordering::Relaxed)
+    }
+    /// Record an empty-triggered restart and persist BEFORE the caller restarts — so the budget
+    /// survives an in-process abort() that never returns.
+    fn note_restart(&self, now: u64) {
+        self.restarts.fetch_add(1, Ordering::Relaxed);
+        self.last_restart_ms.store(now, Ordering::Relaxed);
+        self.persist();
+    }
+    #[cfg(test)]
+    fn restarts(&self) -> u32 {
+        self.restarts.load(Ordering::Relaxed)
+    }
+    fn persist(&self) {
+        let body = serde_json::json!({
+            "restarts": self.restarts.load(Ordering::Relaxed),
+            "last_restart_ms": self.last_restart_ms.load(Ordering::Relaxed),
+        })
+        .to_string();
+        // Atomic write (tmp + rename) so a torn/partial file can never be read back as (0,0),
+        // which would silently reset BOTH the cap and the cooldown.
+        let tmp = self.state_path.with_extension("json.tmp");
+        if std::fs::write(&tmp, &body).is_ok() {
+            let _ = std::fs::rename(&tmp, &self.state_path);
+        }
+    }
+    #[cfg(test)]
+    fn new_for_test() -> Self {
+        Self {
+            consecutive: AtomicU32::new(0),
+            restarts: AtomicU32::new(0),
+            last_restart_ms: AtomicU64::new(0),
+            quarantined: std::sync::atomic::AtomicBool::new(false),
+            quarantined_since_ms: AtomicU64::new(0),
+            state_path: std::env::temp_dir().join("sgl_empty_health_test_state.json"),
+        }
+    }
+}
+
+/// True iff a message's `content` carries non-whitespace text. Handles both the string form and
+/// OpenAI's array-of-parts form (`[{"type":"text","text":"..."}]`); anything else (null, tool
+/// scaffolding) is treated as no-text.
+fn message_has_text(content: Option<&serde_json::Value>) -> bool {
+    match content {
+        Some(serde_json::Value::String(s)) => !s.trim().is_empty(),
+        Some(serde_json::Value::Array(parts)) => parts.iter().any(|p| {
+            p.get("text")
+                .and_then(|t| t.as_str())
+                .map(|s| !s.trim().is_empty())
+                .unwrap_or(false)
+        }),
+        _ => false,
+    }
+}
+
+/// A request "should produce output" iff it allows more than one token AND at least one message
+/// carries non-whitespace text. A whitespace/empty prompt or `max_tokens<=1` can legitimately
+/// yield an empty reply, so those are exempt from the empty-completion signal (no false trip).
+fn request_expects_output(messages: &serde_json::Value, max_tokens: i32) -> bool {
+    if max_tokens <= 1 {
+        return false;
+    }
+    messages
+        .as_array()
+        .map(|arr| arr.iter().any(|m| message_has_text(m.get("content"))))
+        .unwrap_or(false)
+}
+
+/// Outcome of a canary probe. Tri-state on purpose: "inconclusive" (busy/hung/transient) must be
+/// distinguished from "recovered", because only a proven `NonEmpty` may clear quarantine — an
+/// inconclusive probe leaves a parked engine parked (it never proves recovery), and never restarts.
+enum CanaryOutcome {
+    /// Engine answered fast with EMPTY content — the zombie signature. Restart-eligible.
+    Empty,
+    /// Engine answered with real output — proven healthy. Clears quarantine.
+    NonEmpty,
+    /// Timeout or transport error — busy/hung/dead regime owned by the wedge + /health watchdogs.
+    /// A canary queued behind full `--parallel` slots lands here, so it can NOT be read as "dead"
+    /// (else an attacker could fill slots with long jobs + a few empties to force a restart) NOR as
+    /// "recovered" (else a still-dead engine could un-park on a single slow probe). Do nothing.
+    Inconclusive,
+}
+
+/// Canary probe: ask our OWN engine one fixed question with a short cap. A user cannot forge the
+/// engine's own answer, which is what makes this the ground truth that gates restart/un-park.
+async fn run_canary(engine: &InferenceEngine) -> CanaryOutcome {
+    let messages = serde_json::json!([
+        { "role": "user", "content": "Reply with the single word: ok" }
+    ]);
+    let probe = engine.chat_completion(messages, 0.0, 8, None, None);
+    match tokio::time::timeout(std::time::Duration::from_secs(20), probe).await {
+        Ok(Ok(r)) => {
+            if r.content.trim().is_empty() {
+                CanaryOutcome::Empty
+            } else {
+                CanaryOutcome::NonEmpty
+            }
+        }
+        Ok(Err(e)) => {
+            tracing::warn!("empty-completion canary errored — inconclusive (health/wedge watchdogs own this): {e}");
+            CanaryOutcome::Inconclusive
+        }
+        Err(_) => {
+            tracing::warn!("empty-completion canary timed out — inconclusive (engine busy/hung; wedge/health watchdogs own this)");
+            CanaryOutcome::Inconclusive
+        }
+    }
+}
+
 use crate::config::{self, NodeConfig};
 use crate::crypto::NodeKeypair;
 use crate::inference::{ChatMessage, InferenceEngine, InferenceEngineConfig};
@@ -133,7 +352,17 @@ fn maybe_spawn_job(
     max_jobs: u32,
     last_activity: Arc<AtomicU64>,
     completions: Arc<AtomicU64>,
+    empty_health: Arc<EmptyHealth>,
 ) {
+    // Empty-suspect quarantine: while the heartbeat loop is canary-probing (or a
+    // canary-confirmed-dead engine is parked), refuse new work so no request hits a suspect
+    // engine during the probe/restart window. Not marked seen → the orchestrator re-routes it.
+    // This closes the gap where the prior heartbeat's advertisement is still live at the
+    // orchestrator during the ≤20s canary (de-advertising alone only takes effect next heartbeat).
+    if empty_health.is_quarantined() {
+        tracing::debug!("node quarantined (empty-suspect) — deferring job {}", job.id);
+        return;
+    }
     // Atomically reserve a slot (capacity check + increment in one CAS) so
     // concurrent WS-push + REST-poll arrivals can't exceed max_jobs.
     if active_jobs
@@ -169,7 +398,7 @@ fn maybe_spawn_job(
     tracing::info!("Accepted job {} (type: {})", job.id, job.job_type);
     let job_id = job.id.clone();
     tokio::spawn(async move {
-        process_job(&client, &engine, &job, &node_secret, streaming_enabled).await;
+        process_job(&client, &engine, &job, &node_secret, streaming_enabled, &empty_health).await;
         // Release the slot ONLY if this job is still tracked. The watchdog may have already
         // abandoned it (removed it from inflight + released its slot) when the engine wedged.
         // Gating decrement + completion on inflight membership makes slot-release idempotent,
@@ -661,6 +890,9 @@ pub async fn start(
     // Monotonic count of genuinely-completed jobs — the watchdog resets its abort
     // backstop only when this advances (real progress, not a forced slot-reset).
     let completions = Arc::new(AtomicU64::new(0));
+    // Empty-completion self-heal state (shared across both dispatch paths + the heartbeat loop).
+    // Catches the "answers /health but returns 0 tokens" zombie the other watchdogs miss.
+    let empty_health = Arc::new(EmptyHealth::load(config_dir));
 
     // ── WebSocket push-dispatch (additive fast-path) ──────────────────
     // Connects to the orchestrator and processes jobs the instant they're pushed,
@@ -682,6 +914,7 @@ pub async fn start(
         let mj = effective_slots;
         let la = Arc::clone(&last_activity);
         let co = Arc::clone(&completions);
+        let eh = Arc::clone(&empty_health);
         let st = Arc::clone(&ws_state);
         let cfg_tok = cfg.clone();
         let config_dir_buf = config_dir.to_path_buf();
@@ -704,6 +937,7 @@ pub async fn start(
                         mj,
                         Arc::clone(&la),
                         Arc::clone(&co),
+                        Arc::clone(&eh),
                     );
                 },
                 move |new_tok, _exp| {
@@ -742,6 +976,22 @@ pub async fn start(
     const MAX_WEDGE_RESTARTS: u32 = 3; // restart up to this many times, THEN abort the process
     let mut wedge_restarts: u32 = 0;
     let mut last_completions: u64 = 0;
+
+    // Empty-completion self-heal (the fast-empty zombie: /health OK but 0-token replies). Unlike
+    // /health + wedge, this trip has its OWN budget + cooldown because those reset on /health OK
+    // (a zombie passes /health), so reusing them would leave the empty-loop effectively uncapped.
+    // Default ON; operators can disable with SGL_EMPTY_RESTART=0. Canary-confirmed before any
+    // restart, so it can't be weaponized by crafted client requests.
+    const EMPTY_TRIP_THRESHOLD: u32 = 3; // consecutive empty completions before we investigate
+    const MAX_EMPTY_RESTARTS: u32 = 5; // cap on empty-triggered restarts within the window below
+    const EMPTY_RESTART_MIN_INTERVAL_MS: u64 = 600_000; // >=10 min between empty restarts
+    const EMPTY_RESTART_BUDGET_WINDOW_MS: u64 = 3_600_000; // restarts older than 1h don't count
+    // Max time to stay parked on ONLY-inconclusive probes before releasing to real traffic. Bounds
+    // the alive-but-canary-slow case (which /health can't restart) so the node can't go dark forever.
+    const MAX_QUARANTINE_MS: u64 = 300_000; // 5 min
+    let empty_restart_enabled = std::env::var("SGL_EMPTY_RESTART")
+        .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+        .unwrap_or(true);
 
     // #231: advertise the node's modality once (static per engine). An embedding node reports
     // kind="embedding" + its native dim so the orchestrator routes embeddings vs chat correctly
@@ -801,11 +1051,119 @@ pub async fn start(
             }
         }
 
+        // ── empty-completion self-heal (canary-confirmed, sticky quarantine) ──
+        // The wedge watchdog above only catches busy+no-progress; the /health path only catches a
+        // dead server. A live server that returns FAST empty replies passes both, keeps advertising,
+        // and serves empties — the observed zombie. On EMPTY_TRIP_THRESHOLD consecutive empties we
+        // QUARANTINE (de-advertise + refuse new jobs) and CANARY-CONFIRM with our own probe; only a
+        // confirmed FAST-EMPTY canary restarts the engine (cause-scoped: no Vulkan→CPU swap). This
+        // turns an attacker/user-controllable signal into node-controlled ground truth. Quarantine
+        // is STICKY: a canary-confirmed-dead engine stays parked (never resumes serving empties)
+        // until a canary produces real output — even after the restart budget is exhausted. Budget +
+        // cooldown are dedicated (the crash/wedge budgets reset on /health OK → no cap here) and
+        // PERSISTED (an in-process abort() would otherwise reset them and abort-loop forever).
+        if empty_restart_enabled {
+            if let Some(ref eng) = engine {
+                // Enter when a fresh streak trips OR we're already quarantined (sticky re-check).
+                let tripped = empty_health.take_trip(EMPTY_TRIP_THRESHOLD);
+                if tripped || empty_health.is_quarantined() {
+                    let now = now_ms();
+                    // Park immediately: de-advertise AND make maybe_spawn_job refuse work while we
+                    // probe (≤20s), so no request hits a suspect engine during the window. Stamps
+                    // the park-start time on first entry (for the max-age escape below).
+                    empty_health.enter_quarantine(now);
+                    match run_canary(eng).await {
+                        CanaryOutcome::Empty => {
+                            let prior = empty_health.effective_restarts(now, EMPTY_RESTART_BUDGET_WINDOW_MS);
+                            let since = now.saturating_sub(empty_health.last_restart_ms());
+                            if prior >= MAX_EMPTY_RESTARTS {
+                                // Budget exhausted for this window: the engine is confirmed dead but
+                                // restarting isn't fixing it. STAY PARKED (quarantined) — do NOT resume
+                                // serving empties — until it recovers on its own or an operator acts.
+                                tracing::error!(
+                                    "empty-completion engine still dead after {MAX_EMPTY_RESTARTS} restarts this window — staying PARKED (de-advertised); needs operator attention"
+                                );
+                            } else if prior > 0 && since < EMPTY_RESTART_MIN_INTERVAL_MS {
+                                // Confirmed dead but within cooldown: stay parked, don't thrash-restart.
+                                tracing::warn!(
+                                    "empty-completion engine still dead but within {}s cooldown — staying parked this cycle",
+                                    EMPTY_RESTART_MIN_INTERVAL_MS / 1000
+                                );
+                            } else {
+                                tracing::error!(
+                                    "canary confirms engine produces nothing — restarting (empty-cause, no variant swap)"
+                                );
+                                // Persist the restart BEFORE restarting: an in-process restart is abort(),
+                                // which never returns, so the budget must already be on disk.
+                                empty_health.note_restart(now);
+                                let _ = eng.restart_empty().await;
+                                // Reuse the wedge path's cleanup EXACTLY: abandon inflight jobs and
+                                // release exactly that many slots (saturating). Their tasks error out
+                                // against the killed server and skip their own decrement (id already
+                                // gone), so no double-release/underflow; the orchestrator reaps them
+                                // (never completed → never billed). Stay quarantined — next cycle's
+                                // canary confirms recovery before we re-advertise.
+                                let abandoned = {
+                                    let mut g = inflight.lock().unwrap();
+                                    let n = g.len() as u32;
+                                    g.clear();
+                                    n
+                                };
+                                if abandoned > 0 {
+                                    let _ = active_jobs.fetch_update(
+                                        Ordering::SeqCst,
+                                        Ordering::SeqCst,
+                                        |c| Some(c.saturating_sub(abandoned)),
+                                    );
+                                }
+                                last_activity.store(now_ms(), Ordering::Relaxed);
+                            }
+                        }
+                        CanaryOutcome::NonEmpty => {
+                            // Proven healthy → the empties were request-shaped (or transient), not a
+                            // fault. Clear quarantine and resume advertising.
+                            tracing::info!(
+                                "empty-completion canary produced output — engine healthy; clearing quarantine"
+                            );
+                            empty_health.clear_quarantine();
+                        }
+                        CanaryOutcome::Inconclusive => {
+                            // Busy/hung/transient — neither proven dead nor proven recovered. Do NOT
+                            // restart. Normally stay quarantined and re-probe next cycle (parking
+                            // sheds new load, so the next canary usually gets through), and a truly
+                            // DEAD engine is meanwhile caught by the /health auto-restart which now
+                            // always runs. But if we've been parked on ONLY inconclusive probes past
+                            // MAX_QUARANTINE_MS (an alive-but-canary-slow engine /health won't
+                            // restart), release so real traffic re-tests it instead of going dark.
+                            let parked_ms = now.saturating_sub(empty_health.quarantined_since());
+                            if parked_ms > MAX_QUARANTINE_MS {
+                                tracing::warn!(
+                                    "empty-completion quarantine exceeded {}s on inconclusive probes — releasing to let real traffic re-test",
+                                    MAX_QUARANTINE_MS / 1000
+                                );
+                                empty_health.clear_quarantine();
+                            } else {
+                                tracing::warn!(
+                                    "empty-completion canary inconclusive — staying quarantined, re-probing next cycle"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let empty_quarantined = empty_health.is_quarantined();
+
         // Snapshot the jobs we're actually running right now (#119) so the orchestrator can
         // clear any ghost slots. Always sent (even empty) so an idle node frees its slots.
         let active_job_ids: Vec<String> = inflight.lock().unwrap().iter().cloned().collect();
 
-        let advertised: Vec<String> = if let Some(ref eng) = engine {
+        // /health supervision ALWAYS runs — even while empty-quarantined — so a quarantined engine
+        // that then dies outright is still caught by the /health auto-restart (the empty-canary
+        // returns Inconclusive on a dead engine and won't restart it, and the wedge watchdog can't
+        // fire because quarantine refuses new jobs → never busy). Quarantine only SUPPRESSES the
+        // advertisement afterward; it must not disable the crash self-heal.
+        let health_advertised: Vec<String> = if let Some(ref eng) = engine {
             if eng.is_healthy().await {
                 if unhealthy_streak > 0 {
                     tracing::info!("llama-server healthy again — resuming model advertisement");
@@ -839,6 +1197,14 @@ pub async fn start(
             }
         } else {
             models.clone()
+        };
+        // Empty-suspect (canary running, just restarted, or parked): advertise nothing so the
+        // orchestrator routes elsewhere. A zombie passes /health, so this is independent of it —
+        // but the health supervision above still ran, so a dead quarantined engine self-heals.
+        let advertised: Vec<String> = if empty_quarantined {
+            Vec::new()
+        } else {
+            health_advertised
         };
 
         match client
@@ -893,6 +1259,7 @@ pub async fn start(
                         effective_slots,
                         Arc::clone(&last_activity),
                         Arc::clone(&completions),
+                        Arc::clone(&empty_health),
                     );
                 }
             }
@@ -1076,6 +1443,7 @@ async fn process_job(
     job: &PendingJob,
     node_secret: &[u8; 32],
     streaming_enabled: bool,
+    empty_health: &EmptyHealth,
 ) {
     tracing::info!("Processing job {} (type: {})", job.id, job.job_type);
 
@@ -1129,13 +1497,13 @@ async fn process_job(
         && effective_job.job_type == "inference"
     {
         if let Some(resp_pub) = response_pubkey {
-            process_inference_stream(client, engine, &effective_job, node_secret, &resp_pub).await;
+            process_inference_stream(client, engine, &effective_job, node_secret, &resp_pub, empty_health).await;
             return;
         }
     }
 
     let result = match effective_job.job_type.as_str() {
-        "inference" => execute_inference(engine, &effective_job).await,
+        "inference" => execute_inference(engine, &effective_job, empty_health).await,
         "embedding" => execute_embedding(engine, &effective_job).await,
         _ => {
             tracing::warn!("Unsupported job type: {}", effective_job.job_type);
@@ -1440,12 +1808,16 @@ fn xml_attr<'a>(tag: &'a str, attr: &str) -> Option<&'a str> {
 async fn execute_inference(
     engine: &Option<Arc<InferenceEngine>>,
     job: &PendingJob,
+    empty_health: &EmptyHealth,
 ) -> Result<serde_json::Value, String> {
     let engine = engine
         .as_ref()
         .ok_or("No inference engine configured — start with --model-path")?;
 
     let p = parse_inference_params(job.input_payload.as_ref())?;
+    // Whether THIS request should have produced output — captured before `p.messages` is moved
+    // into the engine call, for the empty-completion health signal below.
+    let expects_output = request_expects_output(&p.messages, p.max_tokens);
     // Names of the requested tools — kept for the fallback extractor (only synthesizes calls to
     // tools the CLIENT asked for; a hallucinated name never becomes a tool_call).
     let tool_names: Vec<String> = p
@@ -1468,6 +1840,24 @@ async fn execute_inference(
     let result = engine
         .chat_completion(p.messages, p.temperature, p.max_tokens, p.tools, p.tool_choice)
         .await?;
+
+    // Empty-completion health signal (non-streaming). Content-emptiness is the signal — NOT
+    // completion_tokens, which some server builds omit (0 tokens with real content) and which a
+    // 1-EOS-token zombie would sneak past. Exempt only a genuine tool-call turn (its content is
+    // "" by design — inference.rs normalises it) and, via `expects_output`, empty-prompt /
+    // max_tokens<=1. A request that merely *offers* tools but got neither content nor a tool_call
+    // IS a zombie (agent clients always send tools — they must not be blanket-exempt). Recorded
+    // BEFORE the fallback extractor blanks content (a text tool call is non-empty here anyway).
+    // An EXEMPT request (empty prompt / max_tokens<=1) is a no-op: it proves nothing about engine
+    // health, so it must neither trip nor RESET the streak (else a client could indefinitely defer
+    // detection by interleaving max_tokens:1 health-check probes with real traffic).
+    if !expects_output {
+        // exempt — leave the streak untouched
+    } else if result.tool_calls.is_none() && result.content.trim().is_empty() {
+        empty_health.record_empty();
+    } else {
+        empty_health.record_ok();
+    }
 
     let mut content = result.content;
     let mut tool_calls = result.tool_calls;
@@ -1648,6 +2038,134 @@ mod tool_extract_tests {
     }
 }
 
+#[cfg(test)]
+mod empty_health_tests {
+    use super::{request_expects_output, EmptyHealth};
+    use serde_json::json;
+
+    // ── request_expects_output: the false-positive gate ──────────────────
+
+    #[test]
+    fn normal_prompt_expects_output() {
+        let msgs = json!([{ "role": "user", "content": "Write a haiku about the sea." }]);
+        assert!(request_expects_output(&msgs, 512));
+    }
+
+    #[test]
+    fn max_tokens_one_is_exempt() {
+        // A 1-token cap can legitimately produce an empty/EOS reply — never a zombie signal.
+        let msgs = json!([{ "role": "user", "content": "hello" }]);
+        assert!(!request_expects_output(&msgs, 1));
+    }
+
+    #[test]
+    fn whitespace_or_empty_prompt_is_exempt() {
+        assert!(!request_expects_output(&json!([{ "role": "user", "content": "   " }]), 512));
+        assert!(!request_expects_output(&json!([{ "role": "user", "content": "" }]), 512));
+        // No string content at all (e.g. only a tool/assistant scaffold) → exempt.
+        assert!(!request_expects_output(&json!([{ "role": "assistant", "content": null }]), 512));
+    }
+
+    #[test]
+    fn any_message_with_text_counts() {
+        // A system+user pair where the user carries the real ask.
+        let msgs = json!([
+            { "role": "system", "content": "" },
+            { "role": "user", "content": "Explain TCP." }
+        ]);
+        assert!(request_expects_output(&msgs, 512));
+    }
+
+    #[test]
+    fn array_of_parts_content_is_recognized() {
+        // OpenAI multimodal shape: content is an array of typed parts. A text part with real text
+        // must count as expecting output (llama-server serves these; they must not be blanket-exempt).
+        let msgs = json!([{ "role": "user", "content": [{ "type": "text", "text": "Describe this." }] }]);
+        assert!(request_expects_output(&msgs, 512));
+        // An array with only empty text is exempt.
+        let empty = json!([{ "role": "user", "content": [{ "type": "text", "text": "  " }] }]);
+        assert!(!request_expects_output(&empty, 512));
+    }
+
+    // ── EmptyHealth state machine ────────────────────────────────────────
+
+    #[test]
+    fn streak_advances_and_resets() {
+        let h = EmptyHealth::new_for_test();
+        assert_eq!(h.consecutive(), 0);
+        h.record_empty();
+        h.record_empty();
+        assert_eq!(h.consecutive(), 2);
+        // A single good (or exempt-legit-empty) reply clears the streak — no false trip on
+        // alternating empty/non-empty traffic.
+        h.record_ok();
+        assert_eq!(h.consecutive(), 0);
+        h.record_empty();
+        assert_eq!(h.consecutive(), 1);
+    }
+
+    #[test]
+    fn take_trip_consumes_only_at_threshold() {
+        let h = EmptyHealth::new_for_test();
+        h.record_empty();
+        h.record_empty();
+        // Below threshold: no trip, streak preserved.
+        assert!(!h.take_trip(3));
+        assert_eq!(h.consecutive(), 2);
+        h.record_empty();
+        assert_eq!(h.consecutive(), 3);
+        // At threshold: trips once and clears the streak.
+        assert!(h.take_trip(3));
+        assert_eq!(h.consecutive(), 0);
+        // Restart budget is independent and starts empty.
+        assert_eq!(h.restarts(), 0);
+        assert_eq!(h.last_restart_ms(), 0);
+    }
+
+    #[test]
+    fn quarantine_flag_toggles_and_stamps_entry_once() {
+        let h = EmptyHealth::new_for_test();
+        assert!(!h.is_quarantined());
+        assert_eq!(h.quarantined_since(), 0);
+        h.enter_quarantine(5_000);
+        assert!(h.is_quarantined());
+        assert_eq!(h.quarantined_since(), 5_000);
+        // Re-entering while already quarantined must NOT re-stamp — the max-age is measured from
+        // the first entry, not each re-probe cycle.
+        h.enter_quarantine(9_000);
+        assert_eq!(h.quarantined_since(), 5_000);
+        h.clear_quarantine();
+        assert!(!h.is_quarantined());
+        assert_eq!(h.quarantined_since(), 0);
+        // A fresh entry after clearing stamps the new time.
+        h.enter_quarantine(12_000);
+        assert_eq!(h.quarantined_since(), 12_000);
+    }
+
+    #[test]
+    fn note_restart_tracks_budget_and_cooldown_stamp() {
+        let h = EmptyHealth::new_for_test();
+        h.note_restart(1000);
+        assert_eq!(h.restarts(), 1);
+        assert_eq!(h.last_restart_ms(), 1000);
+        h.note_restart(700_000);
+        assert_eq!(h.restarts(), 2);
+        assert_eq!(h.last_restart_ms(), 700_000);
+    }
+
+    #[test]
+    fn effective_restarts_decays_after_window() {
+        let h = EmptyHealth::new_for_test();
+        h.note_restart(1_000_000);
+        assert_eq!(h.restarts(), 1);
+        // Within window: still counts.
+        assert_eq!(h.effective_restarts(1_500_000, 3_600_000), 1);
+        // Past the window: decays to 0 (and clears the persisted count).
+        assert_eq!(h.effective_restarts(1_000_000 + 3_600_001, 3_600_000), 0);
+        assert_eq!(h.restarts(), 0);
+    }
+}
+
 /// Streaming inference: run llama-server with streaming, seal each token batch as
 /// an ordered chunk, and POST it to the orchestrator (which relays it to the
 /// client over SSE). Each chunk's AAD binds its seq + final flag; the node also
@@ -1684,6 +2202,7 @@ async fn process_inference_stream(
     job: &PendingJob,
     node_secret: &[u8; 32],
     resp_pub: &[u8; 32],
+    empty_health: &EmptyHealth,
 ) {
     let engine = match engine {
         Some(e) => e.clone(),
@@ -1703,6 +2222,9 @@ async fn process_inference_stream(
         }
     };
     let (temperature, max_tokens) = (p.temperature, p.max_tokens);
+    // Whether THIS request should have produced output — captured before `p.messages` is moved,
+    // for the empty-completion health signal recorded at the terminal Done chunk below.
+    let expects_output = request_expects_output(&p.messages, p.max_tokens);
     // Streaming is chat-only in v1 (tool-calling uses the non-streaming path), so render the
     // opaque messages into the {role,content} shape the stream engine consumes.
     let messages: Vec<ChatMessage> = match serde_json::from_value(p.messages) {
@@ -1744,6 +2266,10 @@ async fn process_inference_stream(
 
     let mut seq: u64 = 0;
     let mut emitted_tokens: u32 = 0;
+    // Did the stream emit any NON-whitespace content? The Server engine counts a whitespace-only
+    // delta (e.g. "\n") toward emitted_tokens, so emitted_tokens>0 alone wouldn't catch a
+    // whitespace-only zombie; track real content separately for the empty-completion signal.
+    let mut emitted_nonws = false;
     let mut final_sent = false;
     let mut client_gone = false;
 
@@ -1751,6 +2277,9 @@ async fn process_inference_stream(
         match ev {
             crate::inference::StreamEvent::Delta { text, tokens } => {
                 emitted_tokens = emitted_tokens.saturating_add(tokens);
+                if !text.trim().is_empty() {
+                    emitted_nonws = true;
+                }
                 match seal_post_chunk(
                     client, &sealer, node_secret, &job.id, &eph_b58, seq, false,
                     text.as_bytes(), None,
@@ -1785,7 +2314,22 @@ async fn process_inference_stream(
                 )
                 .await
                 {
-                    Ok(_) => final_sent = true,
+                    Ok(_) => {
+                        final_sent = true;
+                        // Empty-completion health signal (streaming). `emitted_nonws` is true iff any
+                        // non-whitespace content was streamed — the streaming twin of content
+                        // emptiness, independent of whether the build reported usage. Only counted
+                        // on an accepted final (this arm); the client-gone/partial and stream-failure
+                        // paths below are NOT counted (already correct-by-construction). An EXEMPT
+                        // request is a no-op — neither trips nor resets (see the non-stream site).
+                        if !expects_output {
+                            // exempt — leave the streak untouched
+                        } else if !emitted_nonws {
+                            empty_health.record_empty();
+                        } else {
+                            empty_health.record_ok();
+                        }
+                    }
                     Err(e) => tracing::warn!("Job {} final chunk post failed: {e}", job.id),
                 }
                 break;
