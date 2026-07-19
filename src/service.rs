@@ -364,6 +364,27 @@ fn write_sandbox_profile() -> Result<String, String> {
         .ok_or_else(|| "sandbox profile path not UTF-8".to_string())
 }
 
+/// `launchctl bootout` is ASYNCHRONOUS: it returns before the agent — and its
+/// heavyweight `llama-server` child holding several GB of model in RAM — has
+/// actually exited and been released from the domain. Bootstrapping the same
+/// `Label` while the old instance is still draining makes launchd fail with
+/// "Bootstrap failed: 5: Input/output error" (seen live when lowering the
+/// context window forces a service reinstall). So: bootout, then poll the domain
+/// until the label is gone (or a timeout), before the caller bootstraps.
+#[cfg(target_os = "macos")]
+fn bootout_and_wait(target: &str) {
+    let _ = run("launchctl", &["bootout", target]);
+    // `launchctl print <target>` succeeds while the service is still loaded and
+    // fails once launchd has released it. Poll ~12s; the node normally drains in
+    // 1–3s, so this returns early in the common case.
+    for _ in 0..60 {
+        if run("launchctl", &["print", target]).is_err() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+}
+
 #[cfg(target_os = "macos")]
 fn install_macos(opts: &ServiceStartOptions) -> Result<(), String> {
     let exe = current_exe()?;
@@ -442,10 +463,34 @@ fn install_macos(opts: &ServiceStartOptions) -> Result<(), String> {
     let target = format!("{domain}/{SERVICE_LABEL}");
     let plist_str = plist.to_str().ok_or("plist path not UTF-8")?;
 
-    // Reload cleanly: bootout (ignore failure if not loaded) then bootstrap.
-    let _ = run("launchctl", &["bootout", &target]);
-    run("launchctl", &["bootstrap", &domain, plist_str])
-        .map_err(|e| format!("launchctl bootstrap failed: {e}"))?;
+    // Reload cleanly. bootout is async and the old node's llama-server child can
+    // take a few seconds to die, so wait for the label to drain, then bootstrap —
+    // and retry the whole dance if launchd still reports the label busy
+    // ("Bootstrap failed: 5: Input/output error").
+    bootout_and_wait(&target);
+    let mut bootstrap_err = String::new();
+    let mut bootstrapped = false;
+    for attempt in 0..5u64 {
+        match run("launchctl", &["bootstrap", &domain, plist_str]) {
+            Ok(_) => {
+                bootstrapped = true;
+                break;
+            }
+            Err(e) => {
+                bootstrap_err = e;
+                // The previous instance is still draining — force another teardown,
+                // back off, and retry.
+                bootout_and_wait(&target);
+                std::thread::sleep(std::time::Duration::from_millis(300 * (attempt + 1)));
+            }
+        }
+    }
+    if !bootstrapped {
+        return Err(format!(
+            "launchctl bootstrap failed after retries: {bootstrap_err} \
+             (the previous node may still be shutting down — wait a few seconds and try again)"
+        ));
+    }
     let _ = run("launchctl", &["enable", &target]);
     let _ = run("launchctl", &["kickstart", "-k", &target]);
 
