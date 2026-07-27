@@ -46,9 +46,11 @@ enum Commands {
         #[arg(long)]
         wallet: String,
 
-        /// TEE type on this machine
-        #[arg(long, default_value = "apple_se")]
-        tee_type: String,
+        /// TEE type on this machine. Detected from the hardware when omitted —
+        /// do NOT default this to apple_se, which made every Windows node claim
+        /// an Apple secure enclave.
+        #[arg(long)]
+        tee_type: Option<String>,
 
         /// Available models (comma-separated)
         #[arg(long)]
@@ -57,9 +59,11 @@ enum Commands {
 
     /// Log in via browser and register this node (recommended)
     Login {
-        /// TEE type on this machine
-        #[arg(long, default_value = "apple_se")]
-        tee_type: String,
+        /// TEE type on this machine. Detected from the hardware when omitted —
+        /// do NOT default this to apple_se, which made every Windows node claim
+        /// an Apple secure enclave.
+        #[arg(long)]
+        tee_type: Option<String>,
 
         /// Available models (comma-separated)
         #[arg(long)]
@@ -282,6 +286,9 @@ async fn main() {
             let models_vec: Vec<String> = models
                 .map(|m| m.split(',').map(|s| s.trim().to_string()).collect())
                 .unwrap_or_default();
+            // Omitted -> detect. See tee::detect_tee_type.
+            let tee_type = tee_type
+                .unwrap_or_else(|| tee::detect_tee_type(tee::detect().secure_enclave_available));
 
             if let Err(e) = node::init(
                 &config_dir,
@@ -297,6 +304,8 @@ async fn main() {
             }
         }
         Commands::Login { tee_type, models, code, wallet } => {
+            // Omitted -> detect. See tee::detect_tee_type.
+            let tee_type = tee_type.unwrap_or_else(|| tee::detect_tee_type(tee::detect().secure_enclave_available));
             let models_vec: Vec<String> = models
                 .map(|m| m.split(',').map(|s| s.trim().to_string()).collect())
                 .unwrap_or_default();

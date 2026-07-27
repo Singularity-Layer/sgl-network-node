@@ -49,6 +49,29 @@ impl HardwareAttestationReport {
     }
 }
 
+/// What confidential-compute hardware this machine actually has.
+///
+/// The CLI defaults `--tee-type` to `apple_se` on EVERY platform, so a Windows box announces
+/// itself as an Apple secure enclave. Harmless until the orchestrator began cross-checking
+/// TEE against GPU (2026-07-22), at which point every Windows registration was refused
+/// outright for three days. Report the truth instead: no enclave means `none`, which serves
+/// on the Standard tier.
+pub fn detect_tee_type(secure_enclave: bool) -> String {
+    if secure_enclave {
+        return "apple_se".to_string();
+    }
+    #[cfg(target_os = "linux")]
+    {
+        // Linux nodes run under the hardened systemd sandbox; linux_se names that tier, it
+        // is not a hardware-enclave claim.
+        return "linux_se".to_string();
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        "none".to_string()
+    }
+}
+
 pub fn detect() -> TeeCapabilities {
     let cpu_cores = std::thread::available_parallelism()
         .map(|p| p.get() as u32)
@@ -61,11 +84,7 @@ pub fn detect() -> TeeCapabilities {
     let gpu = detect_gpu_name();
 
     TeeCapabilities {
-        tee_type: if secure_enclave {
-            "apple_se".to_string()
-        } else {
-            "none".to_string()
-        },
+        tee_type: detect_tee_type(secure_enclave),
         secure_enclave_available: secure_enclave,
         chip,
         cpu_cores,
