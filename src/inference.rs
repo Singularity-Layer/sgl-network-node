@@ -1088,7 +1088,14 @@ fn qwen_template_override(model_path: &std::path::Path) -> bool {
         .file_name()
         .map(|s| s.to_string_lossy().to_lowercase())
         .unwrap_or_default();
-    name.contains("qwen") && !name.contains("r1") && !name.contains("qwq")
+    // Qwen3's GGUF template already ships a tools section AND thinking controls
+    // (enable_thinking / <think>), so it must keep its EMBEDDED --jinja template —
+    // forcing the Qwen2.5 tool template onto it would clobber the thinking behavior.
+    // Only the older Qwen2.5-family GGUFs (which lack the tools section) need the override.
+    name.contains("qwen")
+        && !name.contains("qwen3")
+        && !name.contains("r1")
+        && !name.contains("qwq")
 }
 
 /// Write the embedded template to a temp file for `--chat-template-file`.
