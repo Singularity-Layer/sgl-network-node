@@ -146,6 +146,11 @@ struct NodeCapabilities {
     // Native embedding dimension when kind == "embedding" (else omitted).
     #[serde(skip_serializing_if = "Option::is_none")]
     dim: Option<u32>,
+    // Vision (multimodal): Some(true) when this node serves an mmproj model and can accept
+    // image inputs. Omitted for text/embedding nodes so the orchestrator only routes image
+    // requests to a vision-capable node.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    vision: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -389,6 +394,8 @@ impl OrchestratorClient {
         // #231: "embedding" for an embedding node (else None → chat), + its native output dim.
         kind: Option<&str>,
         dim: Option<u32>,
+        // Vision: Some(true) when serving an mmproj (multimodal) model, else None.
+        vision: Option<bool>,
     ) -> Result<HeartbeatResponse, String> {
         let url = format!("{}/grid/nodes/heartbeat", self.base_url);
         let token = self.get_token()?;
@@ -404,6 +411,7 @@ impl OrchestratorClient {
                 context_size,
                 kind: kind.map(|s| s.to_string()),
                 dim,
+                vision,
             },
             active_job_ids,
             binary_hash,

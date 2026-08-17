@@ -726,6 +726,8 @@ pub async fn start(
     orchestrator_url: &str,
     model_path: Option<&str>,
     model_name: Option<&str>,
+    mmproj_path: Option<&str>,
+    image_max_tokens: Option<u32>,
     inference_port: u16,
     rc: &ResourceConfig,
 ) -> Result<(), String> {
@@ -794,6 +796,19 @@ pub async fn start(
             #[cfg(not(feature = "inprocess"))]
             _ => crate::inference::EngineMode::Server,
         };
+        // Vision (multimodal) requires the SERVER engine — the in-process engine can't load an
+        // mmproj. Force it whenever an mmproj is provided (even on the macOS/in-process default or
+        // an explicit SGL_ENGINE=inprocess) so a vision node actually serves images instead of
+        // silently degrading to text-only and omitting its `vision` capability.
+        let engine_mode = match engine_mode {
+            crate::inference::EngineMode::InProcess if mmproj_path.is_some() => {
+                tracing::warn!(
+                    "--mmproj-path set: using the server engine (in-process can't serve vision)"
+                );
+                crate::inference::EngineMode::Server
+            }
+            m => m,
+        };
 
         let model_pb = PathBuf::from(path);
         // Continuous batching applies to BOTH engines, sized by the same machine+model-aware
@@ -832,6 +847,8 @@ pub async fn start(
             context_size: total_ctx,
             batch_size: rc.batch_size,
             parallel_slots: effective_slots,
+            mmproj_path: mmproj_path.map(PathBuf::from),
+            image_max_tokens,
         };
         tracing::info!("Inference engine mode: {engine_mode:?}");
         let eng = InferenceEngine::create(eng_config, engine_mode).await?;
@@ -998,6 +1015,10 @@ pub async fn start(
     // and can surface embeddings separately in /v1/models. Chat nodes send neither (byte-identical).
     let embed_dim: Option<u32> = engine.as_ref().and_then(|e| e.embedding_dim());
     let node_kind: Option<&str> = if embed_dim.is_some() { Some("embedding") } else { None };
+    // Vision (multimodal): advertise `vision: true` only when actually serving an mmproj model
+    // (chat/embedding nodes omit it) so the orchestrator routes image requests only here.
+    let node_vision: Option<bool> =
+        engine.as_ref().and_then(|e| if e.is_vision() { Some(true) } else { None });
 
     loop {
         // ── #159 inference-progress watchdog ──────────────────────────────
@@ -1222,6 +1243,7 @@ pub async fn start(
                 effective_slots,
                 node_kind,
                 embed_dim,
+                node_vision,
             )
             .await
         {

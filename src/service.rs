@@ -22,6 +22,11 @@ const SERVICE_LABEL: &str = "cc.x402compute.sglnode";
 pub struct ServiceStartOptions {
     pub model_path: Option<String>,
     pub model_name: Option<String>,
+    /// Vision (multimodal) models: path to the mmproj GGUF, baked into the service so the
+    /// background node serves images across restarts. None for text/embedding models.
+    pub mmproj_path: Option<String>,
+    /// Vision only: per-image token cap (--image-max-tokens).
+    pub image_max_tokens: Option<u32>,
     pub orchestrator_url: String,
     pub resource_percent: u8,
     pub inference_port: u16,
@@ -48,6 +53,14 @@ impl ServiceStartOptions {
         if let Some(mn) = &self.model_name {
             args.push("--model-name".into());
             args.push(mn.clone());
+        }
+        if let Some(mm) = &self.mmproj_path {
+            args.push("--mmproj-path".into());
+            args.push(mm.clone());
+        }
+        if let Some(n) = self.image_max_tokens {
+            args.push("--image-max-tokens".into());
+            args.push(n.to_string());
         }
         args.push("--orchestrator-url".into());
         args.push(self.orchestrator_url.clone());
@@ -583,13 +596,14 @@ fn install_linux(opts: &ServiceStartOptions) -> Result<(), String> {
         .collect::<Vec<_>>()
         .join(" ");
 
-    // Re-expose the operator's chosen model read-only (ProtectHome=true would
-    // otherwise hide it if it lives under $HOME). "-" tolerates a missing path.
-    let model_ro = opts
-        .model_path
-        .as_ref()
-        .map(|m| format!("ReadOnlyPaths=-{m}\n"))
-        .unwrap_or_default();
+    // Re-expose the operator's chosen model (and, for vision models, its mmproj) read-only —
+    // ProtectHome=true would otherwise hide them if they live under $HOME, so llama-server
+    // couldn't open the projector on a service restart. "-" tolerates a missing path.
+    let model_ro = [opts.model_path.as_ref(), opts.mmproj_path.as_ref()]
+        .into_iter()
+        .flatten()
+        .map(|p| format!("ReadOnlyPaths=-{p}\n"))
+        .collect::<String>();
 
     let unit_body = format!(
         r#"[Unit]

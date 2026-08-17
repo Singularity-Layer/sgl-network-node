@@ -34,6 +34,13 @@ pub struct InferenceEngineConfig {
     pub context_size: u32,
     pub batch_size: u32,
     pub parallel_slots: u32,
+    /// Vision (multimodal): path to the model's mmproj (vision projector) GGUF. When set,
+    /// llama-server is launched with `--mmproj` so it accepts OpenAI image_url content. The
+    /// app/provisioner downloads + hash-verifies it (like the main GGUF) and passes the path.
+    /// Only meaningful for the server engine — the in-process engine can't do mmproj.
+    pub mmproj_path: Option<PathBuf>,
+    /// Cap on tokens a single image may cost (llama-server `--image-max-tokens`). None = default.
+    pub image_max_tokens: Option<u32>,
 }
 
 /// The original child-process engine (spawns `llama-server`, talks HTTP). Kept as one
@@ -370,6 +377,15 @@ impl ServerEngine {
         let parallel_str = self.config.parallel_slots.to_string();
 
         let model_str = self.config.model_path.to_string_lossy();
+        // Vision projector (mmproj) + optional per-image token cap. Owned here so the &str
+        // borrows live for the whole args vec. Only used on the chat path (below the embed
+        // early-return), so an embedding model never gets --mmproj.
+        let mmproj_str = self
+            .config
+            .mmproj_path
+            .as_ref()
+            .map(|p| p.to_string_lossy().into_owned());
+        let image_max_tokens_str = self.config.image_max_tokens.map(|n| n.to_string());
         // Embedding mode (non-`inprocess` builds, e.g. Windows): llama-server pools the
         // hidden states itself. c/b/ub are all sized to the model's max input — pooled
         // (non-causal) models require the WHOLE sequence to fit in one ubatch, and BERT
@@ -439,7 +455,24 @@ impl ServerEngine {
             args.push("--chat-template-file");
             args.push(p);
         }
+        // Vision: load the mmproj so llama-server accepts image content on /v1/chat/completions.
+        // Guarded by mmproj_path being set (a vision model + a verified projector on disk).
+        if let Some(mm) = &mmproj_str {
+            args.push("--mmproj");
+            args.push(mm);
+            if let Some(n) = &image_max_tokens_str {
+                args.push("--image-max-tokens");
+                args.push(n);
+            }
+        }
         self.spawn_server(&llama_server, &args).await
+    }
+
+    /// True when this engine is serving a vision (multimodal) model — an mmproj is loaded
+    /// and it is a chat (not embedding) model. Drives the node's `vision` heartbeat capability
+    /// so the orchestrator only routes image requests here.
+    pub fn is_vision(&self) -> bool {
+        self.embed_spec.is_none() && self.config.mmproj_path.is_some()
     }
 
     /// Spawn llama-server with the given args, stream its stderr into tracing, store the
@@ -930,6 +963,18 @@ impl InferenceEngine {
             InferenceEngine::Embed(_) => true,
             #[cfg(feature = "inprocess")]
             InferenceEngine::InProcess(_) => false,
+        }
+    }
+
+    /// True iff this engine serves a vision (multimodal) model. Only the server engine can —
+    /// the in-process (Mac) engine has no mmproj support, and embedding engines never do.
+    pub fn is_vision(&self) -> bool {
+        match self {
+            InferenceEngine::Server(e) => e.is_vision(),
+            #[cfg(feature = "inprocess")]
+            InferenceEngine::InProcess(_) => false,
+            #[cfg(feature = "inprocess")]
+            InferenceEngine::Embed(_) => false,
         }
     }
 

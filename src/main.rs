@@ -89,6 +89,16 @@ enum Commands {
         #[arg(long)]
         model_name: Option<String>,
 
+        /// Vision (multimodal) models only: path to the mmproj (vision projector) GGUF.
+        /// When set, llama-server accepts image inputs. The app/provisioner downloads +
+        /// hash-verifies it alongside the model (same discipline as --model-path).
+        #[arg(long)]
+        mmproj_path: Option<String>,
+
+        /// Vision only: cap the tokens a single image may cost (llama-server --image-max-tokens).
+        #[arg(long)]
+        image_max_tokens: Option<u32>,
+
         /// Port for local llama-server (default: 8081)
         #[arg(long, default_value = "8081")]
         inference_port: u16,
@@ -223,6 +233,14 @@ enum ServiceAction {
         #[arg(long)]
         model_name: Option<String>,
 
+        /// Vision (multimodal) models only: path to the mmproj (vision projector) GGUF.
+        #[arg(long)]
+        mmproj_path: Option<String>,
+
+        /// Vision only: cap the tokens a single image may cost (--image-max-tokens).
+        #[arg(long)]
+        image_max_tokens: Option<u32>,
+
         /// Percentage of system resources to dedicate (1-100)
         #[arg(long, default_value = "50", value_parser = clap::value_parser!(u8).range(1..=100))]
         resource_percent: u8,
@@ -330,6 +348,8 @@ async fn main() {
         Commands::Start {
             model_path,
             model_name,
+            mmproj_path,
+            image_max_tokens,
             inference_port,
             resource_percent,
             threads,
@@ -359,6 +379,8 @@ async fn main() {
                 &cli.orchestrator_url,
                 model_path.as_deref(),
                 model_name.as_deref(),
+                mmproj_path.as_deref(),
+                image_max_tokens,
                 inference_port,
                 &rc,
             )
@@ -440,6 +462,8 @@ async fn main() {
                 ServiceAction::Install {
                     model_path,
                     model_name,
+                    mmproj_path,
+                    image_max_tokens,
                     resource_percent,
                     inference_port,
                     max_jobs,
@@ -451,6 +475,8 @@ async fn main() {
                     let opts = service::ServiceStartOptions {
                         model_path,
                         model_name,
+                        mmproj_path,
+                        image_max_tokens,
                         orchestrator_url: cli.orchestrator_url.clone(),
                         resource_percent,
                         inference_port,
