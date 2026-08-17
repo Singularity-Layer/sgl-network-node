@@ -18,8 +18,10 @@ use std::io::Cursor;
 use std::path::{Path, PathBuf};
 
 /// Pinned llama.cpp release. Bump the tag + all three hashes together after vetting a new build.
-/// Hashes verified against ggml-org/llama.cpp release assets on 2026-07-10.
-const LLAMA_TAG: &str = "b9949";
+/// Hashes verified against ggml-org/llama.cpp release assets on 2026-08-17.
+/// b10419 adds the qwen3_5 arch (Qwen3-VL / Qwen3.8) while still serving Qwen2.5-VL — verified
+/// locally against the qwen2.5-vl-3b vision model before this bump.
+const LLAMA_TAG: &str = "b10419";
 
 struct Asset {
     /// Release asset filename.
@@ -37,14 +39,14 @@ fn asset_for(cpu_only: bool) -> Option<Asset> {
     {
         return Some(if cpu_only {
             Asset {
-                name: "llama-b9949-bin-win-cpu-x64.zip",
-                sha256: "68d98d746236099f8ef08588a42d54a965631919a277a659b83914fb67802c24",
+                name: "llama-b10419-bin-win-cpu-x64.zip",
+                sha256: "f72735759c13df57e24bcca6a65e6cc77897a710d12a79261fad4b311c9d59db",
                 is_zip: true,
             }
         } else {
             Asset {
-                name: "llama-b9949-bin-win-vulkan-x64.zip",
-                sha256: "4f03b4646d8537798445399a679eb7b30b0a32da8158433fa80a09ad336fc04d",
+                name: "llama-b10419-bin-win-vulkan-x64.zip",
+                sha256: "dd4b896fa8a85eb59a8eafe03f096c0a52848c8e46840f1d815d063696b610b9",
                 is_zip: true,
             }
         });
@@ -54,8 +56,8 @@ fn asset_for(cpu_only: bool) -> Option<Asset> {
         // Linux ships CPU inside the vulkan tarball too; one artifact covers both.
         let _ = cpu_only;
         return Some(Asset {
-            name: "llama-b9949-bin-ubuntu-vulkan-x64.tar.gz",
-            sha256: "619620947b2c6253573ac3d026c3b377d8d1a3631fe43be3e06daf0d8322e46d",
+            name: "llama-b10419-bin-ubuntu-vulkan-x64.tar.gz",
+            sha256: "b95c5138625862b4ffa677153a1d7656a14222734e84d2c68bff90b192b6fe63",
             is_zip: false,
         });
     }
