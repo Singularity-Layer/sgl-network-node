@@ -1150,6 +1150,10 @@ fn write_qwen_tools_template() -> Result<String, String> {
     Ok(p.to_string_lossy().into_owned())
 }
 
+// Helper fns intentionally live below this module; reordering a 1.2k-line file to
+// satisfy an organizational lint would churn history for no behavioural gain.
+// Allowed narrowly so `clippy -D warnings` can gate on lints that actually matter.
+#[allow(clippy::items_after_test_module)]
 #[cfg(test)]
 mod template_override_tests {
     use super::qwen_template_override;
