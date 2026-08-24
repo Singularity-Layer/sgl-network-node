@@ -789,6 +789,9 @@ pub async fn start(
         // llama-server child that can die while the wrapper heartbeats "healthy", killing
         // the zombie-node class by design). SGL_ENGINE=server remains the escape hatch.
         // Builds without the feature (Linux, for now) default to the server engine.
+        let engine_explicit = std::env::var("SGL_ENGINE")
+            .map(|s| !s.is_empty())
+            .unwrap_or(false);
         let engine_mode = match std::env::var("SGL_ENGINE").ok().as_deref() {
             Some(s) if !s.is_empty() => crate::inference::EngineMode::parse(s)?,
             #[cfg(feature = "inprocess")]
@@ -851,7 +854,29 @@ pub async fn start(
             image_max_tokens,
         };
         tracing::info!("Inference engine mode: {engine_mode:?}");
-        let eng = InferenceEngine::create(eng_config, engine_mode).await?;
+        // New-arch fallback: the embedded llama.cpp (llama-cpp-2 crate) trails the
+        // llama-server pin, so a model whose arch landed upstream recently (e.g.
+        // muse-glimmer needs >= b10353) loads fine under the server engine but fails
+        // in-process. When the DEFAULTED in-process engine can't create, retry once
+        // as a server child instead of dying. Deliberately narrow: an EXPLICIT
+        // SGL_ENGINE=inprocess still fails loudly (operator asked for that engine),
+        // and embedding models are excluded — create() routes them to the dedicated
+        // embed engine before engine_mode applies, so their failures are unrelated.
+        let eng = match InferenceEngine::create(eng_config.clone(), engine_mode).await {
+            Ok(e) => e,
+            Err(err)
+                if engine_mode == crate::inference::EngineMode::InProcess
+                    && !engine_explicit
+                    && !crate::embed_catalog::is_embedding_model(&eng_config.model_name) =>
+            {
+                tracing::warn!(
+                    "In-process engine failed to load {name} ({err}) — retrying with the \
+                     server engine (llama-server carries newer model archs)"
+                );
+                InferenceEngine::create(eng_config, crate::inference::EngineMode::Server).await?
+            }
+            Err(err) => return Err(err),
+        };
         models.push(name);
         engine = Some(Arc::new(eng));
         tracing::info!("Inference engine ready ({engine_mode:?})");

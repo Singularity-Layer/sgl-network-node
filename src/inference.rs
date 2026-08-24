@@ -25,6 +25,7 @@ fn retryable_inference_transport_error(err: &reqwest::Error) -> bool {
     err.is_connect() || err.is_timeout()
 }
 
+#[derive(Clone)]
 pub struct InferenceEngineConfig {
     pub model_path: PathBuf,
     pub model_name: String,
