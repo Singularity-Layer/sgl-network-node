@@ -1227,21 +1227,27 @@ fn find_llama_server() -> Result<String, String> {
 
     #[cfg(not(windows))]
     {
-        let candidates = [
-            "llama-server",
-            "llama-cli",
-            "/usr/local/bin/llama-server",
-            #[cfg(target_os = "macos")]
-            "/opt/homebrew/bin/llama-server",
-            // Headless Linux GPU machines (one-click deploys): cloud-init installs a
-            // pinned CUDA llama-server here.
-            #[cfg(target_os = "linux")]
-            "/opt/sgl/bin/llama-server",
-        ];
+        let mut candidates: Vec<String> = Vec::new();
+        // The `sgl setup`-installed, hash-VERIFIED pinned build FIRST — same rule as
+        // Windows above. On macOS this is what the engine fallback self-provisions;
+        // without this ordering a stale Homebrew llama-server (predating a model's
+        // arch) would shadow the managed copy and the fallback would fail anyway.
+        if let Some(local) = dirs::data_local_dir() {
+            candidates.push(local.join("sgl-node").join("bin").join("llama-server").to_string_lossy().into_owned());
+        }
+        candidates.push("llama-server".to_string());
+        candidates.push("llama-cli".to_string());
+        candidates.push("/usr/local/bin/llama-server".to_string());
+        #[cfg(target_os = "macos")]
+        candidates.push("/opt/homebrew/bin/llama-server".to_string());
+        // Headless Linux GPU machines (one-click deploys): cloud-init installs a
+        // pinned CUDA llama-server here.
+        #[cfg(target_os = "linux")]
+        candidates.push("/opt/sgl/bin/llama-server".to_string());
 
         for cmd in &candidates {
             if Command::new(cmd).arg("--help").output().is_ok() {
-                return Ok(cmd.to_string());
+                return Ok(cmd.clone());
             }
         }
 

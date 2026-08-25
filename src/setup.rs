@@ -32,9 +32,22 @@ struct Asset {
     is_zip: bool,
 }
 
-/// The asset to install for (os, variant). Returns None on unsupported platforms (e.g. macOS,
-/// which installs llama.cpp via Homebrew).
+/// The asset to install for (os, variant). Returns None on unsupported platforms
+/// (e.g. Intel macOS — Apple-Silicon Macs self-provision below).
 fn asset_for(cpu_only: bool) -> Option<Asset> {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    {
+        // Metal build. Self-provisioned so app-only operators never need Homebrew —
+        // and so a STALE brew llama-server (predating a model's arch, e.g. muse-glimmer
+        // needs >= b10353) can't sabotage the in-process → server fallback: the managed
+        // pinned copy is found FIRST (see find_llama_server()).
+        let _ = cpu_only;
+        return Some(Asset {
+            name: "llama-b10419-bin-macos-arm64.tar.gz",
+            sha256: "10e16c9092b193b26b02326079776c7b5605e67b70e21d3230e9970b1cccb0c0",
+            is_zip: false,
+        });
+    }
     #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
     {
         return Some(if cpu_only {
@@ -77,6 +90,31 @@ fn install_dir() -> Result<PathBuf, String> {
 /// The llama-server executable name for this platform.
 fn server_exe() -> &'static str {
     if cfg!(windows) { "llama-server.exe" } else { "llama-server" }
+}
+
+/// Is the managed (hash-verified, pinned) llama-server installed, LAUNCHABLE, and at
+/// the pinned build? Existence alone is not health (Codex HIGH): a copy with a broken
+/// dylib chain spawns and dies, and a stale earlier pin can't load newer model archs —
+/// both must read as unhealthy so the engine fallback repairs via `run()` (which
+/// reinstalls over an existing dir through the atomic staging promote). A future
+/// `--version` format change also reads unhealthy — failing toward reinstall is safe.
+pub fn managed_server_healthy() -> bool {
+    let Ok(dir) = install_dir() else { return false };
+    let exe = dir.join(server_exe());
+    if !exe.exists() {
+        return false;
+    }
+    let Ok(out) = std::process::Command::new(&exe).arg("--version").output() else { return false };
+    if !out.status.success() {
+        return false;
+    }
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // e.g. "version: 0.1.0-dev (build 10419, commit …)" — match the pinned build number.
+    text.contains(&format!("build {}", LLAMA_TAG.trim_start_matches('b')))
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -417,11 +455,27 @@ fn extract_tar_gz(bytes: &[u8], dir: &Path) -> Result<usize, String> {
     let gz = flate2::read::GzDecoder::new(Cursor::new(bytes));
     let mut tar = tar::Archive::new(gz);
     let mut count = 0usize;
+    // Symlink entries, MATERIALIZED as file copies after the real files land. The
+    // macOS dist ships its dylibs behind symlink chains (libggml.dylib → libggml.0.dylib
+    // → libggml.0.19.0.dylib); skipping them left llama-server unable to dyld-load
+    // @rpath/libllama-common.0.dylib (caught live by the launch check, 2026-08-25).
+    // Copies, not links: a link can't collide with or escape the install dir, and a
+    // real-file name always wins (we never overwrite an extracted file with a link).
+    let mut links: Vec<(std::ffi::OsString, std::ffi::OsString)> = Vec::new();
     for entry in tar.entries().map_err(|e| format!("Bad tar: {e}"))? {
         let mut entry = entry.map_err(|e| format!("Tar entry: {e}"))?;
-        // Regular files only — skip dirs, symlinks, hardlinks, and special entries (Codex LOW:
-        // a symlink/hardlink could otherwise collide with an expected basename).
-        if !entry.header().entry_type().is_file() {
+        let et = entry.header().entry_type();
+        if et.is_symlink() {
+            let path = entry.path().map_err(|e| format!("Tar path: {e}"))?.into_owned();
+            let (Some(fname), Ok(Some(target))) = (path.file_name(), entry.link_name()) else { continue };
+            // Basenames only — both the link name and its target resolve inside `dir`.
+            let Some(tname) = target.file_name() else { continue };
+            links.push((fname.to_os_string(), tname.to_os_string()));
+            continue;
+        }
+        // Regular files only — skip dirs, hardlinks, and special entries (Codex LOW:
+        // a hardlink could otherwise collide with an expected basename).
+        if !et.is_file() {
             continue;
         }
         let path = entry.path().map_err(|e| format!("Tar path: {e}"))?.into_owned();
@@ -431,6 +485,30 @@ fn extract_tar_gz(bytes: &[u8], dir: &Path) -> Result<usize, String> {
             std::fs::File::create(&out).map_err(|e| format!("Write {}: {e}", out.display()))?;
         std::io::copy(&mut entry, &mut f).map_err(|e| format!("Extract {}: {e}", out.display()))?;
         count += 1;
+    }
+    // Resolve link chains in passes: each pass copies links whose target already
+    // exists; chained links resolve once their target materializes. Bounded by
+    // links.len() passes; unresolved leftovers (dangling targets) are skipped.
+    let mut pending = links;
+    for _ in 0..=pending.len() {
+        if pending.is_empty() { break; }
+        let mut still: Vec<(std::ffi::OsString, std::ffi::OsString)> = Vec::new();
+        let mut progressed = false;
+        for (name, target) in pending {
+            let out = dir.join(&name);
+            let src = dir.join(&target);
+            if out.exists() {
+                progressed = true; // real file (or earlier copy) already owns this name
+            } else if src.exists() {
+                std::fs::copy(&src, &out).map_err(|e| format!("Materialize {}: {e}", out.display()))?;
+                count += 1;
+                progressed = true;
+            } else {
+                still.push((name, target));
+            }
+        }
+        pending = still;
+        if !progressed { break; }
     }
     Ok(count)
 }

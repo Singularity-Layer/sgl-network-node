@@ -873,6 +873,18 @@ pub async fn start(
                     "In-process engine failed to load {name} ({err}) — retrying with the \
                      server engine (llama-server carries newer model archs)"
                 );
+                // macOS self-provisioning: the server retry needs a llama-server whose
+                // llama.cpp is at least as new as our pin — a stale Homebrew copy would
+                // fail on the same new arch that broke in-process. Install the managed,
+                // hash-verified pinned build (one-time ~11 MB) so app-only operators
+                // never touch Homebrew. Best-effort: if the download fails we still
+                // retry with whatever find_llama_server() can locate.
+                #[cfg(target_os = "macos")]
+                if !crate::setup::managed_server_healthy() {
+                    if let Err(e) = crate::setup::run(false).await {
+                        tracing::warn!("llama.cpp self-provision failed ({e}) — trying existing installs");
+                    }
+                }
                 InferenceEngine::create(eng_config, crate::inference::EngineMode::Server).await?
             }
             Err(err) => return Err(err),
