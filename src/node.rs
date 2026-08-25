@@ -189,6 +189,195 @@ fn request_expects_output(messages: &serde_json::Value, max_tokens: i32) -> bool
         .unwrap_or(false)
 }
 
+fn is_homura_model(job: &PendingJob) -> bool {
+    job.model
+        .as_deref()
+        .map(|m| {
+            let id = m.to_ascii_lowercase();
+            id == "homura-30b" || id.contains("homura")
+        })
+        .unwrap_or(false)
+}
+
+fn homura_envelope_prefix_is_valid(prefix: &str) -> bool {
+    let lower = prefix.to_ascii_lowercase();
+    let mut s = lower.trim();
+    if let Some(rest) = s.strip_prefix("<|start|>") {
+        s = rest.trim_start();
+    }
+    if let Some(rest) = s.strip_prefix("assistant") {
+        s = rest.trim_start();
+    }
+    let Some(rest) = s.strip_prefix("to=") else {
+        return false;
+    };
+    let role_len = rest
+        .char_indices()
+        .find_map(|(i, ch)| {
+            if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
+                None
+            } else {
+                Some(i)
+            }
+        })
+        .unwrap_or(rest.len());
+    if role_len == 0 {
+        return false;
+    }
+    let tail = rest[role_len..].trim();
+    tail.is_empty()
+        || tail.starts_with("<|channel|>")
+        || tail.split_whitespace().all(|part| {
+            part.starts_with("<|channel|>")
+                || part
+                    .chars()
+                    .all(|c| c.is_ascii_alphabetic() || c == '_')
+        })
+}
+
+fn homura_prefix_might_be_envelope(s: &str) -> bool {
+    let lower = s.trim_start().to_ascii_lowercase();
+    if lower.is_empty() {
+        return true;
+    }
+    ["to=", "<|start|>", "assistant to="]
+        .iter()
+        .any(|start| start.starts_with(&lower) || lower.starts_with(start))
+}
+
+fn find_homura_terminal(s: &str) -> Option<usize> {
+    ["<|eot|>", "<|end|>"]
+        .iter()
+        .filter_map(|marker| s.find(marker))
+        .min()
+}
+
+fn strip_homura_message_envelope(content: &str) -> String {
+    let trimmed = content.trim();
+    let Some(message_pos) = trimmed.find("<|message|>") else {
+        return content.to_string();
+    };
+    if !homura_envelope_prefix_is_valid(&trimmed[..message_pos]) {
+        return content.to_string();
+    }
+    let mut body = &trimmed[message_pos + "<|message|>".len()..];
+    if let Some(end) = find_homura_terminal(body) {
+        body = &body[..end];
+    }
+    body.trim().to_string()
+}
+
+enum HomuraStreamMode {
+    Prefix,
+    Body,
+    Passthrough,
+    Done,
+}
+
+struct HomuraStreamCleaner {
+    mode: HomuraStreamMode,
+    buf: String,
+}
+
+impl HomuraStreamCleaner {
+    fn new() -> Self {
+        Self {
+            mode: HomuraStreamMode::Prefix,
+            buf: String::new(),
+        }
+    }
+
+    fn push(&mut self, text: &str) -> String {
+        if matches!(self.mode, HomuraStreamMode::Done) {
+            return String::new();
+        }
+        self.buf.push_str(text);
+        match self.mode {
+            HomuraStreamMode::Prefix => self.drain_prefix(),
+            HomuraStreamMode::Body => self.drain_body(false),
+            HomuraStreamMode::Passthrough => std::mem::take(&mut self.buf),
+            HomuraStreamMode::Done => String::new(),
+        }
+    }
+
+    fn finish(&mut self) -> String {
+        match self.mode {
+            HomuraStreamMode::Done => String::new(),
+            HomuraStreamMode::Prefix => {
+                let out = self.drain_prefix();
+                if out.is_empty() {
+                    std::mem::take(&mut self.buf)
+                } else {
+                    out + &self.drain_body(true)
+                }
+            }
+            HomuraStreamMode::Body => self.drain_body(true),
+            HomuraStreamMode::Passthrough => std::mem::take(&mut self.buf),
+        }
+    }
+
+    fn drain_prefix(&mut self) -> String {
+        let trim_bytes = self.buf.len() - self.buf.trim_start().len();
+        let visible = &self.buf[trim_bytes..];
+        if let Some(message_pos) = visible.find("<|message|>") {
+            if homura_envelope_prefix_is_valid(&visible[..message_pos]) {
+                let body_start = trim_bytes + message_pos + "<|message|>".len();
+                self.buf = self.buf[body_start..].trim_start().to_string();
+                self.mode = HomuraStreamMode::Body;
+                return self.drain_body(false);
+            }
+        }
+        if homura_prefix_might_be_envelope(visible) && visible.len() <= 512 {
+            return String::new();
+        }
+        self.mode = HomuraStreamMode::Passthrough;
+        std::mem::take(&mut self.buf)
+    }
+
+    fn drain_body(&mut self, flush_tail: bool) -> String {
+        if let Some(end) = find_homura_terminal(&self.buf) {
+            let out = self.buf[..end].trim_end().to_string();
+            self.buf.clear();
+            self.mode = HomuraStreamMode::Done;
+            return out;
+        }
+        if flush_tail {
+            return drain_body_flush_tail(&mut self.buf);
+        }
+        drain_all_but_marker_tail(&mut self.buf)
+    }
+}
+
+fn homura_terminal_prefix_tail_len(buf: &str) -> usize {
+    ["<|eot|>", "<|end|>"]
+        .iter()
+        .flat_map(|marker| (1..marker.len()).map(move |n| &marker[..n]))
+        .filter(|prefix| buf.ends_with(*prefix))
+        .map(str::len)
+        .max()
+        .unwrap_or(0)
+}
+
+fn drain_body_flush_tail(buf: &mut String) -> String {
+    let hold = homura_terminal_prefix_tail_len(buf);
+    let split_at = buf.len().saturating_sub(hold);
+    let out = buf[..split_at].to_string();
+    buf.clear();
+    out
+}
+
+fn drain_all_but_marker_tail(buf: &mut String) -> String {
+    let hold = homura_terminal_prefix_tail_len(buf);
+    if hold == buf.len() {
+        return String::new();
+    }
+    let split_at = buf.len() - hold;
+    let tail = buf[split_at..].to_string();
+    let out = buf[..split_at].to_string();
+    *buf = tail;
+    out
+}
+
 /// Outcome of a canary probe. Tri-state on purpose: "inconclusive" (busy/hung/transient) must be
 /// distinguished from "recovered", because only a proven `NonEmpty` may clear quarantine — an
 /// inconclusive probe leaves a parked engine parked (it never proves recovery), and never restarts.
@@ -1900,27 +2089,34 @@ async fn execute_inference(
         .chat_completion(p.messages, p.temperature, p.max_tokens, p.tools, p.tool_choice)
         .await?;
 
+    let homura_model = is_homura_model(job);
+    let mut content = result.content;
+    let mut tool_calls = result.tool_calls;
+    let mut finish_reason = result.finish_reason;
+    if homura_model {
+        content = strip_homura_message_envelope(&content);
+    }
     // Empty-completion health signal (non-streaming). Content-emptiness is the signal — NOT
     // completion_tokens, which some server builds omit (0 tokens with real content) and which a
     // 1-EOS-token zombie would sneak past. Exempt only a genuine tool-call turn (its content is
     // "" by design — inference.rs normalises it) and, via `expects_output`, empty-prompt /
     // max_tokens<=1. A request that merely *offers* tools but got neither content nor a tool_call
-    // IS a zombie (agent clients always send tools — they must not be blanket-exempt). Recorded
-    // BEFORE the fallback extractor blanks content (a text tool call is non-empty here anyway).
+    // IS a zombie (agent clients always send tools — they must not be blanket-exempt). For HOMURA,
+    // check AFTER protocol cleanup so a reply containing only `to=user<|message|><|eot|>` cannot
+    // become a billed blank success.
     // An EXEMPT request (empty prompt / max_tokens<=1) is a no-op: it proves nothing about engine
     // health, so it must neither trip nor RESET the streak (else a client could indefinitely defer
     // detection by interleaving max_tokens:1 health-check probes with real traffic).
     if !expects_output {
         // exempt — leave the streak untouched
-    } else if result.tool_calls.is_none() && result.content.trim().is_empty() {
+    } else if tool_calls.is_none() && content.trim().is_empty() {
         empty_health.record_empty();
+        if homura_model {
+            return Err("Inference produced no user-visible output after HOMURA protocol cleanup".to_string());
+        }
     } else {
         empty_health.record_ok();
     }
-
-    let mut content = result.content;
-    let mut tool_calls = result.tool_calls;
-    let mut finish_reason = result.finish_reason;
     // Tolerant fallback: model emitted the tool call as text → synthesize structured tool_calls.
     if tools_requested && tool_calls.is_none() {
         if let Some(tc) = extract_text_tool_calls(&content, &tool_names, &job.id) {
@@ -2094,6 +2290,62 @@ mod tool_extract_tests {
             "j"
         )
         .is_none());
+    }
+}
+
+#[cfg(test)]
+mod homura_normalizer_tests {
+    use super::{strip_homura_message_envelope, HomuraStreamCleaner};
+
+    #[test]
+    fn strips_plain_homura_message_envelope() {
+        assert_eq!(
+            strip_homura_message_envelope(
+                "to=user<|message|>Hey fam! What's spinning in your head lately?<|eot|>",
+            ),
+            "Hey fam! What's spinning in your head lately?"
+        );
+    }
+
+    #[test]
+    fn strips_start_and_channel_envelope() {
+        assert_eq!(
+            strip_homura_message_envelope(
+                "<|start|>assistant to=user <|channel|>final <|message|>Hi there<|end|>",
+            ),
+            "Hi there"
+        );
+    }
+
+    #[test]
+    fn leaves_normal_text_untouched() {
+        let text = "Here is a literal token later: to=user<|message|>, not an envelope.";
+        assert_eq!(strip_homura_message_envelope(text), text);
+    }
+
+    #[test]
+    fn stream_cleaner_strips_split_prefix_and_terminal() {
+        let mut c = HomuraStreamCleaner::new();
+        assert_eq!(c.push("to=us"), "");
+        assert_eq!(c.push("er<|mess"), "");
+        assert_eq!(c.push("age|>Hey fam"), "Hey fam");
+        assert_eq!(c.push("! What's up?<|e"), "! What's up?");
+        assert_eq!(c.push("ot|> ignored"), "");
+        assert_eq!(c.finish(), "");
+    }
+
+    #[test]
+    fn stream_cleaner_passes_non_enveloped_text() {
+        let mut c = HomuraStreamCleaner::new();
+        assert_eq!(c.push("Hello there"), "Hello there");
+        assert_eq!(c.finish(), "");
+    }
+
+    #[test]
+    fn stream_cleaner_drops_partial_terminal_on_finish() {
+        let mut c = HomuraStreamCleaner::new();
+        assert_eq!(c.push("to=user<|message|>Hello<|e"), "Hello");
+        assert_eq!(c.finish(), "");
     }
 }
 
@@ -2331,17 +2583,27 @@ async fn process_inference_stream(
     let mut emitted_nonws = false;
     let mut final_sent = false;
     let mut client_gone = false;
+    let mut homura_cleaner = is_homura_model(job).then(HomuraStreamCleaner::new);
+    let mut stream_failure_reason: Option<String> = None;
 
     while let Some(ev) = rx.recv().await {
         match ev {
             crate::inference::StreamEvent::Delta { text, tokens } => {
                 emitted_tokens = emitted_tokens.saturating_add(tokens);
-                if !text.trim().is_empty() {
+                let out_text = if let Some(cleaner) = homura_cleaner.as_mut() {
+                    cleaner.push(&text)
+                } else {
+                    text
+                };
+                if out_text.is_empty() {
+                    continue;
+                }
+                if !out_text.trim().is_empty() {
                     emitted_nonws = true;
                 }
                 match seal_post_chunk(
                     client, &sealer, node_secret, &job.id, &eph_b58, seq, false,
-                    text.as_bytes(), None,
+                    out_text.as_bytes(), None,
                 )
                 .await
                 {
@@ -2361,6 +2623,39 @@ async fn process_inference_stream(
                 prompt_tokens,
                 completion_tokens,
             } => {
+                if let Some(cleaner) = homura_cleaner.as_mut() {
+                    let tail = cleaner.finish();
+                    if !tail.is_empty() {
+                        if !tail.trim().is_empty() {
+                            emitted_nonws = true;
+                        }
+                        match seal_post_chunk(
+                            client, &sealer, node_secret, &job.id, &eph_b58, seq, false,
+                            tail.as_bytes(), None,
+                        )
+                        .await
+                        {
+                            Ok(false) => seq += 1,
+                            Ok(true) => {
+                                client_gone = true;
+                                break;
+                            }
+                            Err(e) => {
+                                tracing::warn!("Job {} cleanup tail chunk post failed: {e}", job.id);
+                                client_gone = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+                if homura_cleaner.is_some() && expects_output && !emitted_nonws {
+                    empty_health.record_empty();
+                    stream_failure_reason = Some(
+                        "Inference produced no user-visible output after HOMURA protocol cleanup"
+                            .to_string(),
+                    );
+                    break;
+                }
                 let usage = serde_json::json!({
                     "prompt_tokens": prompt_tokens,
                     "completion_tokens": completion_tokens,
@@ -2430,10 +2725,20 @@ async fn process_inference_stream(
 
     // Generation failure (upstream EOF without [DONE], or the final post failed) —
     // abort the client stream and fail the job. NO billing.
-    let inf_res = inf
-        .await
-        .unwrap_or_else(|_| Err("inference task panicked".to_string()));
-    let reason = inf_res.err().unwrap_or_else(|| "stream ended without completion".to_string());
+    let reason = match stream_failure_reason {
+        Some(reason) => {
+            let _ = inf.await;
+            reason
+        }
+        None => {
+            let inf_res = inf
+                .await
+                .unwrap_or_else(|_| Err("inference task panicked".to_string()));
+            inf_res
+                .err()
+                .unwrap_or_else(|| "stream ended without completion".to_string())
+        }
+    };
     if let Err(e) = client.report_stream_error(&job.id).await {
         tracing::warn!("stream error report failed for {}: {e}", job.id);
         let _ = client.fail_job(&job.id, &format!("stream failed: {reason}")).await;

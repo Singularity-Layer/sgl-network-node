@@ -1698,7 +1698,7 @@ dependencies = [
 
 [[package]]
 name = "sgl-node"
-version = "1.9.4"
+version = "1.9.5"
 dependencies = [
  "base64",
  "bs58",
