@@ -498,18 +498,31 @@ impl OrchestratorClient {
     /// Fetch this node's per-model prices + the allowed band (public endpoint).
     pub async fn get_prices(&self, node_id: &str) -> Result<serde_json::Value, String> {
         let url = format!("{}/grid/nodes/{}/prices", self.base_url, enc_seg(node_id));
-        let resp = self.client.get(&url).send().await.map_err(|e| format!("Price fetch failed: {e}"))?;
+        let resp = self
+            .client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| format!("Price fetch failed: {e}"))?;
         if !resp.status().is_success() {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
             return Err(format!("Price fetch failed ({status}): {text}"));
         }
-        resp.json().await.map_err(|e| format!("Bad price response: {e}"))
+        resp.json()
+            .await
+            .map_err(|e| format!("Bad price response: {e}"))
     }
 
     /// Set a custom per-token price for a model this node serves (X-Node-Auth; the
     /// orchestrator enforces the allowed band). Prices are USD per 1M tokens.
-    pub async fn set_price(&self, node_id: &str, model: &str, input_per_m: f64, output_per_m: f64) -> Result<(), String> {
+    pub async fn set_price(
+        &self,
+        node_id: &str,
+        model: &str,
+        input_per_m: f64,
+        output_per_m: f64,
+    ) -> Result<(), String> {
         let url = format!("{}/grid/nodes/{}/prices", self.base_url, enc_seg(node_id));
         let token = self.get_token()?;
         let resp = self
@@ -679,6 +692,11 @@ impl OrchestratorClient {
         if let Some(eph) = ephemeral_public_key {
             body["ephemeral_public_key"] = serde_json::Value::String(eph.to_string());
         }
+        // Declare the sealed payload's format so the reader never has to infer it from a
+        // capability flag. Absent = raw text (every previous release).
+        if let Some(f) = fmt {
+            body["fmt"] = serde_json::Value::String(f.to_string());
+        }
         if let Some(u) = usage {
             body["usage"] = u;
         }
@@ -702,9 +720,13 @@ impl OrchestratorClient {
             return Err(format!("chunk post failed ({status}): {text}"));
         }
         // 200 body: { ok, closed }. `closed` means the client is gone.
-        let parsed: serde_json::Value = serde_json::from_slice(&Self::read_body_capped(resp).await?)
-            .unwrap_or(serde_json::Value::Null);
-        Ok(parsed.get("closed").and_then(|v| v.as_bool()).unwrap_or(false))
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&Self::read_body_capped(resp).await?)
+                .unwrap_or(serde_json::Value::Null);
+        Ok(parsed
+            .get("closed")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false))
     }
 
     /// Tell the orchestrator a streaming job failed to generate (e.g. the model
