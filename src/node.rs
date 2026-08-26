@@ -2497,13 +2497,14 @@ async fn seal_post_chunk(
     is_final: bool,
     plaintext: &[u8],
     usage: Option<serde_json::Value>,
+    fmt: Option<&str>,
 ) -> Result<bool, String> {
     let ct = sealer.seal_chunk(plaintext, seq, is_final)?;
     let kind = format!("stream:{seq}:{}", if is_final { 1 } else { 0 });
     let sig = crate::crypto::sign_result_envelope(node_secret, job_id, &kind, ct.as_bytes());
     let eph = if seq == 0 { Some(eph_b58) } else { None };
     client
-        .post_chunk(job_id, seq, is_final, eph, &ct, usage, Some(sig))
+        .post_chunk(job_id, seq, is_final, eph, &ct, usage, Some(sig), fmt)
         .await
 }
 
@@ -2536,15 +2537,33 @@ async fn process_inference_stream(
     // Whether THIS request should have produced output — captured before `p.messages` is moved,
     // for the empty-completion health signal recorded at the terminal Done chunk below.
     let expects_output = request_expects_output(&p.messages, p.max_tokens);
-    // Streaming is chat-only in v1 (tool-calling uses the non-streaming path), so render the
-    // opaque messages into the {role,content} shape the stream engine consumes.
-    let messages: Vec<ChatMessage> = match serde_json::from_value(p.messages) {
-        Ok(m) => m,
-        Err(e) => {
-            let _ = client
-                .fail_job(&job.id, &format!("Invalid messages format: {e}"))
-                .await;
-            return;
+    // Messages are forwarded OPAQUELY, exactly like the non-stream path. Destructuring them
+    // into {role,content} dropped tool fields AND hard-failed on an agent-loop turn (assistant
+    // `content: null` + `tool_calls` -> "invalid type: null, expected a string"), so every
+    // multi-turn tool loop died on turn 2. The engine validates the shape it needs.
+    let tools = p.tools.clone();
+    let tool_choice = p.tool_choice.clone();
+    let wants_tools = tools.is_some();
+    // Opaque forwarding is required ONLY for tool requests (agent-loop turns carry
+    // assistant `tool_calls` + `content: null`, which the old typed shape hard-failed on).
+    // For a plain-chat stream we keep sanitizing to {role,content} so the request that
+    // reaches llama-server is byte-identical to every previous release — no prompt-rendering
+    // change on the live grid from stray fields we used to drop (Codex).
+    let messages = if wants_tools {
+        p.messages
+    } else {
+        match serde_json::from_value::<Vec<ChatMessage>>(p.messages) {
+            Ok(v) => match serde_json::to_value(v) {
+                Ok(val) => val,
+                Err(e) => {
+                    let _ = client.fail_job(&job.id, &format!("Invalid messages format: {e}")).await;
+                    return;
+                }
+            },
+            Err(e) => {
+                let _ = client.fail_job(&job.id, &format!("Invalid messages format: {e}")).await;
+                return;
+            }
         }
     };
 
@@ -2571,11 +2590,25 @@ async fn process_inference_stream(
     let engine2 = engine.clone();
     let inf = tokio::spawn(async move {
         engine2
-            .chat_completion_stream(messages, temperature, max_tokens, tx)
+            .chat_completion_stream(messages, tools, tool_choice, temperature, max_tokens, tx)
             .await
     });
 
+    // Wire format for this stream. `wants_tools` was captured from the sealed request:
+    // with tools the payload must carry STRUCTURE (text vs tool-call deltas), so every
+    // chunk is JSON and is tagged `fmt:"json"`. Without tools it stays raw UTF-8 text,
+    // byte-identical to every previous release, so old clients are untouched.
+    let chunk_fmt: Option<&str> = if wants_tools { Some("json") } else { None };
+    let encode_text = |t: &str| -> Vec<u8> {
+        if wants_tools {
+            serde_json::json!({ "c": t }).to_string().into_bytes()
+        } else {
+            t.as_bytes().to_vec()
+        }
+    };
+
     let mut seq: u64 = 0;
+    let mut saw_tool_call = false;
     let mut emitted_tokens: u32 = 0;
     // Did the stream emit any NON-whitespace content? The Server engine counts a whitespace-only
     // delta (e.g. "\n") toward emitted_tokens, so emitted_tokens>0 alone wouldn't catch a
@@ -2588,6 +2621,32 @@ async fn process_inference_stream(
 
     while let Some(ev) = rx.recv().await {
         match ev {
+            // Tool-call delta: forwarded verbatim inside the sealed payload. Counts as
+            // real output (an agent's whole answer may be a tool call with no prose), so it
+            // marks the stream non-empty for the empty-completion health check — otherwise a
+            // pure tool-call turn would look like a zombie engine and trip self-heal.
+            crate::inference::StreamEvent::ToolCalls { delta } => {
+                emitted_nonws = true;
+                saw_tool_call = true;
+                let payload = serde_json::json!({ "tc": delta }).to_string();
+                match seal_post_chunk(
+                    client, &sealer, node_secret, &job.id, &eph_b58, seq, false,
+                    payload.as_bytes(), None, Some("json"),
+                )
+                .await
+                {
+                    Ok(false) => seq += 1,
+                    Ok(true) => {
+                        client_gone = true;
+                        break;
+                    }
+                    Err(e) => {
+                        tracing::warn!("Job {} tool chunk {seq} post failed: {e}", job.id);
+                        client_gone = true;
+                        break;
+                    }
+                }
+            }
             crate::inference::StreamEvent::Delta { text, tokens } => {
                 emitted_tokens = emitted_tokens.saturating_add(tokens);
                 let out_text = if let Some(cleaner) = homura_cleaner.as_mut() {
@@ -2603,7 +2662,7 @@ async fn process_inference_stream(
                 }
                 match seal_post_chunk(
                     client, &sealer, node_secret, &job.id, &eph_b58, seq, false,
-                    out_text.as_bytes(), None,
+                    &encode_text(&out_text), None, chunk_fmt,
                 )
                 .await
                 {
@@ -2631,7 +2690,7 @@ async fn process_inference_stream(
                         }
                         match seal_post_chunk(
                             client, &sealer, node_secret, &job.id, &eph_b58, seq, false,
-                            tail.as_bytes(), None,
+                            &encode_text(&tail), None, chunk_fmt,
                         )
                         .await
                         {
@@ -2661,10 +2720,15 @@ async fn process_inference_stream(
                     "completion_tokens": completion_tokens,
                     "total_tokens": prompt_tokens + completion_tokens,
                 });
+                // OpenAI clients branch on finish_reason: "tool_calls" tells an agent loop to
+                // execute the calls and come back. Without it a streamed tool turn looks like
+                // a normal answer and the agent stops instead of acting.
+                let finish_reason = if saw_tool_call { Some("tool_calls") } else { None };
+                let _ = &finish_reason;
                 // Only treat as success if the final chunk was actually accepted;
                 // otherwise fall through to the failure path below.
                 match seal_post_chunk(
-                    client, &sealer, node_secret, &job.id, &eph_b58, seq, true, b"", Some(usage),
+                    client, &sealer, node_secret, &job.id, &eph_b58, seq, true, b"", Some(usage), None,
                 )
                 .await
                 {
@@ -2711,7 +2775,7 @@ async fn process_inference_stream(
             "total_tokens": emitted_tokens,
         });
         let _ = seal_post_chunk(
-            client, &sealer, node_secret, &job.id, &eph_b58, seq, true, b"", Some(usage),
+            client, &sealer, node_secret, &job.id, &eph_b58, seq, true, b"", Some(usage), None,
         )
         .await;
         tracing::warn!(

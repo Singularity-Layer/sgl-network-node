@@ -136,6 +136,10 @@ struct HeartbeatRequest {
 #[derive(Serialize)]
 struct NodeCapabilities {
     streaming: bool,
+    // This build forwards `tools` on the STREAM path and emits tool-call deltas. A routing
+    // hint only — correctness comes from the per-chunk `fmt` tag, so a stale value here can
+    // never corrupt a stream (worst case: a pre-commit fallback to the buffered path).
+    streaming_tools: bool,
     // Context window this node serves with (llama-server -c). The grid uses it to
     // size the pre-dispatch prompt check per node instead of assuming a default.
     context_size: u32,
@@ -408,6 +412,7 @@ impl OrchestratorClient {
             key_version,
             capabilities: NodeCapabilities {
                 streaming,
+                streaming_tools: true,
                 context_size,
                 kind: kind.map(|s| s.to_string()),
                 dim,
@@ -656,6 +661,11 @@ impl OrchestratorClient {
         ciphertext_b58: &str,
         usage: Option<serde_json::Value>,
         envelope_signature: Option<String>,
+        // Sealed-payload format. None = raw UTF-8 text (every pre-existing node and every
+        // plain-chat stream). Some("json") = plaintext is {"c":text} or {"tc":[delta]}.
+        // The WRITER declares this per chunk, so a reader never infers it from a capability
+        // flag — stale capabilities then cannot cause a misparse.
+        fmt: Option<&str>,
     ) -> Result<bool, String> {
         let url = format!("{}/grid/jobs/{}/chunk", self.base_url, enc_seg(job_id));
         let token = self.get_token()?;

@@ -93,11 +93,22 @@ struct ChatCompletionRequest {
 
 #[derive(Serialize)]
 struct ChatCompletionStreamRequest {
-    messages: Vec<ChatMessage>,
+    /// Forwarded OPAQUELY (serde_json::Value), never destructured into {role,content}.
+    /// An agent-loop turn carries assistant `tool_calls` with `content: null` plus
+    /// `tool`-role results with `tool_call_id`; typing this as Vec<ChatMessage> both
+    /// dropped those fields AND hard-failed deserialization ("invalid type: null,
+    /// expected a string"), so every agent loop died on turn 2.
+    messages: serde_json::Value,
     temperature: f64,
     max_tokens: i32,
     stream: bool,
     stream_options: StreamOptions,
+    /// OpenAI tool definitions. Streamed tool calls need these to reach llama-server;
+    /// omitted entirely when absent so plain-chat requests are byte-identical to before.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<serde_json::Value>,
 }
 
 #[derive(Serialize)]
@@ -123,6 +134,13 @@ struct StreamChoice {
 struct StreamDelta {
     #[serde(default)]
     content: Option<String>,
+    /// llama.cpp emits OpenAI-shaped tool-call deltas while streaming
+    /// (server-chat.cpp `server_chat_msg_diff_to_json_oaicompat`): each carries an
+    /// `index`, optionally `id`/`type`, and PARTIAL `function.arguments` fragments the
+    /// client concatenates. Forwarded verbatim rather than re-modelled, so we can't
+    /// drift from the upstream shape.
+    #[serde(default)]
+    tool_calls: Option<serde_json::Value>,
 }
 
 /// One event from a streaming completion: a batch of decoded text (with the
@@ -131,6 +149,8 @@ struct StreamDelta {
 /// function returning `Err` WITHOUT a `Done` — never a forged terminal.
 pub enum StreamEvent {
     Delta { text: String, tokens: u32 },
+    /// One tool-call delta batch, forwarded verbatim from llama-server.
+    ToolCalls { delta: serde_json::Value },
     Done {
         prompt_tokens: u32,
         completion_tokens: u32,
@@ -705,7 +725,9 @@ impl ServerEngine {
     /// (and ultimately the browser) went away, so we stop generating.
     pub async fn chat_completion_stream(
         &self,
-        messages: Vec<ChatMessage>,
+        messages: serde_json::Value,
+        tools: Option<serde_json::Value>,
+        tool_choice: Option<serde_json::Value>,
         temperature: f64,
         max_tokens: i32,
         tx: tokio::sync::mpsc::Sender<StreamEvent>,
@@ -725,6 +747,8 @@ impl ServerEngine {
             stream_options: StreamOptions {
                 include_usage: true,
             },
+            tools,
+            tool_choice,
         };
 
         let mut resp = None;
@@ -809,6 +833,28 @@ impl ServerEngine {
                     completion_tokens = u.completion_tokens.unwrap_or(completion_tokens);
                 }
                 for ch in parsed.choices {
+                    // Tool-call deltas: flush any pending TEXT first so the client sees
+                    // deltas in the order the model produced them, then forward the
+                    // tool delta verbatim. Ordering matters — a tool call emitted before
+                    // buffered prose would otherwise arrive after it.
+                    if let Some(tc) = ch.delta.tool_calls {
+                        if !pending.is_empty()
+                            && tx
+                                .send(StreamEvent::Delta {
+                                    text: std::mem::take(&mut pending),
+                                    tokens: batched,
+                                })
+                                .await
+                                .is_err()
+                        {
+                            return Ok(());
+                        }
+                        batched = 0;
+                        emitted += 1;
+                        if tx.send(StreamEvent::ToolCalls { delta: tc }).await.is_err() {
+                            return Ok(());
+                        }
+                    }
                     if let Some(c) = ch.delta.content {
                         if !c.is_empty() {
                             pending.push_str(&c);
@@ -1100,18 +1146,29 @@ impl InferenceEngine {
 
     pub async fn chat_completion_stream(
         &self,
-        messages: Vec<ChatMessage>,
+        messages: serde_json::Value,
+        tools: Option<serde_json::Value>,
+        tool_choice: Option<serde_json::Value>,
         temperature: f64,
         max_tokens: i32,
         tx: tokio::sync::mpsc::Sender<StreamEvent>,
     ) -> Result<(), String> {
         match self {
             InferenceEngine::Server(e) => {
-                e.chat_completion_stream(messages, temperature, max_tokens, tx).await
+                e.chat_completion_stream(messages, tools, tool_choice, temperature, max_tokens, tx).await
             }
             #[cfg(feature = "inprocess")]
             InferenceEngine::InProcess(e) => {
-                e.chat_completion_stream(&messages, max_tokens, temperature as f32, tx).await
+                // The in-process engine renders the prompt itself and has no tool grammar, so
+                // it CANNOT honour `tools`. Refuse loudly rather than silently dropping them —
+                // a dropped tool list makes an agent chat instead of acting, which looks like
+                // the model failing rather than the engine. The caller falls back.
+                if tools.is_some() {
+                    return Err("in-process engine cannot stream tool calls".to_string());
+                }
+                let typed: Vec<ChatMessage> = serde_json::from_value(messages)
+                    .map_err(|e| format!("Invalid messages format: {e}"))?;
+                e.chat_completion_stream(&typed, max_tokens, temperature as f32, tx).await
             }
             #[cfg(feature = "inprocess")]
             InferenceEngine::Embed(_) => {
