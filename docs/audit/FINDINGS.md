@@ -23,6 +23,7 @@ Newest first. Keep rows short; link the commit for detail.
 | 2026-08-19 | VISION in-process vs server-mode risk raised, no recorded follow-up | `src/inprocess.rs`, `src/inference.rs` | Unknown | `OPEN` | Node forces server engine when mmproj is set — needs a test asserting that |
 | 2026-08-19 | Setup partial-extraction risk found, closure not recorded | `src/setup.rs` | Unknown | `OPEN` | Needs rollback test |
 | 2026-08-19 | Startup-hang diagnosis ended in recommendations, no decision recorded | `src/node.rs`, `src/service.rs` | Unknown | `OPEN` | Decide: fix, accept, or reject |
+| 2026-08-26 | `post_chunk` accepted a `fmt` parameter but never wrote it into the request body, so every tool-enabled stream chunk reached the orchestrator untagged. The reader correctly read "untagged" as legacy raw text, terminalized the stream (`node ignored tools on stream`) and fell back to a buffered completion — tool-call deltas were generated then discarded on every request. Billing was never wrong: the failed stream settled $0.00 and the fallback billed exactly once. | `src/orchestrator.rs:684` | **High** (silently dead feature, not a money bug) | `FIXED` | Fixed in `90422cf`, shipped in `v1.9.7`. Live-verified on mainnet: 9 SSE frames / 8 incremental tool-call deltas / `finish_reason=tool_calls`; pre-v1.9.7 nodes still fall back to buffered tool calls unchanged. Root cause was a patch script whose assertion aborted mid-edit, so the signature landed without the body write — the fail-closed reader is what surfaced it. |
 
 ## The four `OPEN` audit-loop items
 
