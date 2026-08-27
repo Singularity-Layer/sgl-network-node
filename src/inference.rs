@@ -1104,12 +1104,16 @@ impl InferenceEngine {
         }
     }
 
-    /// True iff this engine serves a vision (multimodal) model. Only the server engine can —
-    /// the in-process (Mac) engine has no mmproj support, and embedding engines never do.
+    /// True iff this engine serves a vision (multimodal) model. The in-process engine can
+    /// now do this too (feature `vision`), which is the whole point: it keeps the decrypted
+    /// prompt and the image inside this process instead of handing them to a llama-server
+    /// child over a socket the operator can read.
     pub fn is_vision(&self) -> bool {
         match self {
             InferenceEngine::Server(e) => e.is_vision(),
-            #[cfg(feature = "inprocess")]
+            #[cfg(all(feature = "inprocess", feature = "vision"))]
+            InferenceEngine::InProcess(e) => e.is_vision(),
+            #[cfg(all(feature = "inprocess", not(feature = "vision")))]
             InferenceEngine::InProcess(_) => false,
             #[cfg(feature = "inprocess")]
             InferenceEngine::Embed(_) => false,
@@ -1289,8 +1293,14 @@ fn qwen_template_override(model_path: &std::path::Path) -> bool {
     // (enable_thinking / <think>), so it must keep its EMBEDDED --jinja template —
     // forcing the Qwen2.5 tool template onto it would clobber the thinking behavior.
     // Only the older Qwen2.5-family GGUFs (which lack the tools section) need the override.
+    // Vision (…-VL…) GGUFs are excluded so BOTH engines render with the model's OWN embedded
+    // template. Otherwise the server engine used this tools template while the in-process
+    // engine used the embedded one, and the same request would produce different output AND
+    // a different billed prompt_tokens depending on which node served it. The override exists
+    // to add a tools section to Qwen2.5 TEXT GGUFs that lack one; a VL GGUF ships its own.
     name.contains("qwen")
         && !name.contains("qwen3")
+        && !name.contains("-vl")
         && !name.contains("r1")
         && !name.contains("qwq")
 }

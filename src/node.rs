@@ -1016,14 +1016,15 @@ pub async fn start(
             #[cfg(not(feature = "inprocess"))]
             _ => crate::inference::EngineMode::Server,
         };
-        // Vision (multimodal) requires the SERVER engine — the in-process engine can't load an
-        // mmproj. Force it whenever an mmproj is provided (even on the macOS/in-process default or
-        // an explicit SGL_ENGINE=inprocess) so a vision node actually serves images instead of
-        // silently degrading to text-only and omitting its `vision` capability.
+        // Vision used to REQUIRE the server engine, which meant handing the decrypted prompt
+        // and the image to a llama-server child over an unauthenticated 127.0.0.1 socket the
+        // operator could read. A `vision` build serves images in-process instead, so the force
+        // only remains where it is still true: builds without the feature.
+        #[cfg(not(feature = "vision"))]
         let engine_mode = match engine_mode {
             crate::inference::EngineMode::InProcess if mmproj_path.is_some() => {
                 tracing::warn!(
-                    "--mmproj-path set: using the server engine (in-process can't serve vision)"
+                    "--mmproj-path set: using the server engine (this build can't serve vision in-process)"
                 );
                 crate::inference::EngineMode::Server
             }

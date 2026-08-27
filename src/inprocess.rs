@@ -153,6 +153,10 @@ pub struct InProcessEngine {
     last_progress_ms: Arc<AtomicU64>,
     model_name: String,
     max_slots: u32,
+    /// True when a vision projector was loaded, i.e. this engine serves images IN PROCESS.
+    /// Drives the `vision` heartbeat capability, so the orchestrator only routes image
+    /// requests to a node that can actually answer them.
+    vision: bool,
     /// `Option` so `Drop` can `take()` + join it. Joining lets the worker fully release its
     /// llama.cpp context/model/backend BEFORE the process runs C++ static destructors at
     /// exit — otherwise ggml-metal's global device teardown asserts (rsets not empty) and
@@ -170,6 +174,7 @@ impl InProcessEngine {
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
         let model_name = cfg.model_name.clone();
         let max_slots = cfg.max_slots.max(1);
+        let vision = cfg.mmproj_path.is_some();
 
         let w_healthy = Arc::clone(&healthy);
         let w_busy = Arc::clone(&busy);
@@ -195,6 +200,7 @@ impl InProcessEngine {
                 last_progress_ms,
                 model_name,
                 max_slots,
+                vision,
                 worker: Some(worker),
             }),
             Ok(Ok(Err(e))) => Err(e),
@@ -212,6 +218,12 @@ impl InProcessEngine {
     /// Continuous-batching concurrency (advertised capacity).
     pub fn max_slots(&self) -> u32 {
         self.max_slots
+    }
+
+    /// True when this engine serves images itself (projector loaded), so the node can
+    /// advertise vision WITHOUT falling back to the plaintext-exposing server child.
+    pub fn is_vision(&self) -> bool {
+        self.vision
     }
 
     /// Non-streaming completion.
