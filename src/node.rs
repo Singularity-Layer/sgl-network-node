@@ -1011,8 +1011,17 @@ pub async fn start(
             .unwrap_or(false);
         let engine_mode = match std::env::var("SGL_ENGINE").ok().as_deref() {
             Some(s) if !s.is_empty() => crate::inference::EngineMode::parse(s)?,
-            #[cfg(feature = "inprocess")]
+            // macOS defaults to in-process: it is validated there, and it is what keeps the
+            // decrypted prompt inside this process instead of handing it to a llama-server
+            // child over a socket the operator can read.
+            #[cfg(all(feature = "inprocess", target_os = "macos"))]
             _ => crate::inference::EngineMode::InProcess,
+            // Linux ships the in-process engine compiled in but NOT defaulted. It has only
+            // been proven to COMPILE there; defaulting it would move every Linux node onto an
+            // unproven inference path in one release. Operators opt in with
+            // SGL_ENGINE=inprocess, and this flips once it is validated on real hardware.
+            #[cfg(all(feature = "inprocess", not(target_os = "macos")))]
+            _ => crate::inference::EngineMode::Server,
             #[cfg(not(feature = "inprocess"))]
             _ => crate::inference::EngineMode::Server,
         };

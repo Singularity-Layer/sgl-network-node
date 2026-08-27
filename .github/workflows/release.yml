@@ -32,6 +32,9 @@ jobs:
   build:
     name: build (${{ matrix.asset }})
     strategy:
+      # A Linux build hiccup must NOT cancel the macOS binary. macOS is every live grid node,
+      # and Linux is newly compiling llama.cpp in-process here, so it is the likeliest to break.
+      fail-fast: false
       matrix:
         include:
           # macOS = every live grid node. Build with in-process inference (v1.5.0)
@@ -41,18 +44,22 @@ jobs:
             target: aarch64-apple-darwin
             asset: sgl-darwin-arm64
             features: "inprocess,metal,vision"
-          # Linux = future confidential TDX/SEV tier (#109), no live nodes yet.
-          # Kept as plain server-engine builds for now to keep the release green —
-          # a cmake/llama.cpp build hiccup here would block the macOS binary too.
-          # Add `inprocess` here when the Linux tier actually ships.
+          # Linux ships the in-process engine COMPILED IN but NOT as the default (see the
+          # engine selection in node.rs). Compiling in CI does not prove runtime behaviour on
+          # real hardware, and flipping the default blind would move every Linux node onto an
+          # untested inference path at once. Operators opt in with SGL_ENGINE=inprocess; the
+          # default flips once it is validated on a real Linux node.
+          # CPU-only for now: the crate DOES have a `vulkan` feature (which is what llama-server
+          # already uses on Linux), but it needs Vulkan headers + a shader compiler on the
+          # runner. GPU acceleration is the next step, once this builds and runs clean.
           - os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             asset: sgl-linux-x86_64
-            features: ""
+            features: "inprocess,vision"
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             asset: sgl-linux-arm64
-            features: ""
+            features: "inprocess,vision"
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
