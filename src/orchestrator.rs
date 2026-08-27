@@ -420,7 +420,12 @@ impl OrchestratorClient {
             key_version,
             capabilities: NodeCapabilities {
                 streaming,
-                streaming_tools: true,
+                // Honest per ENGINE, not hardcoded. The in-process engine cannot do tool
+                // calls: it errors on the stream path ("cannot stream tool calls") and
+                // silently drops them on the non-stream path. Claiming otherwise made the
+                // orchestrator route tool requests to it, and every one FAILED - which is
+                // what happened the moment vision models moved in-process.
+                streaming_tools: engine != Some("inprocess"),
                 context_size,
                 kind: kind.map(|s| s.to_string()),
                 dim,
