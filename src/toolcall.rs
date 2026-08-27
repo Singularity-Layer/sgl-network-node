@@ -82,6 +82,140 @@ pub fn markers(fmt: ToolFormat) -> Option<(&'static str, &'static str)> {
     }
 }
 
+/// One parsed tool call plus the prose that surrounded it.
+#[derive(Debug, Default)]
+pub struct ParsedOutput {
+    /// Text the user should still see (everything that was not a tool call).
+    pub text: String,
+    /// OpenAI `tool_calls` array, or None when the model produced no valid call.
+    pub tool_calls: Option<serde_json::Value>,
+}
+
+/// Extract tool calls from a COMPLETE generation (the non-streaming path).
+///
+/// `allowed` is the set of tool names the caller actually offered. A name outside it is left
+/// as plain text rather than surfaced as a call: a hallucinated tool would otherwise be handed
+/// to an agent as though the model had really asked for it. Matches the node's existing
+/// server-engine extractor so both engines behave identically.
+///
+/// `id_seed` makes call ids deterministic per request (the node passes the job id), so a
+/// retry of the same job cannot collide with a different call id.
+pub fn parse_complete(
+    fmt: ToolFormat,
+    raw: &str,
+    allowed: &[String],
+    id_seed: &str,
+) -> ParsedOutput {
+    if !fmt.supports_tools() {
+        return ParsedOutput { text: raw.to_string(), tool_calls: None };
+    }
+    let mut calls: Vec<serde_json::Value> = Vec::new();
+    let mut text = String::new();
+    let mut rest = raw;
+
+    while !rest.is_empty() {
+        let Some((start, body, consumed)) = next_candidate(fmt, rest) else {
+            text.push_str(rest);
+            break;
+        };
+        text.push_str(&rest[..start]);
+        match to_openai_call(&body, allowed, id_seed, calls.len()) {
+            Some(c) => calls.push(c),
+            // Not a real call (bad JSON, or a tool we never offered): the model DID produce
+            // this text, so the user must still receive it. Dropping it would bill tokens for
+            // content never delivered.
+            None => text.push_str(&rest[start..start + consumed]),
+        }
+        rest = &rest[start + consumed..];
+    }
+
+    ParsedOutput {
+        text,
+        tool_calls: (!calls.is_empty()).then(|| serde_json::Value::Array(calls)),
+    }
+}
+
+/// Locate the next possible call: returns (offset, json body, bytes consumed).
+fn next_candidate(fmt: ToolFormat, s: &str) -> Option<(usize, String, usize)> {
+    if let Some((open, close)) = markers(fmt) {
+        let start = s.find(open)?;
+        let after = start + open.len();
+        let end = s[after..].find(close)? + after;
+        let body = s[after..end].trim().to_string();
+        return Some((start, body, (end + close.len()) - start));
+    }
+    // Bare-JSON formats (Llama 3.x, HOMURA): no wrapper, so find a balanced object.
+    let start = s.find('{')?;
+    let len = balanced_object_len(&s[start..])?;
+    Some((start, s[start..start + len].to_string(), len))
+}
+
+/// Length of the balanced `{...}` at the head of `s`, honouring strings and escapes so a brace
+/// inside an argument value cannot end the object early.
+fn balanced_object_len(s: &str) -> Option<usize> {
+    let b = s.as_bytes();
+    if b.first() != Some(&b'{') {
+        return None;
+    }
+    let (mut depth, mut in_str, mut esc) = (0usize, false, false);
+    for (i, &c) in b.iter().enumerate() {
+        if esc {
+            esc = false;
+            continue;
+        }
+        match c {
+            b'\\' if in_str => esc = true,
+            b'"' => in_str = !in_str,
+            b'{' if !in_str => depth += 1,
+            b'}' if !in_str => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i + 1);
+                }
+            }
+            _ => {}
+        }
+    }
+    None // truncated mid-object (e.g. hit max_tokens) — caller keeps it as text
+}
+
+/// Convert one candidate body into the OpenAI call shape, or None if it is not a valid call.
+fn to_openai_call(
+    body: &str,
+    allowed: &[String],
+    id_seed: &str,
+    index: usize,
+) -> Option<serde_json::Value> {
+    let v: serde_json::Value = serde_json::from_str(body.trim()).ok()?;
+    // Mistral wraps calls in an array.
+    if let Some(arr) = v.as_array() {
+        return arr
+            .first()
+            .and_then(|f| to_openai_call(&f.to_string(), allowed, id_seed, index));
+    }
+    // `name` for most families, `tool` for HOMURA's trained protocol.
+    let name = v.get("name").or_else(|| v.get("tool"))?.as_str()?;
+    if !allowed.iter().any(|a| a == name) {
+        return None;
+    }
+    // `arguments` for most, `parameters` for Llama 3.x.
+    let args = v
+        .get("arguments")
+        .or_else(|| v.get("parameters"))
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    // OpenAI carries arguments as a STRING of JSON, not an object.
+    let args_str = match args.as_str() {
+        Some(s) => s.to_string(),
+        None => args.to_string(),
+    };
+    Some(serde_json::json!({
+        "id": format!("call_{id_seed}_{index}"),
+        "type": "function",
+        "function": { "name": name, "arguments": args_str },
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -123,6 +257,110 @@ mod tests {
         assert!(markers(ToolFormat::Llama3Json).is_none());
         assert!(markers(ToolFormat::Homura).is_none());
         assert_eq!(markers(ToolFormat::HermesXml), Some(("<tool_call>", "</tool_call>")));
+    }
+
+
+    fn allowed() -> Vec<String> { vec!["get_weather".into(), "search".into()] }
+
+    fn call_name(o: &ParsedOutput, i: usize) -> String {
+        o.tool_calls.as_ref().unwrap()[i]["function"]["name"].as_str().unwrap().into()
+    }
+    fn call_args(o: &ParsedOutput, i: usize) -> String {
+        o.tool_calls.as_ref().unwrap()[i]["function"]["arguments"].as_str().unwrap().into()
+    }
+
+    #[test]
+    fn hermes_call_is_extracted_and_prose_kept() {
+        let raw = "Let me check. <tool_call>{\"name\":\"get_weather\",\"arguments\":{\"city\":\"Paris\"}}</tool_call>";
+        let o = parse_complete(ToolFormat::HermesXml, raw, &allowed(), "job1");
+        assert_eq!(call_name(&o, 0), "get_weather");
+        assert_eq!(call_args(&o, 0), r#"{"city":"Paris"}"#);
+        assert_eq!(o.text, "Let me check. ");
+    }
+
+    /// OpenAI carries arguments as a STRING of JSON, not an object. An agent that gets an
+    /// object here fails to parse the call.
+    #[test]
+    fn arguments_are_a_json_string() {
+        let raw = "<tool_call>{\"name\":\"search\",\"arguments\":{\"q\":\"a\"}}</tool_call>";
+        let o = parse_complete(ToolFormat::HermesXml, raw, &allowed(), "j");
+        let a = &o.tool_calls.as_ref().unwrap()[0]["function"]["arguments"];
+        assert!(a.is_string(), "arguments must be a string, got {a}");
+    }
+
+    #[test]
+    fn homura_uses_tool_key_and_llama_uses_parameters() {
+        let h = parse_complete(ToolFormat::Homura,
+            r#"{"tool":"search","arguments":{"q":"x"}}"#, &allowed(), "j");
+        assert_eq!(call_name(&h, 0), "search");
+        let l = parse_complete(ToolFormat::Llama3Json,
+            r#"{"name":"search","parameters":{"q":"x"}}"#, &allowed(), "j");
+        assert_eq!(call_args(&l, 0), r#"{"q":"x"}"#);
+    }
+
+    /// A tool we never offered must NOT reach the agent as a call — but the text the model
+    /// produced must still be delivered, because those tokens were billed.
+    #[test]
+    fn hallucinated_tool_stays_as_text() {
+        let raw = "<tool_call>{\"name\":\"rm_rf\",\"arguments\":{}}</tool_call>";
+        let o = parse_complete(ToolFormat::HermesXml, raw, &allowed(), "j");
+        assert!(o.tool_calls.is_none(), "must not surface an unoffered tool");
+        assert!(o.text.contains("rm_rf"), "text must still be delivered: {:?}", o.text);
+    }
+
+    /// Truncated at max_tokens: unparseable, so it is prose. Never a partial call.
+    #[test]
+    fn truncated_call_is_delivered_as_text() {
+        let raw = "<tool_call>{\"name\":\"get_weather\",\"argum";
+        let o = parse_complete(ToolFormat::HermesXml, raw, &allowed(), "j");
+        assert!(o.tool_calls.is_none());
+        assert_eq!(o.text, raw, "withheld text must never be dropped");
+    }
+
+    /// THE BILLING INVARIANT (Fable + Codex both flagged it): every byte the model produced
+    /// must come back either as a call or as text. Anything dropped is billed-but-undelivered.
+    #[test]
+    fn nothing_is_ever_dropped() {
+        for raw in [
+            "plain prose only",
+            "<tool_call>{bad json}</tool_call>",
+            "before <tool_call>{\"name\":\"nope\",\"arguments\":{}}</tool_call> after",
+            "<tool_call>",
+        ] {
+            let o = parse_complete(ToolFormat::HermesXml, raw, &allowed(), "j");
+            if o.tool_calls.is_none() {
+                assert_eq!(o.text, raw, "no call parsed, so all text must survive: {raw:?}");
+            }
+        }
+    }
+
+    /// A brace inside an argument STRING must not end the object early.
+    #[test]
+    fn braces_inside_strings_do_not_break_parsing() {
+        let raw = r#"{"tool":"search","arguments":{"q":"a } b {"}}"#;
+        let o = parse_complete(ToolFormat::Homura, raw, &allowed(), "j");
+        assert_eq!(call_name(&o, 0), "search");
+        assert_eq!(call_args(&o, 0), r#"{"q":"a } b {"}"#);
+    }
+
+    #[test]
+    fn parallel_calls_get_distinct_ids() {
+        let raw = "<tool_call>{\"name\":\"search\",\"arguments\":{}}</tool_call>\
+<tool_call>{\"name\":\"get_weather\",\"arguments\":{}}</tool_call>";
+        let o = parse_complete(ToolFormat::HermesXml, raw, &allowed(), "j");
+        let c = o.tool_calls.as_ref().unwrap();
+        assert_eq!(c.as_array().unwrap().len(), 2);
+        assert_ne!(c[0]["id"], c[1]["id"], "ids must be distinct");
+    }
+
+    /// A model with no tools support must pass output through untouched — the engine refuses
+    /// such requests earlier, so this must never invent a call.
+    #[test]
+    fn unsupported_format_passes_through() {
+        let raw = r#"{"name":"get_weather","arguments":{}}"#;
+        let o = parse_complete(ToolFormat::None, raw, &allowed(), "j");
+        assert!(o.tool_calls.is_none());
+        assert_eq!(o.text, raw);
     }
 
     /// THE STAGE-0 BLOCKER: our tools template uses `| tojson`, which minijinja only provides
