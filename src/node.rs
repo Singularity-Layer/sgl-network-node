@@ -2676,7 +2676,12 @@ async fn process_inference_stream(
     // For a plain-chat stream we keep sanitizing to {role,content} so the request that
     // reaches llama-server is byte-identical to every previous release — no prompt-rendering
     // change on the live grid from stray fields we used to drop (Codex).
-    let messages = if wants_tools {
+    // Multimodal content is forwarded opaquely for the same reason tools are: `ChatMessage`
+    // has `content: String`, so an OpenAI array-content (image) message fails this parse and
+    // the job dies with "Invalid messages format". That made every STREAMED vision request
+    // fail, on the server engine, before any of the in-process work — the non-stream path
+    // forwards verbatim and was unaffected, which is why it went unnoticed.
+    let messages = if wants_tools || crate::multimodal::has_multimodal_content(&p.messages) {
         p.messages
     } else {
         match serde_json::from_value::<Vec<ChatMessage>>(p.messages) {
