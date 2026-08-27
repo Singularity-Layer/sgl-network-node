@@ -116,7 +116,10 @@ pub fn install(opts: &ServiceStartOptions) -> Result<(), String> {
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
         let _ = opts;
-        Err("No service installer for this platform. Run `sgl start ...` in the foreground.".to_string())
+        Err(
+            "No service installer for this platform. Run `sgl start ...` in the foreground."
+                .to_string(),
+        )
     }
 }
 
@@ -189,7 +192,23 @@ fn run_powershell(script: &str) -> Result<String, String> {
     if out.status.success() {
         Ok(stdout)
     } else {
-        Err(if stderr.is_empty() { stdout } else { stderr })
+        // NEVER return an empty error. PowerShell can exit non-zero with both streams
+        // empty, and this used to surface to operators as the literal dead end
+        // "Couldn't install the background task:" — the most common Windows failure in
+        // our reports, with nothing after the colon to act on or even diagnose.
+        // Always carry the exit code, and both streams when present.
+        let code = out
+            .status
+            .code()
+            .map(|c| c.to_string())
+            .unwrap_or_else(|| "unknown".into());
+        let detail = match (stderr.is_empty(), stdout.is_empty()) {
+            (false, false) => format!("{stderr} | {stdout}"),
+            (false, true) => stderr,
+            (true, false) => stdout,
+            (true, true) => "PowerShell produced no output".to_string(),
+        };
+        Err(format!("powershell exit {code}: {detail}"))
     }
 }
 
@@ -369,8 +388,7 @@ fn write_sandbox_profile() -> Result<String, String> {
 "#,
         home = home_str,
     );
-    std::fs::write(&profile, body)
-        .map_err(|e| format!("Failed to write sandbox profile: {e}"))?;
+    std::fs::write(&profile, body).map_err(|e| format!("Failed to write sandbox profile: {e}"))?;
     profile
         .to_str()
         .map(|s| s.to_string())
@@ -408,10 +426,7 @@ fn install_macos(opts: &ServiceStartOptions) -> Result<(), String> {
     // caffeinate -i blocks idle sleep so the node stays on the grid; if the
     // node exits, launchd (KeepAlive) restarts the whole thing. When --sandbox
     // is set, the node (and its llama-server child) run under a Seatbelt profile.
-    let mut program_args: Vec<String> = vec![
-        "/usr/bin/caffeinate".to_string(),
-        "-i".to_string(),
-    ];
+    let mut program_args: Vec<String> = vec!["/usr/bin/caffeinate".to_string(), "-i".to_string()];
     if opts.sandbox {
         let profile = write_sandbox_profile()?;
         program_args.push("/usr/bin/sandbox-exec".to_string());
