@@ -52,6 +52,10 @@ encoding_rs = { version = "0.8", optional = true }
 [features]
 inprocess = ["dep:llama-cpp-2", "dep:minijinja", "dep:chrono", "dep:encoding_rs"]
 metal = ["llama-cpp-2/metal"]
+# Multimodal (vision) INSIDE the node process. Implies `inprocess` because it extends
+# that engine. Kept separate so a broken mtmd build can never break plain-text macOS
+# builds, and so the security-relevant diff stays auditable on its own.
+vision = ["inprocess", "llama-cpp-2/mtmd"]
 
 [[example]]
 name = "inproc_poc"

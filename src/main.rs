@@ -1,12 +1,13 @@
 mod config;
-mod embed_catalog;
 mod crypto;
 #[cfg(feature = "inprocess")]
 mod embed;
+mod embed_catalog;
 mod encryption;
 mod inference;
 #[cfg(feature = "inprocess")]
 mod inprocess;
+mod multimodal;
 mod node;
 mod orchestrator;
 mod runtime_hardening;
@@ -321,9 +322,15 @@ async fn main() {
                 std::process::exit(1);
             }
         }
-        Commands::Login { tee_type, models, code, wallet } => {
+        Commands::Login {
+            tee_type,
+            models,
+            code,
+            wallet,
+        } => {
             // Omitted -> detect. See tee::detect_tee_type.
-            let tee_type = tee_type.unwrap_or_else(|| tee::detect_tee_type(tee::detect().secure_enclave_available));
+            let tee_type = tee_type
+                .unwrap_or_else(|| tee::detect_tee_type(tee::detect().secure_enclave_available));
             let models_vec: Vec<String> = models
                 .map(|m| m.split(',').map(|s| s.trim().to_string()).collect())
                 .unwrap_or_default();
@@ -331,7 +338,15 @@ async fn main() {
             let result = match (code, wallet) {
                 // Headless: provision code from the deploy pipeline, no browser.
                 (Some(c), Some(w)) => {
-                    node::login_headless(&config_dir, &cli.orchestrator_url, &tee_type, &models_vec, &c, &w).await
+                    node::login_headless(
+                        &config_dir,
+                        &cli.orchestrator_url,
+                        &tee_type,
+                        &models_vec,
+                        &c,
+                        &w,
+                    )
+                    .await
                 }
                 (Some(_), None) | (None, Some(_)) => {
                     Err("Headless login needs BOTH --code and --wallet.".to_string())
@@ -363,7 +378,11 @@ async fn main() {
         } => {
             // --gpu-layers-auto → sentinel (u32::MAX) so the inference engine lets llama.cpp
             // auto-fit the GPU offload to the card's VRAM (see inference::GPU_LAYERS_AUTO).
-            let gpu_layers = if gpu_layers_auto { Some(u32::MAX) } else { gpu_layers };
+            let gpu_layers = if gpu_layers_auto {
+                Some(u32::MAX)
+            } else {
+                gpu_layers
+            };
             let rc = node::ResourceConfig::from_args(
                 resource_percent,
                 threads,
@@ -405,12 +424,8 @@ async fn main() {
             println!("config dir:    {}", config_dir.display());
             println!("orchestrator:  {}", cli.orchestrator_url);
             println!();
-            println!(
-                "To serve on the grid this sha256 must be on the orchestrator's"
-            );
-            println!(
-                "approved-build allowlist (published with each official release)."
-            );
+            println!("To serve on the grid this sha256 must be on the orchestrator's");
+            println!("approved-build allowlist (published with each official release).");
         }
         Commands::Update => {
             if let Err(e) = update::run(&cli.orchestrator_url).await {
@@ -439,8 +454,16 @@ async fn main() {
         Commands::Price { action } => {
             let result = match action {
                 PriceAction::Show => node::show_prices(&config_dir, &cli.orchestrator_url).await,
-                PriceAction::Set { model, input, output } => node::set_price(&config_dir, &cli.orchestrator_url, &model, input, output).await,
-                PriceAction::Reset { model } => node::reset_price(&config_dir, &cli.orchestrator_url, &model).await,
+                PriceAction::Set {
+                    model,
+                    input,
+                    output,
+                } => {
+                    node::set_price(&config_dir, &cli.orchestrator_url, &model, input, output).await
+                }
+                PriceAction::Reset { model } => {
+                    node::reset_price(&config_dir, &cli.orchestrator_url, &model).await
+                }
             };
             if let Err(e) = result {
                 tracing::error!("Price command failed: {e}");
