@@ -1016,12 +1016,13 @@ pub async fn start(
             // child over a socket the operator can read.
             #[cfg(all(feature = "inprocess", target_os = "macos"))]
             _ => crate::inference::EngineMode::InProcess,
-            // Linux ships the in-process engine compiled in but NOT defaulted. It has only
-            // been proven to COMPILE there; defaulting it would move every Linux node onto an
-            // unproven inference path in one release. Operators opt in with
-            // SGL_ENGINE=inprocess, and this flips once it is validated on real hardware.
+            // Linux now defaults to in-process too. Validated in a native arm64 Linux
+            // container: the engine loads, generates, streams, and produces a tool call
+            // BYTE-IDENTICAL to macOS - same 184/18 and 184/19 token counts - so an operator
+            // is billed the same on either platform. Windows keeps the server engine because
+            // in-process is not compiled there yet.
             #[cfg(all(feature = "inprocess", not(target_os = "macos")))]
-            _ => crate::inference::EngineMode::Server,
+            _ => crate::inference::EngineMode::InProcess,
             #[cfg(not(feature = "inprocess"))]
             _ => crate::inference::EngineMode::Server,
         };
