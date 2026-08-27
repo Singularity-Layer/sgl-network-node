@@ -14,3 +14,4 @@ pub mod inference;
 pub mod inprocess;
 pub mod multimodal;
 pub mod setup;
+pub mod toolcall;

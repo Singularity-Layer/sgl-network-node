@@ -43,14 +43,18 @@ llama-cpp-2 = { version = "=0.1.150", optional = true }  # pin exact: crate trac
 # Render the GGUF's jinja chat template EXACTLY like llama-server (the crate's
 # apply_chat_template uses llama.cpp's legacy engine, which omits Llama-3's date/system
 # preamble — see the parity finding). minijinja + chrono give byte-identical prompts.
-minijinja = { version = "2", optional = true }
+minijinja = { version = "2", optional = true, features = ["json", "loop_controls"] }
+# Python string methods (.split/.startswith/.strip) that llama.cpp's C++ minja implements
+# natively. Chat templates use them in their TOOLS branches, so plain-chat rendering never
+# hit them and they went unnoticed until tool calling.
+minijinja-contrib = { version = "2", optional = true, features = ["pycompat"] }
 chrono = { version = "0.4", optional = true, default-features = false, features = ["clock", "std"] }
 # Persistent per-request UTF-8 decoder for token_to_piece (multi-byte chars split across
 # tokens — e.g. emoji — decode correctly instead of being dropped at token boundaries).
 encoding_rs = { version = "0.8", optional = true }
 
 [features]
-inprocess = ["dep:llama-cpp-2", "dep:minijinja", "dep:chrono", "dep:encoding_rs"]
+inprocess = ["dep:llama-cpp-2", "dep:minijinja", "dep:minijinja-contrib", "dep:chrono", "dep:encoding_rs"]
 metal = ["llama-cpp-2/metal"]
 # Multimodal (vision) INSIDE the node process. Implies `inprocess` because it extends
 # that engine. Kept separate so a broken mtmd build can never break plain-text macOS

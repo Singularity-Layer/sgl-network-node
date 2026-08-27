@@ -8,6 +8,7 @@ mod inference;
 #[cfg(feature = "inprocess")]
 mod inprocess;
 mod multimodal;
+mod toolcall;
 mod node;
 mod orchestrator;
 mod runtime_hardening;
