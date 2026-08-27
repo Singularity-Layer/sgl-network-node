@@ -51,7 +51,9 @@ impl EmptyHealth {
             .map(|v| {
                 (
                     v.get("restarts").and_then(|x| x.as_u64()).unwrap_or(0) as u32,
-                    v.get("last_restart_ms").and_then(|x| x.as_u64()).unwrap_or(0),
+                    v.get("last_restart_ms")
+                        .and_then(|x| x.as_u64())
+                        .unwrap_or(0),
                 )
             })
             .unwrap_or((0, 0));
@@ -229,9 +231,7 @@ fn homura_envelope_prefix_is_valid(prefix: &str) -> bool {
         || tail.starts_with("<|channel|>")
         || tail.split_whitespace().all(|part| {
             part.starts_with("<|channel|>")
-                || part
-                    .chars()
-                    .all(|c| c.is_ascii_alphabetic() || c == '_')
+                || part.chars().all(|c| c.is_ascii_alphabetic() || c == '_')
         })
 }
 
@@ -549,7 +549,10 @@ fn maybe_spawn_job(
     // This closes the gap where the prior heartbeat's advertisement is still live at the
     // orchestrator during the ≤20s canary (de-advertising alone only takes effect next heartbeat).
     if empty_health.is_quarantined() {
-        tracing::debug!("node quarantined (empty-suspect) — deferring job {}", job.id);
+        tracing::debug!(
+            "node quarantined (empty-suspect) — deferring job {}",
+            job.id
+        );
         return;
     }
     // Atomically reserve a slot (capacity check + increment in one CAS) so
@@ -565,7 +568,10 @@ fn maybe_spawn_job(
         .is_err()
     {
         // At capacity. Not marked seen, so the next REST poll retries it.
-        tracing::warn!("At max concurrent jobs ({max_jobs}), deferring job {}", job.id);
+        tracing::warn!(
+            "At max concurrent jobs ({max_jobs}), deferring job {}",
+            job.id
+        );
         return;
     }
     // De-dup; roll back the reserved slot if this id was already handled.
@@ -587,7 +593,15 @@ fn maybe_spawn_job(
     tracing::info!("Accepted job {} (type: {})", job.id, job.job_type);
     let job_id = job.id.clone();
     tokio::spawn(async move {
-        process_job(&client, &engine, &job, &node_secret, streaming_enabled, &empty_health).await;
+        process_job(
+            &client,
+            &engine,
+            &job,
+            &node_secret,
+            streaming_enabled,
+            &empty_health,
+        )
+        .await;
         // Release the slot ONLY if this job is still tracked. The watchdog may have already
         // abandoned it (removed it from inflight + released its slot) when the engine wedged.
         // Gating decrement + completion on inflight membership makes slot-release idempotent,
@@ -891,7 +905,10 @@ fn inprocess_slots(
 ) -> u32 {
     let ram_cap =
         compute_parallel_slots(memory_gb, model_path, context_size, requested_max_jobs).max(1);
-    match std::env::var("SGL_INPROCESS_SLOTS").ok().and_then(|s| s.trim().parse::<u32>().ok()) {
+    match std::env::var("SGL_INPROCESS_SLOTS")
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok())
+    {
         Some(n) if n >= 1 => n.min(ram_cap), // custom, RAM-capped
         _ => ram_cap,                        // dynamic default (machine + model aware)
     }
@@ -946,9 +963,20 @@ pub async fn start(
     tracing::info!("  Batch size:   {}", rc.batch_size);
     tracing::info!(
         "  Max jobs:     {}",
-        if rc.max_jobs == 0 { "auto".to_string() } else { rc.max_jobs.to_string() }
+        if rc.max_jobs == 0 {
+            "auto".to_string()
+        } else {
+            rc.max_jobs.to_string()
+        }
     );
-    tracing::info!("  Streaming:    {}", if rc.streaming_enabled { "enabled" } else { "disabled" });
+    tracing::info!(
+        "  Streaming:    {}",
+        if rc.streaming_enabled {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    );
 
     let mut engine: Option<Arc<InferenceEngine>> = None;
     let mut models: Vec<String> = vec![];
@@ -1008,9 +1036,12 @@ pub async fn start(
         // capacity whichever engine it runs. In-process additionally honors the
         // SGL_INPROCESS_SLOTS override (custom, still RAM-capped) — see inprocess_slots().
         effective_slots = match engine_mode {
-            crate::inference::EngineMode::Server => {
-                compute_parallel_slots(tee::detect().memory_gb, &model_pb, rc.context_size, rc.max_jobs)
-            }
+            crate::inference::EngineMode::Server => compute_parallel_slots(
+                tee::detect().memory_gb,
+                &model_pb,
+                rc.context_size,
+                rc.max_jobs,
+            ),
             crate::inference::EngineMode::InProcess => inprocess_slots(
                 tee::detect().memory_gb,
                 &model_pb,
@@ -1071,7 +1102,9 @@ pub async fn start(
                 #[cfg(target_os = "macos")]
                 if !crate::setup::managed_server_healthy() {
                     if let Err(e) = crate::setup::run(false).await {
-                        tracing::warn!("llama.cpp self-provision failed ({e}) — trying existing installs");
+                        tracing::warn!(
+                            "llama.cpp self-provision failed ({e}) — trying existing installs"
+                        );
                     }
                 }
                 InferenceEngine::create(eng_config, crate::inference::EngineMode::Server).await?
@@ -1103,12 +1136,20 @@ pub async fn start(
     const KEY_VERSION: u32 = 1;
     let node_enc_pubkey_bytes =
         crate::encryption::EncryptionKeypair::from_ed25519_seed(&node_secret).public_key_bytes();
-    let keybind_sig =
-        crate::crypto::sign_keybind_v1(&node_secret, &cfg.node_id, &node_enc_pubkey_bytes, KEY_VERSION);
+    let keybind_sig = crate::crypto::sign_keybind_v1(
+        &node_secret,
+        &cfg.node_id,
+        &node_enc_pubkey_bytes,
+        KEY_VERSION,
+    );
     let key_version_opt = keybind_sig.as_ref().map(|_| KEY_VERSION);
     match &keybind_sig {
-        Some(_) => tracing::info!("Signed key identity published (keybind v1, key_version={KEY_VERSION})"),
-        None => tracing::warn!("Could not sign keybind (node_id not a UUID?) — publishing key unsigned"),
+        Some(_) => {
+            tracing::info!("Signed key identity published (keybind v1, key_version={KEY_VERSION})")
+        }
+        None => {
+            tracing::warn!("Could not sign keybind (node_id not a UUID?) — publishing key unsigned")
+        }
     }
 
     // sha256 of the running binary, computed ONCE (reading the whole exe every
@@ -1118,7 +1159,11 @@ pub async fn start(
     // moment `sgl update` swaps the binary). Empty string → send None.
     let binary_hash = {
         let h = crate::tee::detect_binary_hash();
-        if h.is_empty() { None } else { Some(h) }
+        if h.is_empty() {
+            None
+        } else {
+            Some(h)
+        }
     };
 
     let active_jobs = Arc::new(AtomicU32::new(0));
@@ -1229,8 +1274,8 @@ pub async fn start(
     const MAX_EMPTY_RESTARTS: u32 = 5; // cap on empty-triggered restarts within the window below
     const EMPTY_RESTART_MIN_INTERVAL_MS: u64 = 600_000; // >=10 min between empty restarts
     const EMPTY_RESTART_BUDGET_WINDOW_MS: u64 = 3_600_000; // restarts older than 1h don't count
-    // Max time to stay parked on ONLY-inconclusive probes before releasing to real traffic. Bounds
-    // the alive-but-canary-slow case (which /health can't restart) so the node can't go dark forever.
+                                                           // Max time to stay parked on ONLY-inconclusive probes before releasing to real traffic. Bounds
+                                                           // the alive-but-canary-slow case (which /health can't restart) so the node can't go dark forever.
     const MAX_QUARANTINE_MS: u64 = 300_000; // 5 min
     let empty_restart_enabled = std::env::var("SGL_EMPTY_RESTART")
         .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
@@ -1240,11 +1285,22 @@ pub async fn start(
     // kind="embedding" + its native dim so the orchestrator routes embeddings vs chat correctly
     // and can surface embeddings separately in /v1/models. Chat nodes send neither (byte-identical).
     let embed_dim: Option<u32> = engine.as_ref().and_then(|e| e.embedding_dim());
-    let node_kind: Option<&str> = if embed_dim.is_some() { Some("embedding") } else { None };
+    let node_kind: Option<&str> = if embed_dim.is_some() {
+        Some("embedding")
+    } else {
+        None
+    };
     // Vision (multimodal): advertise `vision: true` only when actually serving an mmproj model
     // (chat/embedding nodes omit it) so the orchestrator routes image requests only here.
     let node_vision: Option<bool> =
-        engine.as_ref().and_then(|e| if e.is_vision() { Some(true) } else { None });
+        engine
+            .as_ref()
+            .and_then(|e| if e.is_vision() { Some(true) } else { None });
+    // Confidentiality signal, reported from the engine that is ACTUALLY running rather than
+    // from the requested mode — a vision model silently forces the server engine below, so a
+    // node can be inprocess for text and server for vision. None only before the engine
+    // exists; the orchestrator must treat an ABSENT value as unknown, never as safe.
+    let node_engine: Option<&str> = engine.as_ref().map(|e| e.mode_label());
 
     loop {
         // ── #159 inference-progress watchdog ──────────────────────────────
@@ -1321,7 +1377,8 @@ pub async fn start(
                     empty_health.enter_quarantine(now);
                     match run_canary(eng).await {
                         CanaryOutcome::Empty => {
-                            let prior = empty_health.effective_restarts(now, EMPTY_RESTART_BUDGET_WINDOW_MS);
+                            let prior = empty_health
+                                .effective_restarts(now, EMPTY_RESTART_BUDGET_WINDOW_MS);
                             let since = now.saturating_sub(empty_health.last_restart_ms());
                             if prior >= MAX_EMPTY_RESTARTS {
                                 // Budget exhausted for this window: the engine is confirmed dead but
@@ -1429,7 +1486,9 @@ pub async fn start(
                             "llama-server not responding ({unhealthy_streak} checks) — auto-restarting engine (attempt {restart_attempts}/{MAX_ENGINE_RESTARTS})"
                         );
                         match eng.restart().await {
-                            Ok(()) => tracing::info!("engine restarted; re-verifying health next cycle"),
+                            Ok(()) => {
+                                tracing::info!("engine restarted; re-verifying health next cycle")
+                            }
                             Err(e) => tracing::error!("engine restart failed: {e}"),
                         }
                     } else {
@@ -1470,6 +1529,7 @@ pub async fn start(
                 node_kind,
                 embed_dim,
                 node_vision,
+                node_engine,
             )
             .await
         {
@@ -1563,7 +1623,11 @@ pub async fn status(config_dir: &Path, orchestrator_url: &str) -> Result<(), Str
 /// Toggle off-grid (maintenance) mode. Off-grid removes the node from job
 /// dispatch for planned downtime — no jobs are routed to it and it isn't
 /// penalized for being offline. Tamper slashing is unaffected.
-pub async fn set_off_grid(config_dir: &Path, orchestrator_url: &str, off_grid: bool) -> Result<(), String> {
+pub async fn set_off_grid(
+    config_dir: &Path,
+    orchestrator_url: &str,
+    off_grid: bool,
+) -> Result<(), String> {
     let cfg = config::load_config(config_dir)?;
     let client = OrchestratorClient::new(orchestrator_url, Some(cfg.auth_token.clone()));
     client.set_off_grid(&cfg.node_id, off_grid).await?;
@@ -1582,7 +1646,11 @@ pub async fn show_prices(config_dir: &Path, orchestrator_url: &str) -> Result<()
     let cfg = config::load_config(config_dir)?;
     let client = OrchestratorClient::new(orchestrator_url, Some(cfg.auth_token.clone()));
     let data = client.get_prices(&cfg.node_id).await?;
-    let prices = data.get("prices").and_then(|p| p.as_array()).cloned().unwrap_or_default();
+    let prices = data
+        .get("prices")
+        .and_then(|p| p.as_array())
+        .cloned()
+        .unwrap_or_default();
     if prices.is_empty() {
         println!("This node isn't serving any models yet.");
         return Ok(());
@@ -1593,28 +1661,46 @@ pub async fn show_prices(config_dir: &Path, orchestrator_url: &str) -> Result<()
         let eff = p.get("effective");
         let custom = p.get("custom").map(|c| !c.is_null()).unwrap_or(false);
         let r = p.get("reference");
-        let g = |v: Option<&serde_json::Value>, k: &str| v.and_then(|o| o.get(k)).and_then(|n| n.as_f64()).unwrap_or(0.0);
+        let g = |v: Option<&serde_json::Value>, k: &str| {
+            v.and_then(|o| o.get(k))
+                .and_then(|n| n.as_f64())
+                .unwrap_or(0.0)
+        };
         println!(
             "  {model:<20} in ${:.6} / out ${:.6}  [{}]   (suggested in ${:.6} / out ${:.6})",
-            g(eff, "inputPerM"), g(eff, "outputPerM"),
+            g(eff, "inputPerM"),
+            g(eff, "outputPerM"),
             if custom { "custom" } else { "suggested" },
-            g(r, "inputPerM"), g(r, "outputPerM"),
+            g(r, "inputPerM"),
+            g(r, "outputPerM"),
         );
     }
     Ok(())
 }
 
 /// Set a custom per-token price for a model (USD per 1M tokens). Band-enforced server-side.
-pub async fn set_price(config_dir: &Path, orchestrator_url: &str, model: &str, input_per_m: f64, output_per_m: f64) -> Result<(), String> {
+pub async fn set_price(
+    config_dir: &Path,
+    orchestrator_url: &str,
+    model: &str,
+    input_per_m: f64,
+    output_per_m: f64,
+) -> Result<(), String> {
     let cfg = config::load_config(config_dir)?;
     let client = OrchestratorClient::new(orchestrator_url, Some(cfg.auth_token.clone()));
-    client.set_price(&cfg.node_id, model, input_per_m, output_per_m).await?;
+    client
+        .set_price(&cfg.node_id, model, input_per_m, output_per_m)
+        .await?;
     println!("✅ Price set for {model}: in ${input_per_m}/1M · out ${output_per_m}/1M. You earn 80% of what you charge.");
     Ok(())
 }
 
 /// Reset a model's price back to the platform suggested rate.
-pub async fn reset_price(config_dir: &Path, orchestrator_url: &str, model: &str) -> Result<(), String> {
+pub async fn reset_price(
+    config_dir: &Path,
+    orchestrator_url: &str,
+    model: &str,
+) -> Result<(), String> {
     let cfg = config::load_config(config_dir)?;
     let client = OrchestratorClient::new(orchestrator_url, Some(cfg.auth_token.clone()));
     client.reset_price(&cfg.node_id, model).await?;
@@ -1745,7 +1831,15 @@ async fn process_job(
         && effective_job.job_type == "inference"
     {
         if let Some(resp_pub) = response_pubkey {
-            process_inference_stream(client, engine, &effective_job, node_secret, &resp_pub, empty_health).await;
+            process_inference_stream(
+                client,
+                engine,
+                &effective_job,
+                node_secret,
+                &resp_pub,
+                empty_health,
+            )
+            .await;
             return;
         }
     }
@@ -1855,9 +1949,7 @@ struct InferenceParams {
     tool_choice: Option<serde_json::Value>,
 }
 
-fn parse_inference_params(
-    payload: Option<&serde_json::Value>,
-) -> Result<InferenceParams, String> {
+fn parse_inference_params(payload: Option<&serde_json::Value>) -> Result<InferenceParams, String> {
     let payload = payload.ok_or("Job has no input payload")?;
 
     // Forward messages opaquely (don't destructure to {role,content} — that would drop tool
@@ -1921,7 +2013,9 @@ fn parse_inference_params(
         }
         let bytes = t.to_string().len();
         if bytes > MAX_TOOLS_BYTES {
-            return Err(format!("tools schema too large ({bytes} bytes > {MAX_TOOLS_BYTES})"));
+            return Err(format!(
+                "tools schema too large ({bytes} bytes > {MAX_TOOLS_BYTES})"
+            ));
         }
     }
     let tool_choice = if tools.is_some() {
@@ -2086,7 +2180,13 @@ async fn execute_inference(
     let tools_requested = p.tools.is_some();
 
     let result = engine
-        .chat_completion(p.messages, p.temperature, p.max_tokens, p.tools, p.tool_choice)
+        .chat_completion(
+            p.messages,
+            p.temperature,
+            p.max_tokens,
+            p.tools,
+            p.tool_choice,
+        )
         .await?;
 
     let homura_model = is_homura_model(job);
@@ -2112,7 +2212,10 @@ async fn execute_inference(
     } else if tool_calls.is_none() && content.trim().is_empty() {
         empty_health.record_empty();
         if homura_model {
-            return Err("Inference produced no user-visible output after HOMURA protocol cleanup".to_string());
+            return Err(
+                "Inference produced no user-visible output after HOMURA protocol cleanup"
+                    .to_string(),
+            );
         }
     } else {
         empty_health.record_ok();
@@ -2120,7 +2223,10 @@ async fn execute_inference(
     // Tolerant fallback: model emitted the tool call as text → synthesize structured tool_calls.
     if tools_requested && tool_calls.is_none() {
         if let Some(tc) = extract_text_tool_calls(&content, &tool_names, &job.id) {
-            tracing::info!("job {}: extracted tool_calls from text reply (nonstandard format)", job.id);
+            tracing::info!(
+                "job {}: extracted tool_calls from text reply (nonstandard format)",
+                job.id
+            );
             tool_calls = Some(tc);
             finish_reason = Some("tool_calls".to_string());
             // OpenAI semantics: a tool-call turn carries no user-facing content.
@@ -2163,7 +2269,10 @@ async fn execute_embedding(
         if !engine.is_embedding() {
             return Err("this node is not an embedding node".to_string());
         }
-        let payload = job.input_payload.as_ref().ok_or("Job has no input payload")?;
+        let payload = job
+            .input_payload
+            .as_ref()
+            .ok_or("Job has no input payload")?;
 
         // `input`: string | string[] (OpenAI shape). Reject anything else.
         let inputs: Vec<String> = match payload.get("input") {
@@ -2235,7 +2344,10 @@ mod tool_extract_tests {
         let c = "<function-call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Tokyo\"}}\n</function-call>";
         let tc = extract_text_tool_calls(c, &allowed(), "jobid123").unwrap();
         assert_eq!(tc[0]["function"]["name"], "get_weather");
-        assert!(tc[0]["function"]["arguments"].as_str().unwrap().contains("Tokyo"));
+        assert!(tc[0]["function"]["arguments"]
+            .as_str()
+            .unwrap()
+            .contains("Tokyo"));
     }
 
     #[test]
@@ -2258,7 +2370,9 @@ mod tool_extract_tests {
             "j"
         )
         .is_none());
-        assert!(extract_text_tool_calls("Here is code: `{}` and {\"a\":1}", &allowed(), "j").is_none());
+        assert!(
+            extract_text_tool_calls("Here is code: `{}` and {\"a\":1}", &allowed(), "j").is_none()
+        );
         assert!(extract_text_tool_calls("no braces at all", &allowed(), "j").is_none());
     }
 
@@ -2275,7 +2389,10 @@ mod tool_extract_tests {
             assert_eq!(tc.as_array().unwrap().len(), 1, "case: {c}");
             assert_eq!(tc[0]["function"]["name"], "get_weather", "case: {c}");
             assert!(
-                tc[0]["function"]["arguments"].as_str().unwrap().contains("Tokyo"),
+                tc[0]["function"]["arguments"]
+                    .as_str()
+                    .unwrap()
+                    .contains("Tokyo"),
                 "case: {c}"
             );
         }
@@ -2371,10 +2488,19 @@ mod empty_health_tests {
 
     #[test]
     fn whitespace_or_empty_prompt_is_exempt() {
-        assert!(!request_expects_output(&json!([{ "role": "user", "content": "   " }]), 512));
-        assert!(!request_expects_output(&json!([{ "role": "user", "content": "" }]), 512));
+        assert!(!request_expects_output(
+            &json!([{ "role": "user", "content": "   " }]),
+            512
+        ));
+        assert!(!request_expects_output(
+            &json!([{ "role": "user", "content": "" }]),
+            512
+        ));
         // No string content at all (e.g. only a tool/assistant scaffold) → exempt.
-        assert!(!request_expects_output(&json!([{ "role": "assistant", "content": null }]), 512));
+        assert!(!request_expects_output(
+            &json!([{ "role": "assistant", "content": null }]),
+            512
+        ));
     }
 
     #[test]
@@ -2391,7 +2517,8 @@ mod empty_health_tests {
     fn array_of_parts_content_is_recognized() {
         // OpenAI multimodal shape: content is an array of typed parts. A text part with real text
         // must count as expecting output (llama-server serves these; they must not be blanket-exempt).
-        let msgs = json!([{ "role": "user", "content": [{ "type": "text", "text": "Describe this." }] }]);
+        let msgs =
+            json!([{ "role": "user", "content": [{ "type": "text", "text": "Describe this." }] }]);
         assert!(request_expects_output(&msgs, 512));
         // An array with only empty text is exempt.
         let empty = json!([{ "role": "user", "content": [{ "type": "text", "text": "  " }] }]);
@@ -2556,12 +2683,16 @@ async fn process_inference_stream(
             Ok(v) => match serde_json::to_value(v) {
                 Ok(val) => val,
                 Err(e) => {
-                    let _ = client.fail_job(&job.id, &format!("Invalid messages format: {e}")).await;
+                    let _ = client
+                        .fail_job(&job.id, &format!("Invalid messages format: {e}"))
+                        .await;
                     return;
                 }
             },
             Err(e) => {
-                let _ = client.fail_job(&job.id, &format!("Invalid messages format: {e}")).await;
+                let _ = client
+                    .fail_job(&job.id, &format!("Invalid messages format: {e}"))
+                    .await;
                 return;
             }
         }
@@ -2630,8 +2761,16 @@ async fn process_inference_stream(
                 saw_tool_call = true;
                 let payload = serde_json::json!({ "tc": delta }).to_string();
                 match seal_post_chunk(
-                    client, &sealer, node_secret, &job.id, &eph_b58, seq, false,
-                    payload.as_bytes(), None, Some("json"),
+                    client,
+                    &sealer,
+                    node_secret,
+                    &job.id,
+                    &eph_b58,
+                    seq,
+                    false,
+                    payload.as_bytes(),
+                    None,
+                    Some("json"),
                 )
                 .await
                 {
@@ -2661,8 +2800,16 @@ async fn process_inference_stream(
                     emitted_nonws = true;
                 }
                 match seal_post_chunk(
-                    client, &sealer, node_secret, &job.id, &eph_b58, seq, false,
-                    &encode_text(&out_text), None, chunk_fmt,
+                    client,
+                    &sealer,
+                    node_secret,
+                    &job.id,
+                    &eph_b58,
+                    seq,
+                    false,
+                    &encode_text(&out_text),
+                    None,
+                    chunk_fmt,
                 )
                 .await
                 {
@@ -2689,8 +2836,16 @@ async fn process_inference_stream(
                             emitted_nonws = true;
                         }
                         match seal_post_chunk(
-                            client, &sealer, node_secret, &job.id, &eph_b58, seq, false,
-                            &encode_text(&tail), None, chunk_fmt,
+                            client,
+                            &sealer,
+                            node_secret,
+                            &job.id,
+                            &eph_b58,
+                            seq,
+                            false,
+                            &encode_text(&tail),
+                            None,
+                            chunk_fmt,
                         )
                         .await
                         {
@@ -2700,7 +2855,10 @@ async fn process_inference_stream(
                                 break;
                             }
                             Err(e) => {
-                                tracing::warn!("Job {} cleanup tail chunk post failed: {e}", job.id);
+                                tracing::warn!(
+                                    "Job {} cleanup tail chunk post failed: {e}",
+                                    job.id
+                                );
                                 client_gone = true;
                                 break;
                             }
@@ -2723,12 +2881,25 @@ async fn process_inference_stream(
                 // OpenAI clients branch on finish_reason: "tool_calls" tells an agent loop to
                 // execute the calls and come back. Without it a streamed tool turn looks like
                 // a normal answer and the agent stops instead of acting.
-                let finish_reason = if saw_tool_call { Some("tool_calls") } else { None };
+                let finish_reason = if saw_tool_call {
+                    Some("tool_calls")
+                } else {
+                    None
+                };
                 let _ = &finish_reason;
                 // Only treat as success if the final chunk was actually accepted;
                 // otherwise fall through to the failure path below.
                 match seal_post_chunk(
-                    client, &sealer, node_secret, &job.id, &eph_b58, seq, true, b"", Some(usage), None,
+                    client,
+                    &sealer,
+                    node_secret,
+                    &job.id,
+                    &eph_b58,
+                    seq,
+                    true,
+                    b"",
+                    Some(usage),
+                    None,
                 )
                 .await
                 {
@@ -2775,7 +2946,16 @@ async fn process_inference_stream(
             "total_tokens": emitted_tokens,
         });
         let _ = seal_post_chunk(
-            client, &sealer, node_secret, &job.id, &eph_b58, seq, true, b"", Some(usage), None,
+            client,
+            &sealer,
+            node_secret,
+            &job.id,
+            &eph_b58,
+            seq,
+            true,
+            b"",
+            Some(usage),
+            None,
         )
         .await;
         tracing::warn!(
@@ -2805,7 +2985,9 @@ async fn process_inference_stream(
     };
     if let Err(e) = client.report_stream_error(&job.id).await {
         tracing::warn!("stream error report failed for {}: {e}", job.id);
-        let _ = client.fail_job(&job.id, &format!("stream failed: {reason}")).await;
+        let _ = client
+            .fail_job(&job.id, &format!("stream failed: {reason}"))
+            .await;
     }
     tracing::warn!("Job {} stream failed: {reason}", job.id);
 }

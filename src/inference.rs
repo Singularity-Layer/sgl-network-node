@@ -148,9 +148,14 @@ struct StreamDelta {
 /// carrying final token counts. A generation failure is signalled by the
 /// function returning `Err` WITHOUT a `Done` — never a forged terminal.
 pub enum StreamEvent {
-    Delta { text: String, tokens: u32 },
+    Delta {
+        text: String,
+        tokens: u32,
+    },
     /// One tool-call delta batch, forwarded verbatim from llama-server.
-    ToolCalls { delta: serde_json::Value },
+    ToolCalls {
+        delta: serde_json::Value,
+    },
     Done {
         prompt_tokens: u32,
         completion_tokens: u32,
@@ -238,7 +243,9 @@ impl ServerEngine {
         dimensions: Option<u32>,
     ) -> Result<crate::embed_catalog::EmbedOut, String> {
         use crate::embed_catalog::{l2_normalize, InputType};
-        let spec = self.embed_spec.ok_or("this node is not an embedding node")?;
+        let spec = self
+            .embed_spec
+            .ok_or("this node is not an embedding node")?;
         // Resolve the effective output dim (Matryoshka truncation). Reject an unsupported
         // request rather than guessing (mirrors the in-process engine + orchestrator).
         let eff_dim = match dimensions {
@@ -258,7 +265,13 @@ impl ServerEngine {
         let n = inputs.len();
         let texts: Vec<String> = inputs
             .into_iter()
-            .map(|i| if prefix.is_empty() { i } else { format!("{prefix}{i}") })
+            .map(|i| {
+                if prefix.is_empty() {
+                    i
+                } else {
+                    format!("{prefix}{i}")
+                }
+            })
             .collect();
 
         let url = format!("{}/v1/embeddings", self.base_url);
@@ -347,7 +360,10 @@ impl ServerEngine {
             .pointer("/usage/prompt_tokens")
             .and_then(|t| t.as_u64())
             .unwrap_or(0) as u32;
-        Ok(crate::embed_catalog::EmbedOut { vectors, prompt_tokens })
+        Ok(crate::embed_catalog::EmbedOut {
+            vectors,
+            prompt_tokens,
+        })
     }
 
     pub async fn start(&self) -> Result<(), String> {
@@ -367,22 +383,23 @@ impl ServerEngine {
         // with the official Qwen2.5 tool-enabled template (teaches `<tool_call>`, which the
         // server parses natively into structured tool_calls). Excludes R1/QwQ distills — those
         // need their own reasoning templates. Written to a temp file each start.
-        let template_file: Option<String> = if self.embed_spec.is_none()
-            && qwen_template_override(&self.config.model_path)
-        {
-            match write_qwen_tools_template() {
-                Ok(p) => {
-                    tracing::info!("using Qwen2.5 tool-enabled chat template override");
-                    Some(p)
+        let template_file: Option<String> =
+            if self.embed_spec.is_none() && qwen_template_override(&self.config.model_path) {
+                match write_qwen_tools_template() {
+                    Ok(p) => {
+                        tracing::info!("using Qwen2.5 tool-enabled chat template override");
+                        Some(p)
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "failed to write Qwen template override (continuing without): {e}"
+                        );
+                        None
+                    }
                 }
-                Err(e) => {
-                    tracing::warn!("failed to write Qwen template override (continuing without): {e}");
-                    None
-                }
-            }
-        } else {
-            None
-        };
+            } else {
+                None
+            };
 
         let llama_server = find_llama_server()?;
         tracing::info!(
@@ -417,26 +434,41 @@ impl ServerEngine {
             .unwrap_or_default();
         if let Some(spec) = self.embed_spec {
             let args: Vec<&str> = vec![
-                "-m", &model_str,
-                "--host", "127.0.0.1",
-                "--port", &port_str,
-                "-t", &threads_str,
-                "-c", &embed_ctx_str,
-                "-b", &embed_ctx_str,
-                "-ub", &embed_ctx_str,
+                "-m",
+                &model_str,
+                "--host",
+                "127.0.0.1",
+                "--port",
+                &port_str,
+                "-t",
+                &threads_str,
+                "-c",
+                &embed_ctx_str,
+                "-b",
+                &embed_ctx_str,
+                "-ub",
+                &embed_ctx_str,
                 "--embedding",
-                "--pooling", spec.pooling.as_server_flag(),
+                "--pooling",
+                spec.pooling.as_server_flag(),
             ];
             return self.spawn_server(&llama_server, &args).await;
         }
         let mut args: Vec<&str> = vec![
-            "-m", &model_str,
-            "--host", "127.0.0.1",
-            "--port", &port_str,
-            "-c", &ctx_str,
-            "-t", &threads_str,
-            "-b", &batch_str,
-            "--parallel", &parallel_str,
+            "-m",
+            &model_str,
+            "--host",
+            "127.0.0.1",
+            "--port",
+            &port_str,
+            "-c",
+            &ctx_str,
+            "-t",
+            &threads_str,
+            "-b",
+            &batch_str,
+            "--parallel",
+            &parallel_str,
             // Continuous batching: interleave multiple in-flight requests in one
             // decode loop so the node serves `--parallel` jobs concurrently instead
             // of one-at-a-time. This is what stops "busy after a single request".
@@ -446,7 +478,8 @@ impl ServerEngine {
             // field that we don't forward — so the browser never saw the reasoning. With
             // `none`, DeepSeek-R1 / QwQ etc. stream their thinking inline and the playground's
             // reasoning parser renders the "Thinking" box. No-op for non-reasoning models.
-            "--reasoning-format", "none",
+            "--reasoning-format",
+            "none",
             // Use the model's embedded chat template (minijinja) so OpenAI `tools`/`tool_choice`
             // activate the tool grammar and the reply carries structured `tool_calls` — the
             // unlock for agentic coding clients (OpenCode/Cline/Roo). Without --jinja, tool
@@ -535,7 +568,9 @@ impl ServerEngine {
 
         // Store the new child (replacing any prior handle). Lock is dropped before the
         // await loop below — never hold a std Mutex guard across .await.
-        { *self.server_process.lock().unwrap() = Some(child); }
+        {
+            *self.server_process.lock().unwrap() = Some(child);
+        }
 
         for i in 0..30 {
             sleep(Duration::from_secs(1)).await;
@@ -598,7 +633,9 @@ impl ServerEngine {
                 );
                 match crate::setup::run(true).await {
                     Ok(_) => tracing::info!("CPU engine installed — relaunching"),
-                    Err(e) => tracing::warn!("engine auto-swap failed (continuing with current build): {e}"),
+                    Err(e) => tracing::warn!(
+                        "engine auto-swap failed (continuing with current build): {e}"
+                    ),
                 }
             }
         }
@@ -611,7 +648,13 @@ impl ServerEngine {
         let url = format!("{}/health", self.base_url);
         // Bounded so start()'s 30s readiness wait can't hang on a /health that accepts
         // the connection but never responds.
-        match self.client.get(&url).timeout(Duration::from_secs(3)).send().await {
+        match self
+            .client
+            .get(&url)
+            .timeout(Duration::from_secs(3))
+            .send()
+            .await
+        {
             Ok(resp) => {
                 if let Ok(h) = resp.json::<HealthResponse>().await {
                     h.status.as_deref() == Some("ok")
@@ -683,7 +726,8 @@ impl ServerEngine {
                 Err(e) => return Err(inference_transport_error(e)),
             }
         }
-        let resp = resp.ok_or_else(|| "Inference backend unavailable; retry shortly".to_string())?;
+        let resp =
+            resp.ok_or_else(|| "Inference backend unavailable; retry shortly".to_string())?;
 
         if !resp.status().is_success() {
             let text = resp.text().await.unwrap_or_default();
@@ -815,7 +859,11 @@ impl ServerEngine {
                             })
                             .await;
                     }
-                    let c = if completion_tokens > 0 { completion_tokens } else { emitted };
+                    let c = if completion_tokens > 0 {
+                        completion_tokens
+                    } else {
+                        emitted
+                    };
                     let _ = tx
                         .send(StreamEvent::Done {
                             prompt_tokens,
@@ -922,7 +970,9 @@ impl EngineMode {
         match s.to_ascii_lowercase().as_str() {
             "server" => Ok(EngineMode::Server),
             "inprocess" | "in-process" => Ok(EngineMode::InProcess),
-            other => Err(format!("unknown --engine '{other}' (use 'server' or 'inprocess')")),
+            other => Err(format!(
+                "unknown --engine '{other}' (use 'server' or 'inprocess')"
+            )),
         }
     }
 }
@@ -942,6 +992,28 @@ pub enum InferenceEngine {
 }
 
 impl InferenceEngine {
+    /// Which engine is ACTUALLY running, for the heartbeat.
+    ///
+    /// This is a confidentiality signal, not a cosmetic one. User prompts are end-to-end
+    /// encrypted and this node is the only place they are decrypted. The `server` engine
+    /// then hands that PLAINTEXT to a separate llama-server child over unauthenticated
+    /// HTTP on 127.0.0.1, where the machine's operator can read it. The `inprocess`
+    /// engine keeps plaintext inside this hardened process. The orchestrator cannot tell
+    /// these apart unless we say so — and without that it cannot refuse to route
+    /// confidential traffic to an exposed node.
+    ///
+    /// Report what is TRUE right now: a vision model silently forces the server engine
+    /// (node.rs), so a node can be `inprocess` for text and `server` for vision.
+    pub fn mode_label(&self) -> &'static str {
+        match self {
+            InferenceEngine::Server(_) => "server",
+            #[cfg(feature = "inprocess")]
+            InferenceEngine::InProcess(_) => "inprocess",
+            #[cfg(feature = "inprocess")]
+            InferenceEngine::Embed(_) => "inprocess",
+        }
+    }
+
     /// Build + start the chosen engine.
     pub async fn create(config: InferenceEngineConfig, mode: EngineMode) -> Result<Self, String> {
         // Embedding models get the dedicated pooling engine regardless of `--engine` (they can't
@@ -951,7 +1023,11 @@ impl InferenceEngine {
             let e = crate::embed::EmbedEngine::start(crate::embed::EmbedConfig {
                 model_path: config.model_path,
                 model_name: config.model_name,
-                n_gpu_layers: if config.gpu_layers == GPU_LAYERS_AUTO { 999 } else { config.gpu_layers },
+                n_gpu_layers: if config.gpu_layers == GPU_LAYERS_AUTO {
+                    999
+                } else {
+                    config.gpu_layers
+                },
             })
             .await?;
             return Ok(InferenceEngine::Embed(e));
@@ -970,22 +1046,31 @@ impl InferenceEngine {
                     // continuous batching across `parallel_slots` sequences.
                     let max_slots = config.parallel_slots.max(1);
                     let per_slot_ctx = (config.context_size / max_slots).max(1);
-                    let e = crate::inprocess::InProcessEngine::start(crate::inprocess::InProcessConfig {
-                        model_path: config.model_path,
-                        model_name: config.model_name,
-                        n_ctx: config.context_size,
-                        // Auto-fit on the in-process engine (Mac unified memory): offload all layers.
-                        n_gpu_layers: if config.gpu_layers == GPU_LAYERS_AUTO { 999 } else { config.gpu_layers },
-                        max_slots,
-                        per_slot_ctx,
-                    })
+                    let e = crate::inprocess::InProcessEngine::start(
+                        crate::inprocess::InProcessConfig {
+                            model_path: config.model_path,
+                            model_name: config.model_name,
+                            n_ctx: config.context_size,
+                            // Auto-fit on the in-process engine (Mac unified memory): offload all layers.
+                            n_gpu_layers: if config.gpu_layers == GPU_LAYERS_AUTO {
+                                999
+                            } else {
+                                config.gpu_layers
+                            },
+                            max_slots,
+                            per_slot_ctx,
+                        },
+                    )
                     .await?;
                     Ok(InferenceEngine::InProcess(e))
                 }
                 #[cfg(not(feature = "inprocess"))]
                 {
                     let _ = config;
-                    Err("--engine=inprocess requires a build with the `inprocess` feature".to_string())
+                    Err(
+                        "--engine=inprocess requires a build with the `inprocess` feature"
+                            .to_string(),
+                    )
                 }
             }
         }
@@ -1117,7 +1202,8 @@ impl InferenceEngine {
     ) -> Result<InferenceResult, String> {
         match self {
             InferenceEngine::Server(e) => {
-                e.chat_completion(messages, temperature, max_tokens, tools, tool_choice).await
+                e.chat_completion(messages, temperature, max_tokens, tools, tool_choice)
+                    .await
             }
             #[cfg(feature = "inprocess")]
             InferenceEngine::InProcess(e) => {
@@ -1127,7 +1213,9 @@ impl InferenceEngine {
                 let _ = (&tools, &tool_choice);
                 let msgs: Vec<ChatMessage> = serde_json::from_value(messages)
                     .map_err(|e| format!("Invalid messages format: {e}"))?;
-                let out = e.chat_completion(&msgs, max_tokens, temperature as f32).await?;
+                let out = e
+                    .chat_completion(&msgs, max_tokens, temperature as f32)
+                    .await?;
                 Ok(InferenceResult {
                     content: out.content,
                     model: e.model_name().to_string(),
@@ -1155,7 +1243,8 @@ impl InferenceEngine {
     ) -> Result<(), String> {
         match self {
             InferenceEngine::Server(e) => {
-                e.chat_completion_stream(messages, tools, tool_choice, temperature, max_tokens, tx).await
+                e.chat_completion_stream(messages, tools, tool_choice, temperature, max_tokens, tx)
+                    .await
             }
             #[cfg(feature = "inprocess")]
             InferenceEngine::InProcess(e) => {
@@ -1168,7 +1257,8 @@ impl InferenceEngine {
                 }
                 let typed: Vec<ChatMessage> = serde_json::from_value(messages)
                     .map_err(|e| format!("Invalid messages format: {e}"))?;
-                e.chat_completion_stream(&typed, max_tokens, temperature as f32, tx).await
+                e.chat_completion_stream(&typed, max_tokens, temperature as f32, tx)
+                    .await
             }
             #[cfg(feature = "inprocess")]
             InferenceEngine::Embed(_) => {
@@ -1219,12 +1309,24 @@ mod template_override_tests {
 
     #[test]
     fn qwen_models_get_override_but_reasoning_distills_do_not() {
-        assert!(qwen_template_override(Path::new("/opt/sgl/models/qwen-coder-7b.gguf")));
-        assert!(qwen_template_override(Path::new("/opt/sgl/models/qwen-2.5-14b.gguf")));
-        assert!(!qwen_template_override(Path::new("/opt/sgl/models/r1-qwen-14b.gguf")));
-        assert!(!qwen_template_override(Path::new("/opt/sgl/models/r1-llama-8b.gguf")));
-        assert!(!qwen_template_override(Path::new("/opt/sgl/models/qwq-32b.gguf")));
-        assert!(!qwen_template_override(Path::new("/opt/sgl/models/gemma-2-2b.gguf")));
+        assert!(qwen_template_override(Path::new(
+            "/opt/sgl/models/qwen-coder-7b.gguf"
+        )));
+        assert!(qwen_template_override(Path::new(
+            "/opt/sgl/models/qwen-2.5-14b.gguf"
+        )));
+        assert!(!qwen_template_override(Path::new(
+            "/opt/sgl/models/r1-qwen-14b.gguf"
+        )));
+        assert!(!qwen_template_override(Path::new(
+            "/opt/sgl/models/r1-llama-8b.gguf"
+        )));
+        assert!(!qwen_template_override(Path::new(
+            "/opt/sgl/models/qwq-32b.gguf"
+        )));
+        assert!(!qwen_template_override(Path::new(
+            "/opt/sgl/models/gemma-2-2b.gguf"
+        )));
     }
 }
 
@@ -1290,7 +1392,14 @@ fn find_llama_server() -> Result<String, String> {
         // without this ordering a stale Homebrew llama-server (predating a model's
         // arch) would shadow the managed copy and the fallback would fail anyway.
         if let Some(local) = dirs::data_local_dir() {
-            candidates.push(local.join("sgl-node").join("bin").join("llama-server").to_string_lossy().into_owned());
+            candidates.push(
+                local
+                    .join("sgl-node")
+                    .join("bin")
+                    .join("llama-server")
+                    .to_string_lossy()
+                    .into_owned(),
+            );
         }
         candidates.push("llama-server".to_string());
         candidates.push("llama-cli".to_string());

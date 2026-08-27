@@ -155,6 +155,12 @@ struct NodeCapabilities {
     // requests to a vision-capable node.
     #[serde(skip_serializing_if = "Option::is_none")]
     vision: Option<bool>,
+    // Which inference engine is actually running: "inprocess" (plaintext never leaves this
+    // process) or "server" (plaintext crosses an unauthenticated 127.0.0.1 socket to a
+    // llama-server child, where the OPERATOR can read it). The orchestrator needs this to
+    // avoid routing confidential traffic onto the exposed path — it has no other way to know.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    engine: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -400,6 +406,8 @@ impl OrchestratorClient {
         dim: Option<u32>,
         // Vision: Some(true) when serving an mmproj (multimodal) model, else None.
         vision: Option<bool>,
+        // "inprocess" | "server" — see NodeCapabilities::engine.
+        engine: Option<&str>,
     ) -> Result<HeartbeatResponse, String> {
         let url = format!("{}/grid/nodes/heartbeat", self.base_url);
         let token = self.get_token()?;
@@ -417,6 +425,7 @@ impl OrchestratorClient {
                 kind: kind.map(|s| s.to_string()),
                 dim,
                 vision,
+                engine: engine.map(|s| s.to_string()),
             },
             active_job_ids,
             binary_hash,
