@@ -22,8 +22,12 @@ fn cosine(a: &[f32], b: &[f32]) -> f32 {
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() {
-    let path = std::env::args().nth(1).expect("usage: embed_batch_test <embed.gguf> [model-id]");
-    let model_id = std::env::args().nth(2).unwrap_or_else(|| "bge-base-en-v1.5".into());
+    let path = std::env::args()
+        .nth(1)
+        .expect("usage: embed_batch_test <embed.gguf> [model-id]");
+    let model_id = std::env::args()
+        .nth(2)
+        .unwrap_or_else(|| "bge-base-en-v1.5".into());
 
     println!("== starting embed engine: {model_id} ==");
     let engine = EmbedEngine::start(EmbedConfig {
@@ -56,13 +60,25 @@ async fn main() {
     //    If this is slow but a repeat is fast, Metal is compiling pipelines per batch shape. ──
     {
         let t = Instant::now();
-        let cold = engine.embed(inputs.clone(), InputType::Document, None).await.expect("cold batch");
+        let cold = engine
+            .embed(inputs.clone(), InputType::Document, None)
+            .await
+            .expect("cold batch");
         let cold_ms = t.elapsed().as_millis();
         assert_eq!(cold.vectors.len(), inputs.len());
         let t2 = Instant::now();
-        let _warm = engine.embed(inputs.clone(), InputType::Document, None).await.expect("warm batch");
+        let _warm = engine
+            .embed(inputs.clone(), InputType::Document, None)
+            .await
+            .expect("warm batch");
         let warm_ms = t2.elapsed().as_millis();
-        println!("COLD batch({}) = {}ms | WARM batch({}) = {}ms  (compile-per-shape if cold>>warm)", inputs.len(), cold_ms, inputs.len(), warm_ms);
+        println!(
+            "COLD batch({}) = {}ms | WARM batch({}) = {}ms  (compile-per-shape if cold>>warm)",
+            inputs.len(),
+            cold_ms,
+            inputs.len(),
+            warm_ms
+        );
     }
 
     // ── 1) Reference: embed each input ALONE (one input per job → no packing). ──
@@ -85,7 +101,11 @@ async fn main() {
         .await
         .expect("batch embed");
     let batch_ms = t_batch.elapsed().as_millis();
-    assert_eq!(batched.vectors.len(), inputs.len(), "batch returned wrong count");
+    assert_eq!(
+        batched.vectors.len(),
+        inputs.len(),
+        "batch returned wrong count"
+    );
 
     // ── PARITY + ORDER: batched[i] must match singles[i] (same input, same slot). ──
     let mut worst = 1.0f32;
@@ -99,19 +119,37 @@ async fn main() {
         );
         // Every vector must be unit-length + finite.
         let norm: f32 = batched.vectors[i].iter().map(|x| x * x).sum::<f32>().sqrt();
-        assert!((norm - 1.0).abs() < 1e-3, "vector {i} not unit-length: {norm}");
-        assert!(batched.vectors[i].iter().all(|x| x.is_finite()), "vector {i} has non-finite");
+        assert!(
+            (norm - 1.0).abs() < 1e-3,
+            "vector {i} not unit-length: {norm}"
+        );
+        assert!(
+            batched.vectors[i].iter().all(|x| x.is_finite()),
+            "vector {i} has non-finite"
+        );
     }
-    println!("PARITY ok — worst cosine(single, batched) = {worst:.6} across {} inputs", inputs.len());
+    println!(
+        "PARITY ok — worst cosine(single, batched) = {worst:.6} across {} inputs",
+        inputs.len()
+    );
 
     // ── ORDER (negative check): a DIFFERENT input must NOT match (guards seq_id misalignment). ──
     let cross = cosine(&batched.vectors[3], &batched.vectors[8]); // "cat" vs "Paris ..." — should be low
-    assert!(cross < 0.95, "distinct inputs too similar ({cross}) — possible seq_id mixup");
+    assert!(
+        cross < 0.95,
+        "distinct inputs too similar ({cross}) — possible seq_id mixup"
+    );
     println!("ORDER ok — distinct-input cosine = {cross:.4} (well below self-match)");
 
     // ── SPEED: the batched pass should be well under the serial sum. ──
-    println!("SPEED — serial {serial_ms}ms vs batched {batch_ms}ms  (speedup {:.1}x)", serial_ms as f64 / batch_ms.max(1) as f64);
-    assert!(batch_ms * 2 < serial_ms.max(1), "batched not meaningfully faster: {batch_ms}ms vs serial {serial_ms}ms");
+    println!(
+        "SPEED — serial {serial_ms}ms vs batched {batch_ms}ms  (speedup {:.1}x)",
+        serial_ms as f64 / batch_ms.max(1) as f64
+    );
+    assert!(
+        batch_ms * 2 < serial_ms.max(1),
+        "batched not meaningfully faster: {batch_ms}ms vs serial {serial_ms}ms"
+    );
 
     // ── prompt_tokens must be the SUM across the batch (billing is input-only). ──
     println!("prompt_tokens (batch) = {}", batched.prompt_tokens);

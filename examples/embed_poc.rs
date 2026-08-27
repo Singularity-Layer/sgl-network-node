@@ -72,16 +72,26 @@ async fn main() {
 
     check(
         out.vectors.len() == sentences.len(),
-        format!("returned {} vectors for {} inputs", out.vectors.len(), sentences.len()),
+        format!(
+            "returned {} vectors for {} inputs",
+            out.vectors.len(),
+            sentences.len()
+        ),
     );
     check(
         out.prompt_tokens > 0,
         format!("prompt_tokens reported = {}", out.prompt_tokens),
     );
     for (i, v) in out.vectors.iter().enumerate() {
-        check(v.len() == spec.dim as usize, format!("vec[{i}] dim {} == {}", v.len(), spec.dim));
+        check(
+            v.len() == spec.dim as usize,
+            format!("vec[{i}] dim {} == {}", v.len(), spec.dim),
+        );
         let n = l2(v);
-        check((n - 1.0).abs() < 1e-3, format!("vec[{i}] L2 norm {n:.6} ≈ 1.0"));
+        check(
+            (n - 1.0).abs() < 1e-3,
+            format!("vec[{i}] L2 norm {n:.6} ≈ 1.0"),
+        );
         let all_zero = v.iter().all(|x| *x == 0.0);
         let any_nan = v.iter().any(|x| !x.is_finite());
         check(!all_zero && !any_nan, format!("vec[{i}] non-zero + finite"));
@@ -109,7 +119,10 @@ async fn main() {
             .expect("matryoshka embed failed");
         check(
             t.vectors[0].len() == small as usize,
-            format!("matryoshka: requested {small}-dim → got {}", t.vectors[0].len()),
+            format!(
+                "matryoshka: requested {small}-dim → got {}",
+                t.vectors[0].len()
+            ),
         );
         check(
             (l2(&t.vectors[0]) - 1.0).abs() < 1e-3,
@@ -121,7 +134,11 @@ async fn main() {
 
     // ── 5: query vs document input_type both produce valid vectors ──
     let q = engine
-        .embed(vec!["what is the capital of France?".to_string()], InputType::Query, None)
+        .embed(
+            vec!["what is the capital of France?".to_string()],
+            InputType::Query,
+            None,
+        )
         .await
         .expect("query embed failed");
     check(
@@ -131,13 +148,24 @@ async fn main() {
 
     // ── 6: reject an unsupported dimensions request ──
     let bad = engine
-        .embed(vec!["hello".to_string()], InputType::Document, Some(spec.dim + 7))
+        .embed(
+            vec!["hello".to_string()],
+            InputType::Document,
+            Some(spec.dim + 7),
+        )
         .await;
-    check(bad.is_err(), "unsupported `dimensions` is rejected (not silently wrong)".to_string());
+    check(
+        bad.is_err(),
+        "unsupported `dimensions` is rejected (not silently wrong)".to_string(),
+    );
 
     println!(
         "\n================ {} ================",
-        if failures.is_empty() { "ALL CHECKS PASSED" } else { "FAILURES PRESENT" }
+        if failures.is_empty() {
+            "ALL CHECKS PASSED"
+        } else {
+            "FAILURES PRESENT"
+        }
     );
     if !failures.is_empty() {
         for f in &failures {

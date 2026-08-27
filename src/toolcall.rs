@@ -82,6 +82,25 @@ pub fn markers(fmt: ToolFormat) -> Option<(&'static str, &'static str)> {
     }
 }
 
+/// The tool names an OpenAI `tools` array offers. Anything the model names outside this set
+/// is returned as text rather than as an executable call.
+pub fn allowed_names(tools: Option<&serde_json::Value>) -> Vec<String> {
+    tools
+        .and_then(|t| t.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|t| {
+                    t.get("function")
+                        .and_then(|f| f.get("name"))
+                        .or_else(|| t.get("name"))
+                        .and_then(|n| n.as_str())
+                        .map(str::to_string)
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// One parsed tool call plus the prose that surrounded it.
 #[derive(Debug, Default)]
 pub struct ParsedOutput {

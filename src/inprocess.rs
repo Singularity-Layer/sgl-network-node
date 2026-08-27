@@ -73,6 +73,11 @@ pub struct GenOut {
     pub content: String,
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
+    /// OpenAI `tool_calls` parsed out of the generation, when the model made a valid call.
+    pub tool_calls: Option<serde_json::Value>,
+    /// "tool_calls" when calls were parsed, else None (callers treat None as "stop"),
+    /// matching what the server engine reports so both engines agree.
+    pub finish_reason: Option<String>,
 }
 
 pub struct InProcessConfig {
@@ -109,6 +114,12 @@ struct Job {
     /// Raw image bytes, in the order their markers appear in the flattened text. mtmd pairs
     /// the Nth marker with the Nth bitmap, so ORDER IS LOAD-BEARING.
     images: Vec<Vec<u8>>,
+    /// OpenAI `tools` array, rendered into the prompt by the model's own chat template.
+    /// None for plain chat, which keeps that render byte-identical to previous releases.
+    tools: Option<serde_json::Value>,
+    /// Tool names the caller actually offered — a call naming anything else is returned as
+    /// text, never surfaced as a call an agent might execute.
+    allowed_tools: Vec<String>,
     max_tokens: i32,
     temperature: f32,
     kind: JobKind,
@@ -122,6 +133,11 @@ struct Slot {
     /// Next KV position to write for this sequence. Under mrope (Qwen2.5-VL) an image spans
     /// MANY KV cells but only a FEW positions, so this is NOT a measure of cache occupancy.
     n_past: i32,
+    /// Tool syntax to look for in this slot's output, and the names the caller offered.
+    /// Parsing happens at FINISH, strictly after tokens are counted at sampling time — so
+    /// classifying output as call-vs-prose can never change what is billed.
+    tool_format: crate::toolcall::ToolFormat,
+    allowed_tools: Vec<String>,
     /// KV cells actually consumed by this sequence: prompt tokens (image tokens included)
     /// plus one per generated token. Capping on `n_past` instead underestimates usage for a
     /// vision request and lets decoding run past the real KV capacity into overflow. Equal
@@ -163,6 +179,11 @@ pub struct InProcessEngine {
     /// Drives the `vision` heartbeat capability, so the orchestrator only routes image
     /// requests to a node that can actually answer them.
     vision: bool,
+    /// Tool syntax this model speaks, detected ONCE from the chat template at load. Drives
+    /// both the refusal (a template with no tools branch cannot express a call) and the
+    /// heartbeat capability, so the orchestrator stops routing tool jobs to a node that
+    /// would have to answer them as prose.
+    tool_format: crate::toolcall::ToolFormat,
     /// `Option` so `Drop` can `take()` + join it. Joining lets the worker fully release its
     /// llama.cpp context/model/backend BEFORE the process runs C++ static destructors at
     /// exit — otherwise ggml-metal's global device teardown asserts (rsets not empty) and
@@ -181,6 +202,9 @@ impl InProcessEngine {
         let model_name = cfg.model_name.clone();
         let max_slots = cfg.max_slots.max(1);
         let vision = cfg.mmproj_path.is_some();
+        // Detect from the template we will actually render — that is what tells the model how
+        // to speak — falling back to the model name for trained-in protocols like HOMURA.
+        let tool_format = crate::toolcall::detect("", &cfg.model_name, false);
 
         let w_healthy = Arc::clone(&healthy);
         let w_busy = Arc::clone(&busy);
@@ -207,6 +231,7 @@ impl InProcessEngine {
                 model_name,
                 max_slots,
                 vision,
+                tool_format,
                 worker: Some(worker),
             }),
             Ok(Ok(Err(e))) => Err(e),
@@ -232,12 +257,20 @@ impl InProcessEngine {
         self.vision
     }
 
+    /// Tool syntax this engine can parse (None = the model cannot express calls at all).
+    pub fn tool_format(&self) -> crate::toolcall::ToolFormat {
+        self.tool_format
+    }
+
     /// Non-streaming completion.
     pub async fn chat_completion(
         &self,
         messages: &[ChatMessage],
         // Decoded image bytes in marker order (empty for text requests).
         images: Vec<Vec<u8>>,
+        // OpenAI tools array (None = plain chat) and the names it offered.
+        tools: Option<serde_json::Value>,
+        allowed_tools: Vec<String>,
         max_tokens: i32,
         temperature: f32,
     ) -> Result<GenOut, String> {
@@ -248,6 +281,8 @@ impl InProcessEngine {
             .send(Job {
                 messages: messages.to_vec(),
                 images,
+                tools,
+                allowed_tools,
                 max_tokens,
                 temperature,
                 kind: JobKind::NonStream(reply),
@@ -265,6 +300,9 @@ impl InProcessEngine {
         messages: &[ChatMessage],
         // Decoded image bytes in marker order (empty for text requests).
         images: Vec<Vec<u8>>,
+        // OpenAI tools array (None = plain chat) and the names it offered.
+        tools: Option<serde_json::Value>,
+        allowed_tools: Vec<String>,
         max_tokens: i32,
         temperature: f32,
         tokens: tokio::sync::mpsc::Sender<StreamEvent>,
@@ -276,6 +314,8 @@ impl InProcessEngine {
             .send(Job {
                 messages: messages.to_vec(),
                 images,
+                tools,
+                allowed_tools,
                 max_tokens,
                 temperature,
                 kind: JobKind::Stream { tokens, done },
@@ -637,6 +677,8 @@ fn admit(
     let Job {
         messages,
         images,
+        tools,
+        allowed_tools,
         max_tokens,
         temperature,
         kind,
@@ -647,7 +689,18 @@ fn admit(
     // at 0 for every new job, so leftover state would corrupt positions + billing).
     let _ = ctx.clear_kv_cache_seq(Some(seq_id as u32), None, None);
 
-    let prompt = match render_chat_prompt(model, &messages) {
+    // Detect from the template we are ACTUALLY about to render — that template is what tells
+    // the model how to speak this request, and it already accounts for any override. Only
+    // needed when tools were offered; plain chat skips it entirely.
+    let tool_format = if tools.is_some() {
+        let tmpl = model
+            .meta_val_str("tokenizer.chat_template")
+            .unwrap_or_default();
+        crate::toolcall::detect(&tmpl, &cfg.model_name, false)
+    } else {
+        crate::toolcall::ToolFormat::None
+    };
+    let prompt = match render_chat_prompt(model, &messages, tools.as_ref()) {
         Ok(p) => p,
         Err(e) => return finish_admit_err(kind, e),
     };
@@ -709,7 +762,8 @@ fn admit(
         // mtmd decoded inside eval_chunks, so the final logits are the context's LAST row
         // (-1), not an index into our batch, which never saw the prompt.
         return admit_after_prefill(
-            ctx, seq_id, progress, kind, prompt_tokens, n_past, -1, max_tokens, temperature,
+            ctx, seq_id, progress, kind, tool_format, allowed_tools, prompt_tokens, n_past, -1,
+            max_tokens, temperature,
         );
     }
 
@@ -756,6 +810,8 @@ fn admit(
         seq_id,
         progress,
         kind,
+        tool_format,
+        allowed_tools,
         prompt_tokens,
         tokens.len() as i32, // positions 0..last consumed; next write head = len
         logits_idx,
@@ -772,11 +828,14 @@ fn admit(
 /// the final prompt logits landed: the last row of our batch for text, -1 (llama.cpp's
 /// "last row") for vision, whose decode happened inside mtmd.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn admit_after_prefill(
     ctx: &mut LlamaContext,
     seq_id: i32,
     progress: &AtomicU64,
     kind: JobKind,
+    tool_format: crate::toolcall::ToolFormat,
+    allowed_tools: Vec<String>,
     prompt_tokens: u32,
     n_past: i32,
     logits_idx: i32,
@@ -799,6 +858,8 @@ fn admit_after_prefill(
         seq_id,
         sampler,
         n_past,
+        tool_format,
+        allowed_tools,
         kv_tokens: prompt_tokens,
         cur_token: first,
         max_new,
@@ -910,6 +971,8 @@ fn finish_ok(ctx: &mut LlamaContext, slot: Slot) {
         prompt_tokens,
         completion_tokens,
         kind,
+        tool_format,
+        allowed_tools,
         mut pending,
         batched,
         stream_dropped,
@@ -919,8 +982,21 @@ fn finish_ok(ctx: &mut LlamaContext, slot: Slot) {
     let _ = ctx.clear_kv_cache_seq(Some(seq_id as u32), None, None);
     match kind {
         JobKind::NonStream(reply) => {
+            // Parse AFTER generation and AFTER counting. Tokens were counted at sampling time,
+            // so deciding here whether text is a call or prose can never move what is billed.
+            // Anything that is not a valid call comes back as text - never dropped, because
+            // those tokens were already billed.
+            let parsed = crate::toolcall::parse_complete(
+                tool_format,
+                &out,
+                &allowed_tools,
+                &seq_id.to_string(),
+            );
+            let finish_reason = parsed.tool_calls.as_ref().map(|_| "tool_calls".to_string());
             let _ = reply.send(Ok(GenOut {
-                content: out,
+                content: parsed.text,
+                tool_calls: parsed.tool_calls,
+                finish_reason,
                 prompt_tokens,
                 completion_tokens,
             }));
@@ -1003,15 +1079,19 @@ fn finish_admit_err(kind: JobKind, msg: String) -> AdmitOutcome {
 /// into the first user message — so if the faithful render fails and the conversation
 /// has system messages, we fold them into the first user turn and render once more.
 /// Matches llama-server behavior instead of failing every chat that sets a system prompt.
-fn render_chat_prompt(model: &LlamaModel, messages: &[ChatMessage]) -> Result<String, String> {
-    match try_render_chat_prompt(model, messages) {
+fn render_chat_prompt(
+    model: &LlamaModel,
+    messages: &[ChatMessage],
+    tools: Option<&serde_json::Value>,
+) -> Result<String, String> {
+    match try_render_chat_prompt(model, messages, tools) {
         Ok(p) => Ok(p),
         Err(first_err) => {
             if !messages.iter().any(|m| m.role == "system") {
                 return Err(first_err);
             }
             let folded = fold_system_into_first_user(messages);
-            try_render_chat_prompt(model, &folded).map_err(|_| first_err)
+            try_render_chat_prompt(model, &folded, tools).map_err(|_| first_err)
         }
     }
 }
@@ -1051,7 +1131,11 @@ fn fold_system_into_first_user(messages: &[ChatMessage]) -> Vec<ChatMessage> {
     out
 }
 
-fn try_render_chat_prompt(model: &LlamaModel, messages: &[ChatMessage]) -> Result<String, String> {
+fn try_render_chat_prompt(
+    model: &LlamaModel,
+    messages: &[ChatMessage],
+    tools: Option<&serde_json::Value>,
+) -> Result<String, String> {
     let tmpl_str = model
         .meta_val_str("tokenizer.chat_template")
         .map_err(|e| format!("model has no chat_template metadata: {e}"))?;
@@ -1074,16 +1158,33 @@ fn try_render_chat_prompt(model: &LlamaModel, messages: &[ChatMessage]) -> Resul
             ))
         },
     );
+    // Chat templates call Python string methods (.split/.startswith/.strip) in their TOOLS
+    // branches. llama.cpp's C++ minja implements those natively; Rust minijinja does not, so
+    // plain chat never noticed and the first tools render would have failed.
+    env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
     env.add_template("chat", &tmpl_str)
         .map_err(|e| format!("chat template parse failed: {e}"))?;
     let tmpl = env
         .get_template("chat")
         .map_err(|e| format!("chat template load failed: {e}"))?;
 
-    tmpl.render(minijinja::context! {
-        messages => messages,
-        add_generation_prompt => true,
-        bos_token => bos_token,
-    })
+    // `tools` is only added when present. Templates gate on `{%- if tools %}`, and an ABSENT
+    // variable is falsy — so a plain-chat render stays byte-identical to every previous
+    // release. That matters for money, not tidiness: if the rendered prompt shifted, every
+    // existing request's prompt_tokens would move and operators would be billed differently
+    // for changing nothing. Pinned by a test.
+    match tools {
+        Some(t) => tmpl.render(minijinja::context! {
+            messages => messages,
+            tools => t,
+            add_generation_prompt => true,
+            bos_token => bos_token,
+        }),
+        None => tmpl.render(minijinja::context! {
+            messages => messages,
+            add_generation_prompt => true,
+            bos_token => bos_token,
+        }),
+    }
     .map_err(|e| format!("chat template render failed: {e}"))
 }

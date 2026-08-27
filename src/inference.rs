@@ -1222,16 +1222,27 @@ impl InferenceEngine {
                 // strict {role,content} shape it renders; tools are ignored here.
                 let _ = (&tools, &tool_choice);
                 let (msgs, images) = crate::multimodal::flatten(&messages)?;
+                // Tools are RENDERED into the prompt by the model's own template and parsed
+                // back out of the reply. Previously they were silently dropped here, so an
+                // agent got prose and it looked like the model failing rather than the engine.
+                if tools.is_some() && !e.tool_format().supports_tools() {
+                    return Err(
+                        "this model's chat template cannot express tool calls".to_string()
+                    );
+                }
+                let allowed = crate::toolcall::allowed_names(tools.as_ref());
                 let out = e
-                    .chat_completion(&msgs, images, max_tokens, temperature as f32)
+                    .chat_completion(&msgs, images, tools, allowed, max_tokens, temperature as f32)
                     .await?;
                 Ok(InferenceResult {
                     content: out.content,
                     model: e.model_name().to_string(),
                     prompt_tokens: out.prompt_tokens,
                     completion_tokens: out.completion_tokens,
-                    tool_calls: None,
-                    finish_reason: None,
+                    // Previously hardcoded None because tools were dropped. Now the engine
+                    // actually parses calls, and reports finish_reason like the server engine.
+                    tool_calls: out.tool_calls,
+                    finish_reason: out.finish_reason,
                 })
             }
             #[cfg(feature = "inprocess")]
@@ -1265,8 +1276,16 @@ impl InferenceEngine {
                     return Err("in-process engine cannot stream tool calls".to_string());
                 }
                 let (typed, images) = crate::multimodal::flatten(&messages)?;
-                e.chat_completion_stream(&typed, images, max_tokens, temperature as f32, tx)
-                    .await
+                e.chat_completion_stream(
+                    &typed,
+                    images,
+                    tools,
+                    Vec::new(),
+                    max_tokens,
+                    temperature as f32,
+                    tx,
+                )
+                .await
             }
             #[cfg(feature = "inprocess")]
             InferenceEngine::Embed(_) => {

@@ -16,18 +16,28 @@ use sgl_node::inference::{ChatMessage, StreamEvent};
 use sgl_node::inprocess::{InProcessConfig, InProcessEngine};
 
 fn user(content: &str) -> Vec<ChatMessage> {
-    vec![ChatMessage { role: "user".into(), content: content.into() }]
+    vec![ChatMessage {
+        role: "user".into(),
+        content: content.into(),
+    }]
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() {
-    let path = std::env::args().nth(1).expect("usage: inproc_batch_test <model.gguf>");
+    let path = std::env::args()
+        .nth(1)
+        .expect("usage: inproc_batch_test <model.gguf>");
     // SLOTS env overrides so we can exercise both the production default (1) and batching (>1).
-    let max_slots = std::env::var("SLOTS").ok().and_then(|s| s.parse().ok()).unwrap_or(3u32);
+    let max_slots = std::env::var("SLOTS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(3u32);
     let per_slot_ctx = 2048u32;
 
     println!("== starting engine: max_slots={max_slots}, per_slot_ctx={per_slot_ctx} ==");
     let engine = InProcessEngine::start(InProcessConfig {
+        mmproj_path: None,
+        image_max_tokens: None,
         model_path: PathBuf::from(&path),
         model_name: "test-model".into(),
         n_ctx: max_slots * per_slot_ctx,
@@ -42,14 +52,20 @@ async fn main() {
     // ---- 1. single-request parity (temp=0) --------------------------------------------
     let t = Instant::now();
     let out = engine
-        .chat_completion(&user("Say hi in three words."), 64, 0.0)
+        .chat_completion(&user("Say hi in three words."), Vec::new(), None, Vec::new(), 64, 0.0)
         .await
         .expect("single completion");
     println!(
         "\n[1] single  ({:?}): prompt_tokens={} completion_tokens={}\n    output={:?}",
-        t.elapsed(), out.prompt_tokens, out.completion_tokens, out.content
+        t.elapsed(),
+        out.prompt_tokens,
+        out.completion_tokens,
+        out.content
     );
-    assert!(out.completion_tokens > 0, "single completion produced no tokens");
+    assert!(
+        out.completion_tokens > 0,
+        "single completion produced no tokens"
+    );
 
     // ---- 2 + 3. N concurrent non-streaming requests -----------------------------------
     let prompts = [
@@ -65,16 +81,26 @@ async fn main() {
     for p in prompts {
         let e = &engine;
         handles.push(async move {
-            let r = e.chat_completion(&user(p), 48, 0.0).await;
+            let r = e.chat_completion(&user(p), Vec::new(), None, Vec::new(), 48, 0.0).await;
             (p, r)
         });
     }
     let results = futures_util::future::join_all(handles).await;
     let concurrent_wall = t.elapsed();
-    println!("\n[2] {} concurrent requests finished in {:?}", prompts.len(), concurrent_wall);
+    println!(
+        "\n[2] {} concurrent requests finished in {:?}",
+        prompts.len(),
+        concurrent_wall
+    );
     for (p, r) in &results {
         match r {
-            Ok(o) => println!("    OK  pt={:>3} ct={:>3}  {:?} -> {:?}", o.prompt_tokens, o.completion_tokens, p, o.content.trim()),
+            Ok(o) => println!(
+                "    OK  pt={:>3} ct={:>3}  {:?} -> {:?}",
+                o.prompt_tokens,
+                o.completion_tokens,
+                p,
+                o.content.trim()
+            ),
             Err(e) => println!("    ERR {:?} -> {e}", p),
         }
     }
@@ -84,12 +110,16 @@ async fn main() {
     // Serial baseline (same prompts, one at a time) to prove batching overlaps work.
     let t = Instant::now();
     for p in prompts {
-        let _ = engine.chat_completion(&user(p), 48, 0.0).await.expect("serial completion");
+        let _ = engine
+            .chat_completion(&user(p), Vec::new(), None, Vec::new(), 48, 0.0)
+            .await
+            .expect("serial completion");
     }
     let serial_wall = t.elapsed();
     println!(
         "[3] serial baseline {:?}  |  concurrent {:?}  |  speedup ~{:.2}x",
-        serial_wall, concurrent_wall,
+        serial_wall,
+        concurrent_wall,
         serial_wall.as_secs_f64() / concurrent_wall.as_secs_f64().max(1e-6)
     );
 
@@ -101,16 +131,23 @@ async fn main() {
     let mut lh = Vec::new();
     for _ in 0..max_slots {
         let e = &engine;
-        lh.push(async move { e.chat_completion(&user(long_prompt), gen, 0.2).await });
+        lh.push(async move { e.chat_completion(&user(long_prompt), Vec::new(), None, Vec::new(), gen, 0.2).await });
     }
     let long_conc = futures_util::future::join_all(lh).await;
     let long_conc_wall = t.elapsed();
-    let conc_tokens: u32 = long_conc.iter().filter_map(|r| r.as_ref().ok()).map(|o| o.completion_tokens).sum();
+    let conc_tokens: u32 = long_conc
+        .iter()
+        .filter_map(|r| r.as_ref().ok())
+        .map(|o| o.completion_tokens)
+        .sum();
 
     let t = Instant::now();
     let mut serial_tokens = 0u32;
     for _ in 0..max_slots {
-        let o = engine.chat_completion(&user(long_prompt), gen, 0.2).await.expect("long serial");
+        let o = engine
+            .chat_completion(&user(long_prompt), Vec::new(), None, Vec::new(), gen, 0.2)
+            .await
+            .expect("long serial");
         serial_tokens += o.completion_tokens;
     }
     let long_serial_wall = t.elapsed();
@@ -130,16 +167,23 @@ async fn main() {
     let mut lh = Vec::new();
     for _ in 0..n_long {
         let e = &engine;
-        lh.push(async move { e.chat_completion(&user(long_prompt), 200, 0.0).await });
+        lh.push(async move { e.chat_completion(&user(long_prompt), Vec::new(), None, Vec::new(), 200, 0.0).await });
     }
     let long_results = futures_util::future::join_all(lh).await;
     let long_concurrent = t.elapsed();
-    let long_ct: u32 = long_results.iter().filter_map(|r| r.as_ref().ok()).map(|o| o.completion_tokens).sum();
+    let long_ct: u32 = long_results
+        .iter()
+        .filter_map(|r| r.as_ref().ok())
+        .map(|o| o.completion_tokens)
+        .sum();
 
     let t = Instant::now();
     let mut serial_ct = 0u32;
     for _ in 0..n_long {
-        let o = engine.chat_completion(&user(long_prompt), 200, 0.0).await.expect("serial long");
+        let o = engine
+            .chat_completion(&user(long_prompt), Vec::new(), None, Vec::new(), 200, 0.0)
+            .await
+            .expect("serial long");
         serial_ct += o.completion_tokens;
     }
     let long_serial = t.elapsed();
@@ -153,7 +197,10 @@ async fn main() {
     let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamEvent>(64);
     let stream_task = {
         let e = &engine;
-        async move { e.chat_completion_stream(&user("Count from 1 to 5, space separated."), 48, 0.0, tx).await }
+        async move {
+            e.chat_completion_stream(&user("Count from 1 to 5, space separated."), Vec::new(), None, Vec::new(), 48, 0.0, tx)
+                .await
+        }
     };
     let collect_task = async {
         let mut text = String::new();
@@ -161,8 +208,21 @@ async fn main() {
         let mut done: Option<(u32, u32)> = None;
         while let Some(ev) = rx.recv().await {
             match ev {
-                StreamEvent::Delta { text: t, tokens } => { text.push_str(&t); delta_tokens += tokens; }
-                StreamEvent::Done { prompt_tokens, completion_tokens } => { done = Some((prompt_tokens, completion_tokens)); }
+                StreamEvent::Delta { text: t, tokens } => {
+                    text.push_str(&t);
+                    delta_tokens += tokens;
+                }
+                // The in-process engine refuses tools outright, so this is unreachable here;
+                // matched explicitly so adding a variant keeps failing the build loudly.
+                StreamEvent::ToolCalls { .. } => {
+                    panic!("in-process engine must not emit tool calls");
+                }
+                StreamEvent::Done {
+                    prompt_tokens,
+                    completion_tokens,
+                } => {
+                    done = Some((prompt_tokens, completion_tokens));
+                }
             }
         }
         (text, delta_tokens, done)
@@ -176,32 +236,58 @@ async fn main() {
     );
     assert!(ct > 0, "stream produced no completion tokens");
     // Delta tokens should cover all but possibly the terminal stop token.
-    assert!(delta_tokens >= ct.saturating_sub(1), "streamed deltas ({delta_tokens}) < completion_tokens ({ct})");
+    assert!(
+        delta_tokens >= ct.saturating_sub(1),
+        "streamed deltas ({delta_tokens}) < completion_tokens ({ct})"
+    );
 
     // ---- 4b. SYSTEM PROMPT (Gemma's template rejects the system role; the engine must
     // fold it into the first user turn like llama-server's legacy path — regression test
     // for the chat-UI "System role not supported" failure) -------------------------------
     let sys_messages = vec![
-        ChatMessage { role: "system".into(), content: "You are a pirate. Always answer in pirate speak.".into() },
-        ChatMessage { role: "user".into(), content: "Say hello in one short sentence.".into() },
+        ChatMessage {
+            role: "system".into(),
+            content: "You are a pirate. Always answer in pirate speak.".into(),
+        },
+        ChatMessage {
+            role: "user".into(),
+            content: "Say hello in one short sentence.".into(),
+        },
     ];
     let out = engine
-        .chat_completion(&sys_messages, 48, 0.0)
+        .chat_completion(&sys_messages, Vec::new(), None, Vec::new(), 48, 0.0)
         .await
         .expect("system-prompt completion must succeed (fold-into-user fallback)");
-    println!("\n[4b] system-prompt: pt={} ct={} -> {:?}", out.prompt_tokens, out.completion_tokens, out.content.trim());
-    assert!(out.completion_tokens > 0, "system-prompt completion produced no tokens");
+    println!(
+        "\n[4b] system-prompt: pt={} ct={} -> {:?}",
+        out.prompt_tokens,
+        out.completion_tokens,
+        out.content.trim()
+    );
+    assert!(
+        out.completion_tokens > 0,
+        "system-prompt completion produced no tokens"
+    );
 
     // ---- 5. oversized prompt rejected cleanly -----------------------------------------
     let huge = "word ".repeat(per_slot_ctx as usize + 200);
-    let r = engine.chat_completion(&user(&huge), 16, 0.0).await;
-    println!("\n[5] oversized prompt -> {:?}", r.as_ref().map(|_| "UNEXPECTED OK").map_err(|e| e.as_str()));
+    let r = engine.chat_completion(&user(&huge), Vec::new(), None, Vec::new(), 16, 0.0).await;
+    println!(
+        "\n[5] oversized prompt -> {:?}",
+        r.as_ref().map(|_| "UNEXPECTED OK").map_err(|e| e.as_str())
+    );
     assert!(r.is_err(), "oversized prompt should be rejected");
 
     // ---- 6. engine still healthy + serving after all of the above ----------------------
     assert!(engine.is_healthy(), "engine unhealthy after test run");
-    let after = engine.chat_completion(&user("Say 'ok'."), 16, 0.0).await.expect("post-test completion");
-    println!("\n[6] post-test completion still works: {:?}", after.content.trim());
+    let after = engine
+        .chat_completion(&user("Say 'ok'."), Vec::new(), None, Vec::new(), 16, 0.0)
+        .await
+        .expect("post-test completion");
+    println!(
+        "\n[6] post-test completion still works: {:?}",
+        after.content.trim()
+    );
 
     println!("\n== ALL CHECKS PASSED ==");
 }

@@ -41,13 +41,25 @@ fn main() {
 
     // Render the GGUF jinja template with minijinja (same logic as InProcessEngine's
     // render_chat_prompt) so the prompt matches llama-server exactly.
-    let tmpl_str = model.meta_val_str("tokenizer.chat_template").expect("chat_template meta");
-    let bos_token = model.token_to_str(model.token_bos(), Special::Tokenize).unwrap_or_default();
+    let tmpl_str = model
+        .meta_val_str("tokenizer.chat_template")
+        .expect("chat_template meta");
+    let bos_token = model
+        .token_to_str(model.token_bos(), Special::Tokenize)
+        .unwrap_or_default();
     let mut env = minijinja::Environment::new();
-    env.add_function("strftime_now", |fmt: String| chrono::Local::now().format(&fmt).to_string());
-    env.add_function("raise_exception", |m: String| -> Result<minijinja::Value, minijinja::Error> {
-        Err(minijinja::Error::new(minijinja::ErrorKind::InvalidOperation, m))
+    env.add_function("strftime_now", |fmt: String| {
+        chrono::Local::now().format(&fmt).to_string()
     });
+    env.add_function(
+        "raise_exception",
+        |m: String| -> Result<minijinja::Value, minijinja::Error> {
+            Err(minijinja::Error::new(
+                minijinja::ErrorKind::InvalidOperation,
+                m,
+            ))
+        },
+    );
     env.add_template("chat", &tmpl_str).expect("parse template");
     let tmpl = env.get_template("chat").unwrap();
     let prompt = tmpl
@@ -66,7 +78,9 @@ fn main() {
     let mut batch = LlamaBatch::new(512, 1);
     let last = tokens.len() - 1;
     for (i, tok) in tokens.iter().enumerate() {
-        batch.add(*tok, i as i32, &[0], i == last).expect("add prompt token");
+        batch
+            .add(*tok, i as i32, &[0], i == last)
+            .expect("add prompt token");
     }
     ctx.decode(&mut batch).expect("decode prompt");
 
@@ -82,7 +96,11 @@ fn main() {
             completion_tokens += 1; // match llama-server (counts the stop token)
             break;
         }
-        out.push_str(&model.token_to_str(token, Special::Plaintext).unwrap_or_default());
+        out.push_str(
+            &model
+                .token_to_str(token, Special::Plaintext)
+                .unwrap_or_default(),
+        );
         completion_tokens += 1;
         batch.clear();
         batch.add(token, n_cur, &[0], true).expect("add gen token");
