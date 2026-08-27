@@ -142,9 +142,15 @@ jobs:
         # defaults to the dynamic one (/MD), and mixing them fails to link. LLAMA_STATIC_CRT
         # tells llama-cpp-sys-2 to build llama.cpp against the SAME runtime
         # (build.rs -> config.static_crt), so the two agree.
+        # LLAMA_STATIC_CRT only reaches the CMAKE half of the build. The mtmd (vision) sources
+        # are compiled by the `cc` crate instead, which never saw it and used /MD - producing
+        # LNK2038 RuntimeLibrary mismatches on mtmd.o/clip.o/siglip.o/pixtral.o. CFLAGS/CXXFLAGS
+        # force that half to /MT too, so every object agrees with Rust's static CRT.
         env:
           RUSTFLAGS: -C target-feature=+crt-static
           LLAMA_STATIC_CRT: "1"
+          CFLAGS: /MT
+          CXXFLAGS: /MT
         run: cargo build --release --target x86_64-pc-windows-msvc --features inprocess,vision
 
       - name: Package + checksum
