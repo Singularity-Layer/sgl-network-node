@@ -28,6 +28,8 @@ use llama_cpp_2::context::LlamaContext;
 use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::params::LlamaModelParams;
+#[cfg(feature = "vision")]
+use llama_cpp_2::mtmd::{MtmdBitmap, MtmdContext, MtmdContextParams, MtmdInputText};
 use llama_cpp_2::model::{AddBos, LlamaModel, Special};
 use llama_cpp_2::sampling::LlamaSampler;
 use llama_cpp_2::token::LlamaToken;
@@ -84,6 +86,12 @@ pub struct InProcessConfig {
     pub max_slots: u32,
     /// Per-request context window (the operator's configured context_size).
     pub per_slot_ctx: u32,
+    /// Vision projector (mmproj). Some(_) => this engine serves multimodal requests IN
+    /// PROCESS, so the decrypted prompt and the image never cross a socket the operator
+    /// can read. None => text only.
+    pub mmproj_path: Option<PathBuf>,
+    /// Visual token budget per image (`--image-max-tokens`). None => model default.
+    pub image_max_tokens: Option<u32>,
 }
 
 enum JobKind {
@@ -98,6 +106,9 @@ enum JobKind {
 
 struct Job {
     messages: Vec<ChatMessage>,
+    /// Raw image bytes, in the order their markers appear in the flattened text. mtmd pairs
+    /// the Nth marker with the Nth bitmap, so ORDER IS LOAD-BEARING.
+    images: Vec<Vec<u8>>,
     max_tokens: i32,
     temperature: f32,
     kind: JobKind,
@@ -207,6 +218,8 @@ impl InProcessEngine {
     pub async fn chat_completion(
         &self,
         messages: &[ChatMessage],
+        // Decoded image bytes in marker order (empty for text requests).
+        images: Vec<Vec<u8>>,
         max_tokens: i32,
         temperature: f32,
     ) -> Result<GenOut, String> {
@@ -216,6 +229,7 @@ impl InProcessEngine {
             .ok_or_else(|| "inference worker is gone".to_string())?
             .send(Job {
                 messages: messages.to_vec(),
+                images,
                 max_tokens,
                 temperature,
                 kind: JobKind::NonStream(reply),
@@ -231,6 +245,8 @@ impl InProcessEngine {
     pub async fn chat_completion_stream(
         &self,
         messages: &[ChatMessage],
+        // Decoded image bytes in marker order (empty for text requests).
+        images: Vec<Vec<u8>>,
         max_tokens: i32,
         temperature: f32,
         tokens: tokio::sync::mpsc::Sender<StreamEvent>,
@@ -241,6 +257,7 @@ impl InProcessEngine {
             .ok_or_else(|| "inference worker is gone".to_string())?
             .send(Job {
                 messages: messages.to_vec(),
+                images,
                 max_tokens,
                 temperature,
                 kind: JobKind::Stream { tokens, done },
@@ -274,7 +291,9 @@ impl Drop for InProcessEngine {
         // destructors at exit; skipping it lets ggml-metal's global device teardown race the
         // still-live context and abort a clean shutdown.
         drop(self.job_tx.take());
-        let Some(handle) = self.worker.take() else { return };
+        let Some(handle) = self.worker.take() else {
+            return;
+        };
 
         // Bounded join: a healthy worker exits fast, but a worker WEDGED inside a native
         // llama.cpp call can never be unblocked from Rust. Rather than hang the process on
@@ -320,6 +339,46 @@ fn worker_main(
         Err(e) => {
             let _ = ready_tx.send(Err(format!("model load failed: {e}")));
             return;
+        }
+    };
+
+    // Vision projector, built ONCE at startup like the inference context below. Loading it
+    // lazily would put a multi-hundred-MB load on the first paying request's latency, and a
+    // failure would surface as a mid-job error instead of a clean refusal to start.
+    #[cfg(feature = "vision")]
+    let mtmd: Option<MtmdContext> = match &cfg.mmproj_path {
+        None => None,
+        Some(path) => {
+            let params = MtmdContextParams {
+                use_gpu: true,
+                print_timings: false,
+                n_threads: 4,
+                media_marker: match std::ffi::CString::new(crate::multimodal::MEDIA_MARKER) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        let _ = ready_tx.send(Err(format!("bad media marker: {e}")));
+                        return;
+                    }
+                },
+                image_min_tokens: -1,
+                image_max_tokens: cfg.image_max_tokens.map_or(-1, |n| n as i32),
+            };
+            match MtmdContext::init_from_file(&path.to_string_lossy(), &model, &params) {
+                Ok(c) => {
+                    // An audio-only projector would tokenize images into nothing and the model
+                    // would answer about a picture it never saw. Refuse to start instead.
+                    if !c.support_vision() {
+                        let _ =
+                            ready_tx.send(Err("this mmproj does not support vision".to_string()));
+                        return;
+                    }
+                    Some(c)
+                }
+                Err(e) => {
+                    let _ = ready_tx.send(Err(format!("mmproj load failed: {e}")));
+                    return;
+                }
+            }
         }
     };
 
@@ -405,10 +464,21 @@ fn worker_main(
         // Native llama.cpp aborts/segfaults already kill the process; this covers the
         // Rust-panic case without forcing global panic=abort on the rest of the node.
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            run_iteration(&mut ctx, &mut batch, &mut slots, &mut waiting, &cfg, &progress);
+            run_iteration(
+                &mut ctx,
+                &mut batch,
+                &mut slots,
+                &mut waiting,
+                &cfg,
+                &progress,
+                #[cfg(feature = "vision")]
+                mtmd.as_ref(),
+            );
         }));
         if outcome.is_err() {
-            tracing::error!("inference worker panicked mid-iteration — aborting for a clean OS restart");
+            tracing::error!(
+                "inference worker panicked mid-iteration — aborting for a clean OS restart"
+            );
             std::process::abort();
         }
 
@@ -421,6 +491,7 @@ fn worker_main(
 
 /// One scheduler iteration: admit waiting jobs into free slots (prefill + first token), then
 /// advance every active slot by exactly one token in a single batched `decode`.
+#[allow(clippy::too_many_arguments)]
 fn run_iteration(
     ctx: &mut LlamaContext,
     batch: &mut LlamaBatch,
@@ -428,15 +499,22 @@ fn run_iteration(
     waiting: &mut VecDeque<Job>,
     cfg: &InProcessConfig,
     progress: &AtomicU64,
+    #[cfg(feature = "vision")] mtmd: Option<&MtmdContext>,
 ) {
     // 1. Admit: fill free slots from the waiting queue.
     for idx in 0..slots.len() {
         if slots[idx].is_some() {
             continue;
         }
-        let Some(job) = waiting.pop_front() else { break };
+        let Some(job) = waiting.pop_front() else {
+            break;
+        };
         let seq_id = idx as i32;
-        match admit(ctx, batch, seq_id, cfg, progress, job) {
+        #[cfg(feature = "vision")]
+        let outcome = admit(ctx, batch, seq_id, cfg, progress, mtmd, job);
+        #[cfg(not(feature = "vision"))]
+        let outcome = admit(ctx, batch, seq_id, cfg, progress, job);
+        match outcome {
             AdmitOutcome::Active(slot) => slots[idx] = Some(slot),
             AdmitOutcome::Finished => { /* replied already; slot stays free */ }
         }
@@ -534,9 +612,16 @@ fn admit(
     seq_id: i32,
     cfg: &InProcessConfig,
     progress: &AtomicU64,
+    #[cfg(feature = "vision")] mtmd: Option<&MtmdContext>,
     job: Job,
 ) -> AdmitOutcome {
-    let Job { messages, max_tokens, temperature, kind } = job;
+    let Job {
+        messages,
+        images,
+        max_tokens,
+        temperature,
+        kind,
+    } = job;
     let model = ctx.model;
 
     // Defensive: clear any stale KV cells for this seq_id before reuse (positions restart
@@ -547,6 +632,68 @@ fn admit(
         Ok(p) => p,
         Err(e) => return finish_admit_err(kind, e),
     };
+    // ── Vision: tokenize text+images together and prefill through mtmd ──────────────
+    // The whole point of this path is that the decrypted prompt AND the image stay inside
+    // this process. The server engine would hand both to a llama-server child over an
+    // unauthenticated 127.0.0.1 socket, where the operator can read them.
+    #[cfg(feature = "vision")]
+    if !images.is_empty() {
+        let Some(mtmd) = mtmd else {
+            return finish_admit_err(
+                kind,
+                "this node is not configured to serve images".to_string(),
+            );
+        };
+        let mut bitmaps = Vec::with_capacity(images.len());
+        for bytes in &images {
+            match MtmdBitmap::from_buffer(mtmd, bytes, false) {
+                Ok(b) => bitmaps.push(b),
+                Err(e) => return finish_admit_err(kind, format!("invalid image: {e}")),
+            }
+        }
+        let refs: Vec<&MtmdBitmap> = bitmaps.iter().collect();
+        // `add_special: false` because the chat template already renders BOS as text (same
+        // reason the text path tokenizes with AddBos::Never) — adding it again would shift
+        // every position and diverge from llama-server. `parse_special: true` so the
+        // template's literal <|im_start|> etc. map back to their ids.
+        let chunks = match mtmd.tokenize(
+            MtmdInputText {
+                text: prompt,
+                add_special: false,
+                parse_special: true,
+            },
+            &refs,
+        ) {
+            Ok(c) => c,
+            // Also fires when the marker count != bitmap count (e.g. a user typed the marker
+            // themselves). Fail the job rather than silently generate against a wrong prompt.
+            Err(e) => return finish_admit_err(kind, format!("multimodal tokenize failed: {e}")),
+        };
+        // BILLING: total_tokens() counts image tokens as well as text. NOT total_positions()
+        // — under mrope (Qwen2.5-VL) positions are far fewer than tokens, and billing those
+        // would underpay the operator for every image.
+        let prompt_tokens = chunks.total_tokens() as u32;
+        if prompt_tokens >= cfg.per_slot_ctx {
+            return finish_admit_err(kind, "prompt exceeds context window".to_string());
+        }
+        // eval_chunks decodes text chunks and encodes+decodes image chunks, handling
+        // non-causal attention and mrope positions internally. It returns POSITIONS, which
+        // is what the decode loop must continue from.
+        let n_past = match chunks.eval_chunks(mtmd, ctx, 0, seq_id, PREFILL_CHUNK as i32, true) {
+            Ok(p) => p,
+            Err(e) => {
+                let _ = ctx.clear_kv_cache_seq(Some(seq_id as u32), None, None);
+                return finish_admit_err(kind, format!("multimodal prefill failed: {e}"));
+            }
+        };
+        progress.store(now_ms(), Ordering::Relaxed);
+        // mtmd decoded inside eval_chunks, so the final logits are the context's LAST row
+        // (-1), not an index into our batch, which never saw the prompt.
+        return admit_after_prefill(
+            ctx, seq_id, progress, kind, prompt_tokens, n_past, -1, max_tokens, temperature,
+        );
+    }
+
     let tokens = match model.str_to_token(&prompt, AddBos::Never) {
         Ok(t) => t,
         Err(e) => return finish_admit_err(kind, format!("tokenize failed: {e}")),
@@ -582,6 +729,42 @@ fn admit(
     }
     progress.store(now_ms(), Ordering::Relaxed); // prefill done
 
+    // Text prefill wrote the prompt through OUR batch, so the final token's logits are the
+    // last row of that batch. (The vision path decodes inside mtmd and passes -1 instead.)
+    let logits_idx = batch.n_tokens() - 1;
+    admit_after_prefill(
+        ctx,
+        seq_id,
+        progress,
+        kind,
+        prompt_tokens,
+        tokens.len() as i32, // positions 0..last consumed; next write head = len
+        logits_idx,
+        max_tokens,
+        temperature,
+    )
+}
+
+/// Shared tail of admit: sample the first token and build the slot.
+///
+/// Split out so the text and vision prefills converge here instead of duplicating the
+/// EOG / max_tokens==1 / first-emit handling, which is where the billing edge cases live.
+/// `n_past` is POSITIONS (under mrope these are fewer than tokens) and `logits_idx` is where
+/// the final prompt logits landed: the last row of our batch for text, -1 (llama.cpp's
+/// "last row") for vision, whose decode happened inside mtmd.
+#[allow(clippy::too_many_arguments)]
+fn admit_after_prefill(
+    ctx: &mut LlamaContext,
+    seq_id: i32,
+    progress: &AtomicU64,
+    kind: JobKind,
+    prompt_tokens: u32,
+    n_past: i32,
+    logits_idx: i32,
+    max_tokens: i32,
+    temperature: f32,
+) -> AdmitOutcome {
+    let model = ctx.model;
     let mut sampler = if temperature > 0.0 {
         LlamaSampler::chain_simple([LlamaSampler::temp(temperature), LlamaSampler::dist(0)])
     } else {
@@ -590,9 +773,8 @@ fn admit(
 
     let max_new = max_tokens.max(1);
     // Sample the first generated token from the last prompt token's logits.
-    let first = sampler.sample(&*ctx, batch.n_tokens() - 1);
+    let first = sampler.sample(&*ctx, logits_idx);
     sampler.accept(first);
-    let n_past = tokens.len() as i32; // positions 0..last consumed; next write head = len
 
     let mut slot = Slot {
         seq_id,
@@ -662,7 +844,10 @@ fn flush_stream_nonblocking(slot: &mut Slot, tokens: &tokio::sync::mpsc::Sender<
     if slot.pending.is_empty() {
         return;
     }
-    let ev = StreamEvent::Delta { text: slot.pending.clone(), tokens: slot.batched };
+    let ev = StreamEvent::Delta {
+        text: slot.pending.clone(),
+        tokens: slot.batched,
+    };
     match tokens.try_send(ev) {
         Ok(()) => {
             slot.pending.clear();
@@ -714,7 +899,11 @@ fn finish_ok(ctx: &mut LlamaContext, slot: Slot) {
     let _ = ctx.clear_kv_cache_seq(Some(seq_id as u32), None, None);
     match kind {
         JobKind::NonStream(reply) => {
-            let _ = reply.send(Ok(GenOut { content: out, prompt_tokens, completion_tokens }));
+            let _ = reply.send(Ok(GenOut {
+                content: out,
+                prompt_tokens,
+                completion_tokens,
+            }));
         }
         JobKind::Stream { tokens, done } => {
             if !stream_dropped {
@@ -728,11 +917,20 @@ fn finish_ok(ctx: &mut LlamaContext, slot: Slot) {
                 } else {
                     send_terminal(
                         &tokens,
-                        StreamEvent::Delta { text: std::mem::take(&mut pending), tokens: batched },
+                        StreamEvent::Delta {
+                            text: std::mem::take(&mut pending),
+                            tokens: batched,
+                        },
                     )
                 };
                 let finished = tail_delivered
-                    && send_terminal(&tokens, StreamEvent::Done { prompt_tokens, completion_tokens });
+                    && send_terminal(
+                        &tokens,
+                        StreamEvent::Done {
+                            prompt_tokens,
+                            completion_tokens,
+                        },
+                    );
                 let _ = done.send(if finished {
                     Ok(())
                 } else {
@@ -825,7 +1023,10 @@ fn fold_system_into_first_user(messages: &[ChatMessage]) -> Vec<ChatMessage> {
         }
     }
     if !injected {
-        out.push(ChatMessage { role: "user".to_string(), content: system_text });
+        out.push(ChatMessage {
+            role: "user".to_string(),
+            content: system_text,
+        });
     }
     out
 }
@@ -847,7 +1048,10 @@ fn try_render_chat_prompt(model: &LlamaModel, messages: &[ChatMessage]) -> Resul
     env.add_function(
         "raise_exception",
         |msg: String| -> Result<minijinja::Value, minijinja::Error> {
-            Err(minijinja::Error::new(minijinja::ErrorKind::InvalidOperation, msg))
+            Err(minijinja::Error::new(
+                minijinja::ErrorKind::InvalidOperation,
+                msg,
+            ))
         },
     );
     env.add_template("chat", &tmpl_str)

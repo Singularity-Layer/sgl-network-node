@@ -1059,6 +1059,12 @@ impl InferenceEngine {
                             },
                             max_slots,
                             per_slot_ctx,
+                            // Vision IN PROCESS: with the projector here, the decrypted
+                            // prompt and the image never cross a socket the operator can
+                            // read. Without the `vision` feature these are inert and the
+                            // engine selection in node.rs keeps forcing the server child.
+                            mmproj_path: config.mmproj_path.clone(),
+                            image_max_tokens: config.image_max_tokens,
                         },
                     )
                     .await?;
@@ -1211,10 +1217,9 @@ impl InferenceEngine {
                 // a server-engine (Linux GPU) feature. Deserialize the opaque messages into the
                 // strict {role,content} shape it renders; tools are ignored here.
                 let _ = (&tools, &tool_choice);
-                let msgs: Vec<ChatMessage> = serde_json::from_value(messages)
-                    .map_err(|e| format!("Invalid messages format: {e}"))?;
+                let (msgs, images) = crate::multimodal::flatten(&messages)?;
                 let out = e
-                    .chat_completion(&msgs, max_tokens, temperature as f32)
+                    .chat_completion(&msgs, images, max_tokens, temperature as f32)
                     .await?;
                 Ok(InferenceResult {
                     content: out.content,
@@ -1255,9 +1260,8 @@ impl InferenceEngine {
                 if tools.is_some() {
                     return Err("in-process engine cannot stream tool calls".to_string());
                 }
-                let typed: Vec<ChatMessage> = serde_json::from_value(messages)
-                    .map_err(|e| format!("Invalid messages format: {e}"))?;
-                e.chat_completion_stream(&typed, max_tokens, temperature as f32, tx)
+                let (typed, images) = crate::multimodal::flatten(&messages)?;
+                e.chat_completion_stream(&typed, images, max_tokens, temperature as f32, tx)
                     .await
             }
             #[cfg(feature = "inprocess")]

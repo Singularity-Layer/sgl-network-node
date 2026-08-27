@@ -10,6 +10,7 @@ pub mod embed_catalog;
 pub mod encryption;
 pub mod inference;
 // Engine installer — inference.rs drives the crash-loop auto-swap through it.
-pub mod setup;
 #[cfg(feature = "inprocess")]
 pub mod inprocess;
+pub mod multimodal;
+pub mod setup;
