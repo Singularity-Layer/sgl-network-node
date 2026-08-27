@@ -23,4 +23,34 @@ async fn main() {
     println!("tool_calls    : {}", serde_json::to_string(&out.tool_calls).unwrap());
     println!("content       : {:?}", out.content);
     println!("tokens        : {} prompt / {} completion", out.prompt_tokens, out.completion_tokens);
+
+    // ---- streaming ----
+    println!("\n--- streaming ---");
+    let tools2 = serde_json::json!([{
+        "type":"function",
+        "function":{"name":"get_weather","description":"Get the weather for a city",
+            "parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}
+    }]);
+    let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+    let msgs2 = vec![ChatMessage{ role:"user".into(), content:"What is the weather in Tokyo? Use the tool.".into() }];
+    let h = tokio::spawn(async move {
+        let mut text = String::new();
+        let mut calls = Vec::new();
+        let mut usage = None;
+        while let Some(ev) = rx.recv().await {
+            match ev {
+                sgl_node::inference::StreamEvent::Delta{text:t,..} => text.push_str(&t),
+                sgl_node::inference::StreamEvent::ToolCalls{delta} => calls.push(delta),
+                sgl_node::inference::StreamEvent::Done{prompt_tokens,completion_tokens} =>
+                    usage = Some((prompt_tokens,completion_tokens)),
+            }
+        }
+        (text, calls, usage)
+    });
+    e.chat_completion_stream(&msgs2, Vec::new(), Some(tools2), vec!["get_weather".into()], 80, 0.0, tx)
+        .await.expect("stream");
+    let (text, calls, usage) = h.await.unwrap();
+    println!("stream text   : {text:?}");
+    println!("stream calls  : {}", serde_json::to_string(&calls).unwrap());
+    println!("stream usage  : {usage:?}");
 }

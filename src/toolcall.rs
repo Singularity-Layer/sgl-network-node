@@ -235,6 +235,191 @@ fn to_openai_call(
     }))
 }
 
+/// Cap on withheld text. A model that emits an opening marker and never closes it (or plain
+/// prose full of `{`) must not pin memory or swallow the whole answer — past this we give up
+/// and flush what we held as ordinary text.
+const MAX_HOLD_BYTES: usize = 8 * 1024;
+
+/// What the scanner decided about a piece of generated text.
+#[derive(Debug, PartialEq)]
+pub enum ScanOut {
+    /// Deliver to the user as ordinary content.
+    Text(String),
+    /// A complete, validated tool call, as one OpenAI streaming delta.
+    Call(serde_json::Value),
+}
+
+/// Incremental tool-call scanner for the STREAMING path.
+///
+/// Emits a tool call as ONE complete delta rather than dribbling out partial `arguments`
+/// fragments. That is legal OpenAI streaming (clients only require the concatenation to
+/// parse) and it makes a malformed fragment impossible by construction: nothing leaves here
+/// until the call is complete AND parses AND names a tool the caller offered.
+///
+/// The cost is that text is WITHHELD while a call might be forming. Withheld text is never
+/// discarded — if it turns out not to be a call it is flushed as content, because those
+/// tokens were counted at sampling time and billed.
+pub struct ToolCallScanner {
+    fmt: ToolFormat,
+    allowed: Vec<String>,
+    id_seed: String,
+    /// Text held back because it might be (part of) a call.
+    buf: String,
+    /// True once an opening marker was seen and we are inside a candidate call.
+    in_call: bool,
+    /// The opening marker text we consumed to enter the call. Kept so that a candidate which
+    /// turns out NOT to be a valid call can be delivered EXACTLY as the model wrote it —
+    /// dropping the marker would bill tokens for content the user never received.
+    open_marker: String,
+    /// Next `index` for the OpenAI streaming tool_calls array (parallel calls increment).
+    index: usize,
+}
+
+impl ToolCallScanner {
+    pub fn new(fmt: ToolFormat, allowed: Vec<String>, id_seed: String) -> Self {
+        Self {
+            fmt,
+            allowed,
+            id_seed,
+            buf: String::new(),
+            in_call: false,
+            open_marker: String::new(),
+            index: 0,
+        }
+    }
+
+    /// Feed one decoded piece; get back whatever is now safe to deliver.
+    pub fn push(&mut self, piece: &str) -> Vec<ScanOut> {
+        if !self.fmt.supports_tools() {
+            return vec![ScanOut::Text(piece.to_string())];
+        }
+        self.buf.push_str(piece);
+        self.drain(false)
+    }
+
+    /// Generation ended: flush everything still held. NEVER drops text.
+    pub fn finish(&mut self) -> Vec<ScanOut> {
+        let mut out = self.drain(true);
+        if !self.buf.is_empty() || !self.open_marker.is_empty() {
+            let held = format!(
+                "{}{}",
+                std::mem::take(&mut self.open_marker),
+                std::mem::take(&mut self.buf)
+            );
+            out.push(ScanOut::Text(held));
+        }
+        out
+    }
+
+    fn drain(&mut self, final_pass: bool) -> Vec<ScanOut> {
+        let mut out = Vec::new();
+        loop {
+            if self.in_call {
+                match self.take_complete_call() {
+                    Some(o) => out.push(o),
+                    None => break,
+                }
+            } else {
+                match self.take_until_call_start() {
+                    Some(o) => out.push(o),
+                    None => break,
+                }
+            }
+        }
+        // Runaway guard: held too much without completing a call → it was prose after all.
+        if !final_pass && self.buf.len() > MAX_HOLD_BYTES {
+            self.in_call = false;
+            let held = format!(
+                "{}{}",
+                std::mem::take(&mut self.open_marker),
+                std::mem::take(&mut self.buf)
+            );
+            out.push(ScanOut::Text(held));
+        }
+        out
+    }
+
+    /// Emit text up to the next possible call start; hold back anything that might be one.
+    fn take_until_call_start(&mut self) -> Option<ScanOut> {
+        let start = match markers(self.fmt) {
+            Some((open, _)) => match self.buf.find(open) {
+                Some(i) => {
+                    self.in_call = true;
+                    self.open_marker = open.to_string();
+                    let text = self.buf[..i].to_string();
+                    self.buf.drain(..i + open.len());
+                    return (!text.is_empty()).then_some(ScanOut::Text(text));
+                }
+                None => {
+                    // No marker yet. Emit everything except a tail that could still BECOME
+                    // one ("<tool_c" waiting for "all>"), or we would leak half a marker.
+                    let keep = partial_marker_tail(&self.buf, open);
+                    let cut = self.buf.len() - keep;
+                    if cut == 0 {
+                        return None;
+                    }
+                    let text: String = self.buf.drain(..cut).collect();
+                    return (!text.is_empty()).then_some(ScanOut::Text(text));
+                }
+            },
+            // Bare JSON: a call starts at a `{`.
+            None => self.buf.find('{'),
+        };
+        match start {
+            Some(0) => {
+                self.in_call = true;
+                None
+            }
+            Some(i) => {
+                let text: String = self.buf.drain(..i).collect();
+                self.in_call = true;
+                (!text.is_empty()).then_some(ScanOut::Text(text))
+            }
+            None => {
+                let text = std::mem::take(&mut self.buf);
+                (!text.is_empty()).then_some(ScanOut::Text(text))
+            }
+        }
+    }
+
+    /// Inside a candidate: emit it once it is complete, as a Call if valid else as Text.
+    fn take_complete_call(&mut self) -> Option<ScanOut> {
+        let (body, consumed) = match markers(self.fmt) {
+            Some((_, close)) => {
+                let end = self.buf.find(close)?;
+                (self.buf[..end].trim().to_string(), end + close.len())
+            }
+            None => {
+                let len = balanced_object_len(&self.buf)?;
+                (self.buf[..len].to_string(), len)
+            }
+        };
+        let raw: String = self.buf.drain(..consumed).collect();
+        self.in_call = false;
+        match to_openai_call(&body, &self.allowed, &self.id_seed, self.index) {
+            Some(mut c) => {
+                self.open_marker.clear();
+                // Streaming deltas carry an `index`; parallel calls must not collide.
+                c["index"] = serde_json::json!(self.index);
+                self.index += 1;
+                Some(ScanOut::Call(serde_json::Value::Array(vec![c])))
+            }
+            // Not a real call — the model produced it, so the user still gets it, INCLUDING
+            // the opening marker we consumed to get here.
+            None => Some(ScanOut::Text(format!("{}{raw}", std::mem::take(&mut self.open_marker)))),
+        }
+    }
+}
+
+/// Length of the longest suffix of `s` that is a proper prefix of `marker`.
+fn partial_marker_tail(s: &str, marker: &str) -> usize {
+    let max = marker.len().saturating_sub(1).min(s.len());
+    (1..=max)
+        .rev()
+        .find(|&n| s.is_char_boundary(s.len() - n) && marker.starts_with(&s[s.len() - n..]))
+        .unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -380,6 +565,107 @@ mod tests {
         let o = parse_complete(ToolFormat::None, raw, &allowed(), "j");
         assert!(o.tool_calls.is_none());
         assert_eq!(o.text, raw);
+    }
+
+
+    fn scan_all(fmt: ToolFormat, pieces: &[&str]) -> Vec<ScanOut> {
+        let mut sc = ToolCallScanner::new(fmt, allowed(), "j".into());
+        let mut out = Vec::new();
+        for p in pieces { out.extend(sc.push(p)); }
+        out.extend(sc.finish());
+        out
+    }
+    fn joined_text(o: &[ScanOut]) -> String {
+        o.iter().filter_map(|x| match x { ScanOut::Text(t) => Some(t.as_str()), _ => None })
+         .collect::<Vec<_>>().join("")
+    }
+    fn calls(o: &[ScanOut]) -> Vec<&serde_json::Value> {
+        o.iter().filter_map(|x| match x { ScanOut::Call(c) => Some(c), _ => None }).collect()
+    }
+
+    /// THE REAL CONDITION: the model arrives one token at a time, so a marker is split across
+    /// pushes. A scanner that emits eagerly would leak "<tool_c" to the user as content.
+    #[test]
+    fn call_split_across_many_pushes() {
+        let whole = "Sure. <tool_call>{\"name\":\"get_weather\",\"arguments\":{\"city\":\"Paris\"}}</tool_call>";
+        let pieces: Vec<String> = whole.chars().map(|c| c.to_string()).collect();
+        let refs: Vec<&str> = pieces.iter().map(|s| s.as_str()).collect();
+        let out = scan_all(ToolFormat::HermesXml, &refs);
+        assert_eq!(joined_text(&out), "Sure. ", "no marker fragment may leak as text");
+        let c = calls(&out);
+        assert_eq!(c.len(), 1);
+        assert_eq!(c[0][0]["function"]["name"], "get_weather");
+        assert_eq!(c[0][0]["function"]["arguments"], r#"{"city":"Paris"}"#);
+    }
+
+    #[test]
+    fn plain_text_streams_straight_through() {
+        let out = scan_all(ToolFormat::HermesXml, &["Hello ", "there ", "friend"]);
+        assert!(calls(&out).is_empty());
+        assert_eq!(joined_text(&out), "Hello there friend");
+    }
+
+    /// A model with no tool support must never withhold anything.
+    #[test]
+    fn unsupported_format_never_withholds() {
+        let out = scan_all(ToolFormat::None, &["{\"name\":", "\"x\"}"]);
+        assert_eq!(joined_text(&out), r#"{"name":"x"}"#);
+    }
+
+    /// BILLING INVARIANT under streaming: every byte in must come out, as call or as text.
+    #[test]
+    fn streaming_never_drops_text() {
+        for pieces in [
+            vec!["<tool_call>", "{bad}", "</tool_call>"],
+            vec!["<tool_call>", "{\"name\":\"nope\",\"arguments\":{}}", "</tool_call>"],
+            vec!["<tool_call>", "{\"name\":\"get_weather\""],   // never closed
+            vec!["prose ", "<tool_c"],                              // partial marker at EOF
+        ] {
+            let joined: String = pieces.concat();
+            let out = scan_all(ToolFormat::HermesXml, &pieces);
+            if calls(&out).is_empty() {
+                assert_eq!(joined_text(&out), joined, "must survive: {joined:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn parallel_calls_get_incrementing_index() {
+        let out = scan_all(ToolFormat::HermesXml, &[
+            "<tool_call>{\"name\":\"search\",\"arguments\":{}}</tool_call>",
+            "<tool_call>{\"name\":\"get_weather\",\"arguments\":{}}</tool_call>",
+        ]);
+        let c = calls(&out);
+        assert_eq!(c.len(), 2);
+        assert_eq!(c[0][0]["index"], 0);
+        assert_eq!(c[1][0]["index"], 1);
+    }
+
+    /// Bare-JSON families (HOMURA/Llama) have no wrapper, so the scanner balances braces.
+    #[test]
+    fn bare_json_call_streams() {
+        let out = scan_all(ToolFormat::Homura, &["{\"tool\":\"sea", "rch\",\"arguments\":{\"q\":\"a\"}}"]);
+        let c = calls(&out);
+        assert_eq!(c.len(), 1);
+        assert_eq!(c[0][0]["function"]["name"], "search");
+    }
+
+    /// An unterminated marker must not swallow the answer forever.
+    #[test]
+    fn runaway_hold_is_flushed_as_text() {
+        let big = "x".repeat(MAX_HOLD_BYTES + 64);
+        let out = scan_all(ToolFormat::HermesXml, &["<tool_call>", &big]);
+        assert!(calls(&out).is_empty());
+        assert!(joined_text(&out).contains(&big), "held text must be delivered, not dropped");
+    }
+
+    /// Text BEFORE a call must reach the user before the call does.
+    #[test]
+    fn text_is_ordered_before_the_call() {
+        let out = scan_all(ToolFormat::HermesXml,
+            &["thinking... <tool_call>{\"name\":\"search\",\"arguments\":{}}</tool_call>"]);
+        match &out[0] { ScanOut::Text(t) => assert_eq!(t, "thinking... "), o => panic!("{o:?}") }
+        assert!(matches!(&out[1], ScanOut::Call(_)));
     }
 
     /// THE STAGE-0 BLOCKER: our tools template uses `| tojson`, which minijinja only provides

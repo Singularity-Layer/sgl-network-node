@@ -1268,19 +1268,22 @@ impl InferenceEngine {
             }
             #[cfg(feature = "inprocess")]
             InferenceEngine::InProcess(e) => {
-                // The in-process engine renders the prompt itself and has no tool grammar, so
-                // it CANNOT honour `tools`. Refuse loudly rather than silently dropping them —
-                // a dropped tool list makes an agent chat instead of acting, which looks like
-                // the model failing rather than the engine. The caller falls back.
-                if tools.is_some() {
-                    return Err("in-process engine cannot stream tool calls".to_string());
+                // Streaming tool calls now work in-process: the scanner holds text back until
+                // a call is complete and validated, then emits it as one delta. What must still
+                // be refused is a model whose template cannot express a call at all — answering
+                // as prose is the bug this whole path exists to kill.
+                if tools.is_some() && !e.tool_format().supports_tools() {
+                    return Err(
+                        "this model's chat template cannot express tool calls".to_string()
+                    );
                 }
                 let (typed, images) = crate::multimodal::flatten(&messages)?;
+                let allowed = crate::toolcall::allowed_names(tools.as_ref());
                 e.chat_completion_stream(
                     &typed,
                     images,
                     tools,
-                    Vec::new(),
+                    allowed,
                     max_tokens,
                     temperature as f32,
                     tx,

@@ -133,6 +133,10 @@ struct Slot {
     /// Next KV position to write for this sequence. Under mrope (Qwen2.5-VL) an image spans
     /// MANY KV cells but only a FEW positions, so this is NOT a measure of cache occupancy.
     n_past: i32,
+    /// Incremental tool-call scanner, present only for a STREAMING request that offered
+    /// tools. Holds text back while a call might be forming, then emits the call as one
+    /// complete delta. None for plain chat, which keeps that path byte-identical.
+    scanner: Option<crate::toolcall::ToolCallScanner>,
     /// Tool syntax to look for in this slot's output, and the names the caller offered.
     /// Parsing happens at FINISH, strictly after tokens are counted at sampling time — so
     /// classifying output as call-vs-prose can never change what is billed.
@@ -867,10 +871,21 @@ fn admit_after_prefill(
     let first = sampler.sample(&*ctx, logits_idx);
     sampler.accept(first);
 
+    // Only a streaming request needs the incremental scanner; the non-streaming path parses
+    // the whole generation at the end instead.
+    let scanner = match (&kind, tool_format.supports_tools()) {
+        (JobKind::Stream { .. }, true) => Some(crate::toolcall::ToolCallScanner::new(
+            tool_format,
+            allowed_tools.clone(),
+            seq_id.to_string(),
+        )),
+        _ => None,
+    };
     let mut slot = Slot {
         seq_id,
         sampler,
         n_past,
+        scanner,
         tool_format,
         allowed_tools,
         kv_tokens: prompt_tokens,
@@ -925,8 +940,30 @@ fn emit(slot: &mut Slot, piece: String) {
             return;
         }
     };
-    slot.pending.push_str(&piece);
+    // Count the token FIRST, before the scanner sees the text. Classifying output as call
+    // vs prose must never change what is billed.
     slot.batched += 1;
+
+    let Some(scanner) = slot.scanner.as_mut() else {
+        slot.pending.push_str(&piece);
+        if slot.batched >= FLUSH_EVERY {
+            flush_stream_nonblocking(slot, &tokens);
+        }
+        return;
+    };
+    for out in scanner.push(&piece) {
+        match out {
+            crate::toolcall::ScanOut::Text(t) => slot.pending.push_str(&t),
+            crate::toolcall::ScanOut::Call(delta) => {
+                // Any text that preceded the call must reach the client BEFORE it, or an
+                // agent sees the call first and the reasoning after.
+                flush_stream_nonblocking(slot, &tokens);
+                if tokens.try_send(StreamEvent::ToolCalls { delta }).is_err() {
+                    slot.stream_dropped = true;
+                }
+            }
+        }
+    }
     if slot.batched >= FLUSH_EVERY {
         flush_stream_nonblocking(slot, &tokens);
     }
@@ -979,6 +1016,22 @@ fn send_terminal(tokens: &tokio::sync::mpsc::Sender<StreamEvent>, ev: StreamEven
 /// Successful terminal: flush any pending stream tail + send the final counts, or return the
 /// accumulated non-stream text. Frees the sequence's KV cells for reuse.
 fn finish_ok(ctx: &mut LlamaContext, slot: Slot) {
+    let mut slot = slot;
+    // Flush anything the scanner still holds BEFORE settling. Held text was counted at
+    // sampling time, so dropping it here would bill for output never delivered.
+    if let (Some(scanner), JobKind::Stream { tokens, .. }) = (slot.scanner.as_mut(), &slot.kind) {
+        let tokens = tokens.clone();
+        let tail: Vec<_> = scanner.finish();
+        for out in tail {
+            match out {
+                crate::toolcall::ScanOut::Text(t) => slot.pending.push_str(&t),
+                crate::toolcall::ScanOut::Call(delta) => {
+                    flush_stream_nonblocking(&mut slot, &tokens);
+                    let _ = tokens.try_send(StreamEvent::ToolCalls { delta });
+                }
+            }
+        }
+    }
     let Slot {
         seq_id,
         prompt_tokens,
