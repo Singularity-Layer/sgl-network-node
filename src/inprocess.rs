@@ -198,13 +198,15 @@ impl InProcessEngine {
         let healthy = Arc::new(AtomicBool::new(false));
         let busy = Arc::new(AtomicBool::new(false));
         let last_progress_ms = Arc::new(AtomicU64::new(0));
-        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
+        // The worker reports the tool format it detected FROM THE LOADED MODEL's template.
+        // Detecting it here would mean guessing from the model name against an empty
+        // template, which reports None for every model - and None makes the engine REFUSE
+        // every tool request. Only the worker has the template.
+        let (ready_tx, ready_rx) =
+            tokio::sync::oneshot::channel::<Result<crate::toolcall::ToolFormat, String>>();
         let model_name = cfg.model_name.clone();
         let max_slots = cfg.max_slots.max(1);
         let vision = cfg.mmproj_path.is_some();
-        // Detect from the template we will actually render — that is what tells the model how
-        // to speak — falling back to the model name for trained-in protocols like HOMURA.
-        let tool_format = crate::toolcall::detect("", &cfg.model_name, false);
 
         let w_healthy = Arc::clone(&healthy);
         let w_busy = Arc::clone(&busy);
@@ -223,7 +225,7 @@ impl InProcessEngine {
         // legitimately slow first-run Metal compile + big-model load never trips it.
         const STARTUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
         match tokio::time::timeout(STARTUP_TIMEOUT, ready_rx).await {
-            Ok(Ok(Ok(()))) => Ok(Self {
+            Ok(Ok(Ok(tool_format))) => Ok(Self {
                 job_tx: Some(job_tx),
                 healthy,
                 busy,
@@ -382,7 +384,7 @@ fn worker_main(
     healthy: Arc<AtomicBool>,
     busy: Arc<AtomicBool>,
     progress: Arc<AtomicU64>,
-    ready_tx: tokio::sync::oneshot::Sender<Result<(), String>>,
+    ready_tx: tokio::sync::oneshot::Sender<Result<crate::toolcall::ToolFormat, String>>,
 ) {
     let backend = match LlamaBackend::init() {
         Ok(b) => b,
@@ -470,7 +472,18 @@ fn worker_main(
     let mut waiting: VecDeque<Job> = VecDeque::new();
 
     healthy.store(true, Ordering::Relaxed);
-    let _ = ready_tx.send(Ok(()));
+    // Detect the tool syntax from the model's ACTUAL chat template, now that it is loaded.
+    // This is what the engine reports as its capability, so the orchestrator stops routing
+    // tool jobs to a model that cannot express a call.
+    let tool_format = crate::toolcall::detect(
+        &model
+            .meta_val_str("tokenizer.chat_template")
+            .unwrap_or_default(),
+        &cfg.model_name,
+        false,
+    );
+    tracing::info!("Tool-call format: {:?}", tool_format);
+    let _ = ready_tx.send(Ok(tool_format));
 
     let mut active_count = 0usize;
     loop {

@@ -80,3 +80,7 @@ required-features = ["inprocess"]
 [[example]]
 name = "embed_batch_test"
 required-features = ["inprocess"]
+
+[[example]]
+name = "tool_probe"
+required-features = ["inprocess"]
