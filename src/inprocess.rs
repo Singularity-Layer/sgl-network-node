@@ -119,8 +119,14 @@ struct Job {
 struct Slot {
     seq_id: i32,
     sampler: LlamaSampler,
-    /// Next KV position to write for this sequence (also == tokens decoded so far).
+    /// Next KV position to write for this sequence. Under mrope (Qwen2.5-VL) an image spans
+    /// MANY KV cells but only a FEW positions, so this is NOT a measure of cache occupancy.
     n_past: i32,
+    /// KV cells actually consumed by this sequence: prompt tokens (image tokens included)
+    /// plus one per generated token. Capping on `n_past` instead underestimates usage for a
+    /// vision request and lets decoding run past the real KV capacity into overflow. Equal
+    /// to `n_past` for text, so the text path is unchanged.
+    kv_tokens: u32,
     /// The token to decode on the next step (the previously sampled, already-emitted token).
     cur_token: LlamaToken,
     max_new: i32,
@@ -571,6 +577,7 @@ fn run_iteration(
             let tok = slot.sampler.sample(&*ctx, i as i32);
             slot.sampler.accept(tok);
             slot.n_past += 1; // cur_token now occupies its position; advance the write head
+            slot.kv_tokens += 1; // and one more KV cell is consumed
             (tok, ctx.model.is_eog_token(tok))
         };
         progress.store(now, Ordering::Relaxed);
@@ -598,7 +605,7 @@ fn run_iteration(
 
             if slot.stream_dropped
                 || slot.completion_tokens as i32 >= slot.max_new
-                || slot.n_past as u32 >= cfg.per_slot_ctx
+                || slot.kv_tokens >= cfg.per_slot_ctx
             {
                 done = true;
             }
@@ -792,6 +799,7 @@ fn admit_after_prefill(
         seq_id,
         sampler,
         n_past,
+        kv_tokens: prompt_tokens,
         cur_token: first,
         max_new,
         prompt_tokens,
