@@ -24,6 +24,10 @@ on:
   push:
     tags:
       - "v*"
+  # Manual trigger so a build can be PROVEN before it is released. Without this the only
+  # way to test a toolchain change (e.g. compiling llama.cpp in-process for a new platform)
+  # was to tag, which is why operators saw a run of releases in a single day.
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -132,9 +136,16 @@ jobs:
         # Static CRT: link the MSVC C runtime into the binary so sgl.exe has zero DLL
         # dependencies. Without this, clean Windows installs (no VC++ Redistributable)
         # die at launch with "VCRUNTIME140.dll was not found".
+        #
+        # In-process inference on Windows: the blocker was never Windows, it was a C-runtime
+        # MISMATCH. Rust links the static CRT (/MT) above while llama.cpp's cmake build
+        # defaults to the dynamic one (/MD), and mixing them fails to link. LLAMA_STATIC_CRT
+        # tells llama-cpp-sys-2 to build llama.cpp against the SAME runtime
+        # (build.rs -> config.static_crt), so the two agree.
         env:
           RUSTFLAGS: -C target-feature=+crt-static
-        run: cargo build --release --target x86_64-pc-windows-msvc
+          LLAMA_STATIC_CRT: "1"
+        run: cargo build --release --target x86_64-pc-windows-msvc --features inprocess,vision
 
       - name: Package + checksum
         shell: pwsh
