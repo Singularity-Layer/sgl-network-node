@@ -61,6 +61,11 @@ encoding_rs = { version = "0.8", optional = true }
 [features]
 inprocess = ["dep:llama-cpp-2", "dep:minijinja", "dep:minijinja-contrib", "dep:chrono", "dep:encoding_rs"]
 metal = ["llama-cpp-2/metal"]
+# GPU acceleration for the in-process engine on Linux, matching what llama-server already
+# uses there. One artifact covers GPU and CPU: ggml picks the Vulkan backend when a device
+# is present and falls back to CPU when it is not. Needs libvulkan-dev + glslang-tools to
+# BUILD (see the release workflow), not to run.
+vulkan = ["llama-cpp-2/vulkan"]
 # Multimodal (vision) INSIDE the node process. Implies `inprocess` because it extends
 # that engine. Kept separate so a broken mtmd build can never break plain-text macOS
 # builds, and so the security-relevant diff stays auditable on its own.
