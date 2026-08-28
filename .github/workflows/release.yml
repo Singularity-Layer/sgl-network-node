@@ -81,7 +81,7 @@ jobs:
         if: runner.os == 'Linux'
         # glslc (from shaderc) specifically - cmake's FindVulkan requires it and
         # glslang-tools only provides glslangValidator, which it does not accept.
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq libvulkan-dev glslc glslang-tools
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq libvulkan-dev glslc glslang-tools spirv-headers spirv-tools
 
       - name: Build
         run: |
