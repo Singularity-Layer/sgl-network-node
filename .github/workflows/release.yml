@@ -79,7 +79,9 @@ jobs:
       # llama-server already has on Linux.
       - name: Vulkan build deps (Linux)
         if: runner.os == 'Linux'
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq libvulkan-dev glslang-tools
+        # glslc (from shaderc) specifically - cmake's FindVulkan requires it and
+        # glslang-tools only provides glslangValidator, which it does not accept.
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq libvulkan-dev glslc glslang-tools
 
       - name: Build
         run: |
