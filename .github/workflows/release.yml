@@ -53,15 +53,12 @@ jobs:
           # real hardware, and flipping the default blind would move every Linux node onto an
           # untested inference path at once. Operators opt in with SGL_ENGINE=inprocess; the
           # default flips once it is validated on a real Linux node.
-          # CPU-only, deliberately. Building with `vulkan` DOES work (headers + glslc +
-          # spirv-headers on the runner) and gives the in-process engine GPU acceleration - but
-          # the resulting binary hard-links libvulkan.so.1 and then will not START on a machine
-          # without the Vulkan runtime. Verified in a bare container: "error while loading
-          # shared libraries: libvulkan.so.1". That would fix GPU nodes by bricking every
-          # CPU-only node, which is a worse trade. Binary also grows 16M -> 44M.
-          # Proper fix is a dynamically-loaded backend (llama-cpp-2 has `dynamic-backends`) or
-          # a separate GPU artifact chosen at install, like setup.rs already does with
-          # engine.variant. Until then Linux keeps the server engine as its default.
+          # TWO Linux artifacts per arch, because one binary cannot serve both. Linking the
+          # Vulkan backend hard-links libvulkan.so.1, and the binary then will not START on a
+          # host without the Vulkan runtime ("error while loading shared libraries") - so a
+          # single GPU build would fix GPU nodes by bricking every CPU-only node. Verified in
+          # a bare container. The installer picks by detecting a GPU, the same way setup.rs
+          # already chooses llama-server variants via engine.variant.
           - os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             asset: sgl-linux-x86_64
@@ -70,6 +67,18 @@ jobs:
             target: aarch64-unknown-linux-gnu
             asset: sgl-linux-arm64
             features: "inprocess,vision"
+          # GPU builds. `vulkan` matches what llama-server already uses on Linux, so a GPU
+          # node keeps the acceleration it has today. Needs libvulkan-dev + glslc +
+          # spirv-headers to BUILD (see the step below); needs a Vulkan runtime to RUN, which
+          # is exactly why these are separate assets.
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            asset: sgl-linux-x86_64-gpu
+            features: "inprocess,vision,vulkan"
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            asset: sgl-linux-arm64-gpu
+            features: "inprocess,vision,vulkan"
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -78,6 +87,13 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+
+      # Only the *-gpu Linux assets need these; cmake's FindVulkan wants glslc specifically
+      # (glslang-tools ships glslangValidator, which it rejects), and ggml-vulkan then wants
+      # SPIRV-Headers.
+      - name: Vulkan build deps
+        if: endsWith(matrix.asset, '-gpu')
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq libvulkan-dev glslc glslang-tools spirv-headers spirv-tools
 
       - name: Build
         run: |
