@@ -53,17 +53,18 @@ jobs:
           # real hardware, and flipping the default blind would move every Linux node onto an
           # untested inference path at once. Operators opt in with SGL_ENGINE=inprocess; the
           # default flips once it is validated on a real Linux node.
-          # CPU-only for now: the crate DOES have a `vulkan` feature (which is what llama-server
-          # already uses on Linux), but it needs Vulkan headers + a shader compiler on the
-          # runner. GPU acceleration is the next step, once this builds and runs clean.
+          # `vulkan` matches what llama-server already uses on Linux, so an in-process node
+          # keeps the SAME acceleration it has today - GPU where present, CPU otherwise, one
+          # artifact for both. Without it, defaulting Linux to in-process would move every GPU
+          # node onto CPU inference.
           - os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             asset: sgl-linux-x86_64
-            features: "inprocess,vision"
+            features: "inprocess,vision,vulkan"
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             asset: sgl-linux-arm64
-            features: "inprocess,vision"
+            features: "inprocess,vision,vulkan"
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -72,6 +73,13 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+
+      # Vulkan headers + the glsl compiler, needed to build ggml's Vulkan backend. Without
+      # these the build fails; with them the in-process engine gets the same GPU acceleration
+      # llama-server already has on Linux.
+      - name: Vulkan build deps (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq libvulkan-dev glslang-tools
 
       - name: Build
         run: |
