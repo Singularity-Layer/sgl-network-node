@@ -1016,13 +1016,19 @@ pub async fn start(
             // child over a socket the operator can read.
             #[cfg(all(feature = "inprocess", target_os = "macos"))]
             _ => crate::inference::EngineMode::InProcess,
-            // Linux now defaults to in-process too. Validated in a native arm64 Linux
-            // container: the engine loads, generates, streams, and produces a tool call
-            // BYTE-IDENTICAL to macOS - same 184/18 and 184/19 token counts - so an operator
-            // is billed the same on either platform. Windows keeps the server engine because
-            // in-process is not compiled there yet.
+            // Linux stays on the server engine BY DEFAULT, deliberately.
+            //
+            // In-process is proven correct there (validated in a native arm64 Linux container:
+            // byte-identical tool call and token counts to macOS). What it is NOT yet is FAST:
+            // llama-server on Linux runs on Vulkan, while our in-process build is CPU-only
+            // because the Vulkan feature needs shader tooling in CI. Defaulting now would move
+            // every Linux GPU node from GPU to CPU inference - a large slowdown, missed SLAs
+            // and lost earnings for operators who changed nothing.
+            //
+            // Operators can opt in today with SGL_ENGINE=inprocess (correct, just CPU-bound).
+            // This flips once in-process is built with Vulkan.
             #[cfg(all(feature = "inprocess", not(target_os = "macos")))]
-            _ => crate::inference::EngineMode::InProcess,
+            _ => crate::inference::EngineMode::Server,
             #[cfg(not(feature = "inprocess"))]
             _ => crate::inference::EngineMode::Server,
         };
@@ -1312,6 +1318,11 @@ pub async fn start(
     // node can be inprocess for text and server for vision. None only before the engine
     // exists; the orchestrator must treat an ABSENT value as unknown, never as safe.
     let node_engine: Option<&str> = engine.as_ref().map(|e| e.mode_label());
+    // Tool capability comes from the ENGINE, not from a guess about the engine kind: the
+    // server engine always can, the in-process engine only when the loaded model's template
+    // can express a call. Advertising it wrongly either starves the node of tool traffic or
+    // routes it jobs that fail.
+    let node_tools_capable = engine.as_ref().map(|e| e.supports_tools()).unwrap_or(false);
 
     loop {
         // ── #159 inference-progress watchdog ──────────────────────────────
@@ -1541,6 +1552,7 @@ pub async fn start(
                 embed_dim,
                 node_vision,
                 node_engine,
+                node_tools_capable,
             )
             .await
         {

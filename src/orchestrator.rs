@@ -408,6 +408,10 @@ impl OrchestratorClient {
         vision: Option<bool>,
         // "inprocess" | "server" — see NodeCapabilities::engine.
         engine: Option<&str>,
+        // Whether this node can actually SERVE tool calls right now: the server engine always
+        // can (llama-server does it), the in-process engine only if the loaded model's chat
+        // template can express a call.
+        tools_capable: bool,
     ) -> Result<HeartbeatResponse, String> {
         let url = format!("{}/grid/nodes/heartbeat", self.base_url);
         let token = self.get_token()?;
@@ -420,12 +424,12 @@ impl OrchestratorClient {
             key_version,
             capabilities: NodeCapabilities {
                 streaming,
-                // Honest per ENGINE, not hardcoded. The in-process engine cannot do tool
-                // calls: it errors on the stream path ("cannot stream tool calls") and
-                // silently drops them on the non-stream path. Claiming otherwise made the
-                // orchestrator route tool requests to it, and every one FAILED - which is
-                // what happened the moment vision models moved in-process.
-                streaming_tools: engine != Some("inprocess"),
+                // Honest capability, passed in by the caller from the ENGINE'S OWN answer.
+                // It was briefly hardcoded false for in-process (which then could not do tool
+                // calls at all); in-process now can, and leaving that stale would starve those
+                // nodes of every tool request. It was hardcoded TRUE before that, which routed
+                // tool jobs to nodes that failed them. Neither hardcoding survives contact.
+                streaming_tools: tools_capable,
                 context_size,
                 kind: kind.map(|s| s.to_string()),
                 dim,

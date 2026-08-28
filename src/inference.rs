@@ -1120,6 +1120,24 @@ impl InferenceEngine {
         }
     }
 
+    /// Can this engine actually serve a tool-calling request right now?
+    ///
+    /// The server engine always can - llama-server renders and parses tool calls itself. The
+    /// in-process engine can only when the loaded model's chat template can express a call;
+    /// for a model like Gemma, whose template has no tools branch, it must say NO so the
+    /// orchestrator stops routing tool jobs here rather than having them refused on arrival.
+    pub fn supports_tools(&self) -> bool {
+        match self {
+            InferenceEngine::Server(e) => !e.is_embedding(),
+            #[cfg(all(feature = "inprocess", feature = "vision"))]
+            InferenceEngine::InProcess(e) => e.tool_format().supports_tools(),
+            #[cfg(all(feature = "inprocess", not(feature = "vision")))]
+            InferenceEngine::InProcess(e) => e.tool_format().supports_tools(),
+            #[cfg(feature = "inprocess")]
+            InferenceEngine::Embed(_) => false,
+        }
+    }
+
     /// Native embedding dimension when this is an embedding engine (else None) — advertised to the
     /// orchestrator so it can meter + surface `dim` per model.
     pub fn embedding_dim(&self) -> Option<u32> {
