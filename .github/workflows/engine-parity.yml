@@ -11,6 +11,8 @@ name: engine-parity
 
 on:
   workflow_dispatch:
+  push:
+    branches: [feat/grid-embeddings]
 
 permissions:
   contents: read
