@@ -121,6 +121,42 @@ jobs:
           docker run --rm -v "${PWD}:C:\w" mcr.microsoft.com/windows/servercore:ltsc2025 `
             C:\w\sgl-windows-x86_64.exe --version
 
+      # PROVE THE ENGINE WORKS, not just that the binary starts. A build can link cleanly,
+      # pass the DLL gate, run --version, and still be unable to load a model or produce a
+      # tool call. macOS and Linux were both validated against a real model before their
+      # defaults were flipped; this is the Windows equivalent, and it runs on EVERY build
+      # instead of once on a rented box.
+      #
+      # The token counts below are not arbitrary: macOS and Linux each produced exactly
+      # 184 prompt / 22 completion for this prompt+tools. Identical counts across platforms
+      # is what guarantees an operator is billed the same wherever their node runs, so a
+      # drift here is a MONEY bug and must fail the build.
+      - name: Build the engine probe
+        env:
+          RUSTFLAGS: -C target-feature=+crt-static
+          CMAKE_MSVC_RUNTIME_LIBRARY: MultiThreaded
+          CMAKE_POLICY_DEFAULT_CMP0091: NEW
+          CFLAGS: /MT
+          CXXFLAGS: /MT
+        run: cargo build --release --target x86_64-pc-windows-msvc --features inprocess,vision --example tool_probe
+
+      - name: Run real inference through the in-process engine
+        shell: pwsh
+        run: |
+          $url = "https://huggingface.co/bartowski/Llama-3.2-1B-Instruct-GGUF/resolve/main/Llama-3.2-1B-Instruct-Q4_K_M.gguf"
+          Invoke-WebRequest -Uri $url -OutFile model.gguf -UseBasicParsing
+          $probe = "target/x86_64-pc-windows-msvc/release/examples/tool_probe.exe"
+          if (-not (Test-Path $probe)) { throw "probe not built at $probe" }
+          $out = & $probe model.gguf 2>&1 | Out-String
+          Write-Host $out
+          if ($out -notmatch 'tool_format detected: Llama3Json') { throw "tool format not detected on Windows" }
+          if ($out -notmatch 'finish_reason : Some\("tool_calls"\)') { throw "no tool call produced on Windows" }
+          if ($out -notmatch 'get_weather')                        { throw "tool name missing from the call" }
+          if ($out -notmatch 'tokens        : 184 prompt / 22 completion') {
+            throw "TOKEN COUNTS DIFFER from macOS/Linux (expected 184/22) - operators would be billed differently by platform"
+          }
+          Write-Host "OK: Windows in-process engine produced a tool call with matching token counts"
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
