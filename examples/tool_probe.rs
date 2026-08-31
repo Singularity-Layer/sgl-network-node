@@ -22,6 +22,7 @@ async fn main() {
     println!("finish_reason : {:?}", out.finish_reason);
     println!("tool_calls    : {}", serde_json::to_string(&out.tool_calls).unwrap());
     println!("content       : {:?}", out.content);
+    println!("content_len   : {}", out.content.len());
     println!("tokens        : {} prompt / {} completion", out.prompt_tokens, out.completion_tokens);
 
     // ---- streaming ----
@@ -32,7 +33,7 @@ async fn main() {
             "parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}
     }]);
     let (tx, mut rx) = tokio::sync::mpsc::channel(64);
-    let msgs2 = vec![ChatMessage{ role:"user".into(), content:"What is the weather in Tokyo? Use the tool.".into() }];
+    let msgs2 = vec![ChatMessage{ role:"user".into(), content:"What is the weather in Paris? Use the tool.".into() }];
     let h = tokio::spawn(async move {
         let mut text = String::new();
         let mut calls = Vec::new();

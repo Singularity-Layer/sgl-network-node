@@ -123,14 +123,24 @@ jobs:
 
       # PROVE THE ENGINE WORKS, not just that the binary starts. A build can link cleanly,
       # pass the DLL gate, run --version, and still be unable to load a model or produce a
-      # tool call. macOS and Linux were both validated against a real model before their
-      # defaults were flipped; this is the Windows equivalent, and it runs on EVERY build
-      # instead of once on a rented box.
+      # tool call.
       #
-      # The token counts below are not arbitrary: macOS and Linux each produced exactly
-      # 184 prompt / 22 completion for this prompt+tools. Identical counts across platforms
-      # is what guarantees an operator is billed the same wherever their node runs, so a
-      # drift here is a MONEY bug and must fail the build.
+      # This gate deliberately does NOT assert an exact completion-token count across
+      # platforms. An earlier version did, and it was wrong: greedy decoding is not
+      # bit-identical across ISAs. The x86-64 MSVC baseline is SSE2 with NO fused
+      # multiply-add, so every multiply-add rounds twice, while the arm64 builds use NEON
+      # with fused FMA that rounds once. On a near-tied logit the argmax legitimately flips,
+      # and Windows produced prose where arm64 produced a tool call - on ONE prompt, while
+      # matching arm64 token-for-token on another. That is model behaviour, not a bug.
+      # (The prompt also embeds today's date via the chat template, so "the same prompt" is
+      # not even byte-stable across days or timezones.)
+      #
+      # Billing correctness is "billed == produced", which holds regardless. Identical counts
+      # across platforms was never the invariant, and claiming it was an overreach.
+      #
+      # What IS deterministic, and what we therefore assert: on ONE machine with ONE binary
+      # at temperature 0, the streaming and non-streaming paths share a decode loop and must
+      # agree exactly. Plus the behaviour that actually matters - a real tool call comes back.
       - name: Build the engine probe
         env:
           RUSTFLAGS: -C target-feature=+crt-static
@@ -149,13 +159,27 @@ jobs:
           if (-not (Test-Path $probe)) { throw "probe not built at $probe" }
           $out = & $probe model.gguf 2>&1 | Out-String
           Write-Host $out
+
+          # 1. The engine loaded and knows what syntax this model speaks.
           if ($out -notmatch 'tool_format detected: Llama3Json') { throw "tool format not detected on Windows" }
+
+          # 2. A REAL tool call came back, with the right name and a usable argument.
           if ($out -notmatch 'finish_reason : Some\("tool_calls"\)') { throw "no tool call produced on Windows" }
-          if ($out -notmatch 'get_weather')                        { throw "tool name missing from the call" }
-          if ($out -notmatch 'tokens        : 184 prompt / 22 completion') {
-            throw "TOKEN COUNTS DIFFER from macOS/Linux (expected 184/22) - operators would be billed differently by platform"
+          if ($out -notmatch 'get_weather')                          { throw "tool name missing from the call" }
+          if ($out -notmatch '\\"city\\"')                            { throw "tool call carried no city argument" }
+
+          # 3. SAME-MACHINE PARITY - the real invariant. Both paths now use the same prompt,
+          #    same binary, same backend, temperature 0, so they are deterministic and MUST
+          #    agree. A mismatch here is a genuine bug in one of the two paths.
+          $ns = [regex]::Match($out, 'tokens\s+:\s+(\d+) prompt / (\d+) completion')
+          $st = [regex]::Match($out, 'stream usage\s+:\s+Some\((\d+), (\d+)\)')
+          if (-not $ns.Success -or -not $st.Success) { throw "could not read token counts from the probe" }
+          if ($ns.Groups[1].Value -ne $st.Groups[1].Value) {
+            throw "PROMPT TOKENS DIFFER between paths on one machine: $($ns.Groups[1].Value) vs $($st.Groups[1].Value) - the two paths render different prompts"
           }
-          Write-Host "OK: Windows in-process engine produced a tool call with matching token counts"
+          $nsc = [int]$ns.Groups[2].Value
+          if ($nsc -lt 1 -or $nsc -ge 80) { throw "completion tokens $nsc hit the cap - the model never finished a tool call" }
+          Write-Host "OK: Windows in-process engine produced a real tool call; both paths agree on prompt tokens ($($ns.Groups[1].Value))"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
