@@ -51,17 +51,40 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          # Suffix bumped deliberately. llama-cpp-sys-2 sets .always_configure(false), and
+          # cmake-rs SKIPS configure entirely when CMakeCache.txt exists — so a target/ dir
+          # cached from a /MD configure silently ignores a new runtime define and the change
+          # looks like it did nothing. Bump this whenever the CMake flags change.
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}-crtmt-v1
           restore-keys: |
+            ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}-crtmt-
             ${{ runner.os }}-cargo-
 
       - name: Build (release, MSVC)
         # Static CRT: link the MSVC C runtime into the binary so sgl.exe has zero DLL
         # dependencies. Without this, clean Windows installs (no VC++ Redistributable)
         # die at launch with "VCRUNTIME140.dll was not found".
+        #
+        # IN-PROCESS ON WINDOWS. The blocker was a C-runtime mismatch, not Windows: Rust
+        # links /MT (above) while llama.cpp's CMake half built /MD, giving
+        #   LNK2038: 'MT_StaticRelease' doesn't match 'MD_DynamicRelease' in llama-sampler.obj
+        #
+        # LLAMA_STATIC_CRT does NOT fix it. cmake-rs's static_crt() only feeds its internal
+        # cc configs and injects CMAKE_C_FLAGS; it never sets CMAKE_MSVC_RUNTIME_LIBRARY. And
+        # under policy CMP0091 (NEW — llama.cpp requires cmake >= 3.14...3.28) the runtime is
+        # chosen by that PROPERTY, not by flags, so a textual /MT in CMAKE_C_FLAGS loses.
+        #
+        # llama-cpp-sys-2's build.rs forwards any CMAKE_* env var as a -D define, so setting
+        # the property here reaches CMake without patching or forking the crate.
+        # CFLAGS/CXXFLAGS still matter: the mtmd/clip/siglip sources are compiled by the `cc`
+        # crate, which never sees the CMake property.
         env:
           RUSTFLAGS: -C target-feature=+crt-static
-        run: cargo build --release --target x86_64-pc-windows-msvc
+          CMAKE_MSVC_RUNTIME_LIBRARY: MultiThreaded
+          CMAKE_POLICY_DEFAULT_CMP0091: NEW
+          CFLAGS: /MT
+          CXXFLAGS: /MT
+        run: cargo build --release --target x86_64-pc-windows-msvc --features inprocess,vision
 
       - name: Checksum
         shell: pwsh
@@ -72,6 +95,31 @@ jobs:
           "$hash  sgl-windows-x86_64.exe" | Out-File -Encoding ascii "sgl-windows-x86_64.exe.sha256"
           Get-Content "sgl-windows-x86_64.exe.sha256"
           Copy-Item $bin "sgl-windows-x86_64.exe"
+
+      # "It links" is not "it runs". Twice on Linux a build went green and the binary then
+      # would not START on a clean host (libgomp.so.1, then libvulkan.so.1) because the
+      # loader fails before main(). These two gates are the Windows equivalent.
+      - name: Assert zero non-OS DLL imports
+        shell: pwsh
+        run: |
+          $dumpbin = (Get-ChildItem -Recurse -Filter dumpbin.exe `
+            "C:\Program Files\Microsoft Visual Studio" -ErrorAction SilentlyContinue |
+            Select-Object -First 1).FullName
+          if (-not $dumpbin) { Write-Host "dumpbin not found - skipping"; exit 0 }
+          $out = & $dumpbin /DEPENDENTS sgl-windows-x86_64.exe
+          Write-Host $out
+          $bad = $out | Select-String -Pattern 'VCRUNTIME|MSVCP|api-ms-win-crt|ucrtbase|vcomp'
+          if ($bad) { throw "sgl.exe imports a non-OS runtime DLL - it will not start on a clean Windows box: $bad" }
+          Write-Host "OK: no VC++ runtime imports"
+
+      - name: Run on a clean Windows image (no VC++ redistributable)
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          # Server Core has the OS UCRT but NOT the VC++ redistributable - the clean-box
+          # profile an operator actually has. A /MD binary dies here with 0xC0000135.
+          docker run --rm -v "${PWD}:C:\w" mcr.microsoft.com/windows/servercore:ltsc2025 `
+            C:\w\sgl-windows-x86_64.exe --version
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
