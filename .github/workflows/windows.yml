@@ -142,12 +142,19 @@ jobs:
       # at temperature 0, the streaming and non-streaming paths share a decode loop and must
       # agree exactly. Plus the behaviour that actually matters - a real tool call comes back.
       - name: Build the engine probe
+        # EXPERIMENT: +avx2,+fma. llama-cpp-sys-2 derives ggml's kernels from
+        # CARGO_CFG_TARGET_FEATURE when GGML_NATIVE is OFF, and the plain x86_64-msvc baseline
+        # is SSE2 - no FMA at all, so every multiply-add rounds twice. The arm64 builds use
+        # NEON with FUSED multiply-add (one rounding). That is the widest numerical gap in the
+        # whole matrix, and this build is producing degenerate output (echoing the tool schema
+        # instead of calling the tool) where arm64 calls it correctly. AVX2+FMA has been in
+        # essentially every x86 CPU since 2013.
         env:
-          RUSTFLAGS: -C target-feature=+crt-static
+          RUSTFLAGS: -C target-feature=+crt-static,+avx2,+fma
           CMAKE_MSVC_RUNTIME_LIBRARY: MultiThreaded
           CMAKE_POLICY_DEFAULT_CMP0091: NEW
-          CFLAGS: /MT
-          CXXFLAGS: /MT
+          CFLAGS: /MT /arch:AVX2
+          CXXFLAGS: /MT /arch:AVX2
         run: cargo build --release --target x86_64-pc-windows-msvc --features inprocess,vision --example tool_probe
 
       - name: Run real inference through the in-process engine
