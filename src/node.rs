@@ -1016,19 +1016,16 @@ pub async fn start(
             // child over a socket the operator can read.
             #[cfg(all(feature = "inprocess", target_os = "macos"))]
             _ => crate::inference::EngineMode::InProcess,
-            // Linux stays on the server engine BY DEFAULT, deliberately.
+            // Linux defaults to in-process too, now that the GPU path is proven.
             //
-            // In-process is proven correct there (validated in a native arm64 Linux container:
-            // byte-identical tool call and token counts to macOS). What it is NOT yet is FAST:
-            // llama-server on Linux runs on Vulkan, while our in-process build is CPU-only
-            // because the Vulkan feature needs shader tooling in CI. Defaulting now would move
-            // every Linux GPU node from GPU to CPU inference - a large slowdown, missed SLAs
-            // and lost earnings for operators who changed nothing.
-            //
-            // Operators can opt in today with SGL_ENGINE=inprocess (correct, just CPU-bound).
-            // This flips once in-process is built with Vulkan.
+            // Verified on a real NVIDIA A16 host, not in a container: ggml reported
+            // "Found 1 Vulkan devices" and assigned every layer to Vulkan0, and the GPU build
+            // answered in 2s against 43s for the CPU build on the same box and model - with
+            // IDENTICAL tool call and token counts (184/22), so nobody is billed differently.
+            // Linux ships two artifacts and the installer picks by detecting a GPU, because a
+            // Vulkan-linked binary cannot start at all on a host without the Vulkan runtime.
             #[cfg(all(feature = "inprocess", not(target_os = "macos")))]
-            _ => crate::inference::EngineMode::Server,
+            _ => crate::inference::EngineMode::InProcess,
             #[cfg(not(feature = "inprocess"))]
             _ => crate::inference::EngineMode::Server,
         };
