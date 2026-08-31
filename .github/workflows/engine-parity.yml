@@ -1,0 +1,32 @@
+# Does the in-process engine behave the same on x86-64 as on arm64?
+#
+# Every platform where tool calling works today is arm64 (macOS Metal, Linux arm64 CPU,
+# Linux arm64 Vulkan). Windows x86-64 echoes the tool SCHEMA back instead of calling the
+# tool. Windows was the only x86 build in the experiment, so "Windows is different" and
+# "x86 is different" are perfectly confounded. This runs the SAME probe on x86-64 Linux
+# with GCC to separate them:
+#   - x86 Linux also echoes  -> it is the x86 kernels, not Windows or MSVC
+#   - x86 Linux calls the tool -> it is specific to the Windows/MSVC build
+name: engine-parity
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux-x86:
+    name: in-process engine on x86-64 Linux
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build probe
+        run: cargo build --release --features inprocess,vision --example tool_probe
+      - name: Run the same probe as Windows
+        run: |
+          curl -sL -o model.gguf \
+            "https://huggingface.co/bartowski/Llama-3.2-1B-Instruct-GGUF/resolve/main/Llama-3.2-1B-Instruct-Q4_K_M.gguf"
+          ./target/release/examples/tool_probe model.gguf 2>&1 \
+            | grep -E "^tool_format|^finish_reason|^tokens|^content_len|^stream usage" || true
