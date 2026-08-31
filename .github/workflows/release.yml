@@ -216,7 +216,8 @@ jobs:
             --title "sgl-node $TAG" \
             --generate-notes \
             --prerelease \
-            sgl-darwin-arm64 sgl-darwin-arm64.sha256 \
-            sgl-linux-x86_64 sgl-linux-x86_64.sha256 \
-            sgl-linux-arm64 sgl-linux-arm64.sha256 \
-            sgl-windows-x86_64.exe sgl-windows-x86_64.exe.sha256
+            sgl-*
+          # Globbed on purpose. This list used to be hardcoded, and when the Linux GPU
+          # artifacts were added they BUILT green and were then silently dropped from the
+          # release - so `sgl update` on a GPU host would have 404'd. A new matrix entry must
+          # never again need a second edit here to actually ship.
