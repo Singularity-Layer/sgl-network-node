@@ -150,7 +150,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}-crtmt-v1
           restore-keys: |
             ${{ runner.os }}-cargo-
 
@@ -159,20 +159,43 @@ jobs:
         # dependencies. Without this, clean Windows installs (no VC++ Redistributable)
         # die at launch with "VCRUNTIME140.dll was not found".
         #
-        # In-process inference on Windows is NOT enabled yet. It is a C-runtime mismatch, not
-        # a Windows limitation: Rust links the static CRT (/MT) above, llama.cpp's cmake half
-        # builds /MD, and they fail to link (LNK2038 on llama-sampler.obj). CFLAGS/CXXFLAGS=/MT
-        # fixes the cc-crate half (mtmd/clip/siglip) but LLAMA_STATIC_CRT does not reach the
-        # cmake half - llama.cpp's own CMakeLists appears to override CMAKE_MSVC_RUNTIME_LIBRARY.
-        # Until that is solved Windows keeps the server engine, so this build stays green and a
-        # release can publish.
-        # LLAMA_STATIC_CRT only reaches the CMAKE half of the build. The mtmd (vision) sources
-        # are compiled by the `cc` crate instead, which never saw it and used /MD - producing
-        # LNK2038 RuntimeLibrary mismatches on mtmd.o/clip.o/siglip.o/pixtral.o. CFLAGS/CXXFLAGS
-        # force that half to /MT too, so every object agrees with Rust's static CRT.
+        #
+        # IN-PROCESS ON WINDOWS (proven in windows.yml before landing here).
+        #
+        # The blocker was a C-runtime mismatch, not a Windows limitation: Rust links /MT via
+        # crt-static above, while llama.cpp's CMake half built /MD -> LNK2038 on
+        # llama-sampler.obj. LLAMA_STATIC_CRT cannot fix it: cmake-rs's static_crt() only
+        # feeds its internal cc configs and injects CMAKE_C_FLAGS, never
+        # CMAKE_MSVC_RUNTIME_LIBRARY - and under policy CMP0091 (NEW) the runtime comes from
+        # that PROPERTY, so a textual /MT in flags loses.
+        #
+        # llama-cpp-sys-2's build.rs forwards any CMAKE_* env var as a -D define, so setting
+        # the property here reaches CMake with no patch or fork. CFLAGS/CXXFLAGS stay because
+        # the mtmd/clip/siglip sources are compiled by the `cc` crate, which never sees it.
         env:
           RUSTFLAGS: -C target-feature=+crt-static
-        run: cargo build --release --target x86_64-pc-windows-msvc
+          CMAKE_MSVC_RUNTIME_LIBRARY: MultiThreaded
+          CMAKE_POLICY_DEFAULT_CMP0091: NEW
+          CFLAGS: /MT
+          CXXFLAGS: /MT
+        run: cargo build --release --target x86_64-pc-windows-msvc --features inprocess,vision
+
+      # "It links" is not "it runs". Twice on Linux a green build produced a binary that
+      # would not START on a clean host (libgomp.so.1, then libvulkan.so.1) because the
+      # loader fails before main(). This is the Windows equivalent - do not remove it.
+      - name: Assert zero non-OS DLL imports
+        shell: pwsh
+        run: |
+          $bin = "target/x86_64-pc-windows-msvc/release/sgl.exe"
+          $dumpbin = (Get-ChildItem -Recurse -Filter dumpbin.exe `
+            "C:\Program Files\Microsoft Visual Studio" -ErrorAction SilentlyContinue |
+            Select-Object -First 1).FullName
+          if (-not $dumpbin) { Write-Host "dumpbin not found - skipping"; exit 0 }
+          $out = & $dumpbin /DEPENDENTS $bin
+          Write-Host $out
+          $bad = $out | Select-String -Pattern 'VCRUNTIME|MSVCP|api-ms-win-crt|ucrtbase|vcomp'
+          if ($bad) { throw "sgl.exe imports a non-OS runtime DLL - it will not start on a clean Windows box: $bad" }
+          Write-Host "OK: no VC++ runtime imports"
 
       - name: Package + checksum
         shell: pwsh
