@@ -1307,12 +1307,36 @@ async fn process_inference_stream(
 
     // Per-request nonce chosen by the client (inside the sealed prompt) — bound
     // into every chunk's AAD so a stream can't be spliced into another request.
-    let req_nonce = job
+    //
+    // REQUIRED, never defaulted. This used to fall back to "" when the field was
+    // absent, which looks harmless and is not: an empty nonce is a known
+    // constant, so every chunk's AAD becomes predictable and the forgery
+    // protection this nonce exists to provide silently disappears. Nothing
+    // anywhere reported it — the stream just worked, weakly.
+    //
+    // Not hypothetical: a first-party client shipped exactly that bug, sending
+    // the field as `stream_nonce` while this reads `nonce`. It was caught in
+    // review, not by any system. Fail closed so the next one is caught here.
+    let req_nonce = match job
         .input_payload
         .as_ref()
         .and_then(|p| p.get("nonce"))
         .and_then(|v| v.as_str())
-        .unwrap_or("");
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+    {
+        Some(n) => n,
+        None => {
+            let _ = client
+                .fail_job(
+                    &job.id,
+                    "sealed stream request missing required nonce (must be a non-empty \
+                     string inside the sealed payload)",
+                )
+                .await;
+            return;
+        }
+    };
     let sealer = match crate::encryption::StreamSealer::new(resp_pub, req_nonce) {
         Ok(s) => s,
         Err(e) => {
