@@ -8,6 +8,7 @@ mod node;
 mod orchestrator;
 mod runtime_hardening;
 mod service;
+mod streamseal;
 mod tee;
 mod update;
 mod ws;

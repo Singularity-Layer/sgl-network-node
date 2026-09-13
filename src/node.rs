@@ -1305,20 +1305,12 @@ async fn process_inference_stream(
             }
         };
 
-    // Per-request nonce chosen by the client (inside the sealed prompt) — bound
-    // into every chunk's AAD so a stream can't be spliced into another request.
-    let req_nonce = job
-        .input_payload
-        .as_ref()
-        .and_then(|p| p.get("nonce"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    let sealer = match crate::encryption::StreamSealer::new(resp_pub, req_nonce) {
+    // Per-request nonce + stream sealer. The nonce is REQUIRED and never defaulted —
+    // see crate::streamseal for why an empty one silently removes forgery protection.
+    let sealer = match crate::streamseal::init(job.input_payload.as_ref(), resp_pub) {
         Ok(s) => s,
-        Err(e) => {
-            let _ = client
-                .fail_job(&job.id, &format!("stream seal init failed: {e}"))
-                .await;
+        Err(reason) => {
+            let _ = client.fail_job(&job.id, &reason).await;
             return;
         }
     };
