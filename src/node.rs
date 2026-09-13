@@ -1419,4 +1419,3 @@ async fn process_inference_stream(
     }
     tracing::warn!("Job {} stream failed: {reason}", job.id);
 }
-
