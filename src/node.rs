@@ -987,6 +987,11 @@ pub async fn start(
         systemone_sidecar_url
             .map(|s| s.trim().trim_end_matches('/').to_string())
             .filter(|s| !s.is_empty())
+            .map(|s| {
+                validate_systemone_sidecar_url(&s)?;
+                Ok::<_, String>(s)
+            })
+            .transpose()?
     } else {
         if systemone_sidecar_url.is_some() {
             tracing::warn!("--systemone-sidecar-url is ignored when --model-path is set");
@@ -2485,12 +2490,54 @@ async fn execute_systemone(
     Ok(out)
 }
 
+fn validate_systemone_sidecar_url(raw: &str) -> Result<(), String> {
+    let url =
+        reqwest::Url::parse(raw).map_err(|e| format!("Invalid System One sidecar URL: {e}"))?;
+    match url.scheme() {
+        "http" | "https" => {}
+        s => return Err(format!("System One sidecar URL must be http(s), got {s:?}")),
+    }
+    let host = url
+        .host_str()
+        .ok_or("System One sidecar URL must include a host")?;
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    if host.eq_ignore_ascii_case("localhost") {
+        return Ok(());
+    }
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        if ip.is_loopback() {
+            return Ok(());
+        }
+    }
+    Err("System One sidecar URL must be loopback-only (127.0.0.1, ::1, or localhost)".to_string())
+}
+
 #[cfg(test)]
 mod tool_extract_tests {
-    use super::extract_text_tool_calls;
+    use super::{extract_text_tool_calls, validate_systemone_sidecar_url};
 
     fn allowed() -> Vec<String> {
         vec!["get_weather".to_string()]
+    }
+
+    #[test]
+    fn systemone_sidecar_accepts_only_loopback_urls() {
+        for url in [
+            "http://127.0.0.1:8000",
+            "http://localhost:8000",
+            "http://[::1]:8000",
+            "https://127.0.0.1",
+        ] {
+            assert!(validate_systemone_sidecar_url(url).is_ok(), "{url}");
+        }
+        for url in [
+            "http://10.0.0.8:8000",
+            "http://example.com:8000",
+            "file:///tmp/laya.sock",
+            "http://0.0.0.0:8000",
+        ] {
+            assert!(validate_systemone_sidecar_url(url).is_err(), "{url}");
+        }
     }
 
     #[test]

@@ -673,6 +673,7 @@ mod tests {
     /// failed with "unknown filter: tojson" — after the model was loaded and the operator was
     /// already serving. This test fails loudly at build time instead.
     #[test]
+    #[cfg(feature = "inprocess")]
     fn tools_template_renders_with_tojson() {
         let mut env = minijinja::Environment::new();
         env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
@@ -700,6 +701,7 @@ mod tests {
     /// If it does not, every existing request's prompt_tokens moves and billing shifts under
     /// operators who changed nothing.
     #[test]
+    #[cfg(feature = "inprocess")]
     fn absent_tools_renders_identically() {
         let mut env = minijinja::Environment::new();
         env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
