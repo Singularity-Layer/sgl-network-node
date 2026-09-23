@@ -30,7 +30,9 @@ on:
   workflow_dispatch:
 
 permissions:
+  attestations: write
   contents: write
+  id-token: write
 
 jobs:
   build:
@@ -227,6 +229,11 @@ jobs:
 
       - name: Show checksums (paste these into the allowlist)
         run: cat ./*.sha256
+
+      - name: Attest release artifacts
+        uses: actions/attest@v4.2.2
+        with:
+          subject-path: sgl-*
 
       - name: Create prerelease with assets
         env:

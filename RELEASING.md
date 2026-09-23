@@ -14,7 +14,8 @@ publishes **one GitHub prerelease** carrying one binary + `.sha256` per platform
 | `sgl-windows-x86_64.exe` | `windows-latest` | MSVC + NASM; non-confidential node |
 
 Jobs: a matrix `build` (mac/linux) + a dedicated `build-windows` (MSVC toolchain +
-`ilammy/setup-nasm@v1` for `ring`) → a single `release` job that runs one
+`ilammy/setup-nasm@v1` for `ring`) → a single `release` job that attests the
+downloaded artifacts with GitHub Artifact Attestations, then runs one
 `gh release create --prerelease` with ALL platform assets. So mac + linux + windows
 land on ONE release, not several.
 
@@ -44,6 +45,8 @@ serve traffic. On every release:
 
 - Take each `*.sha256` (release asset, or the release run's *"Show checksums"*
   step) — the 64-char lowercase hex before the filename.
+- Verify provenance for any downloaded asset before syncing it publicly:
+  `gh attestation verify <asset> --repo Singularity-Layer/sgl-network-node`.
 - Append the new hashes to `ALLOWED_NODE_BINARY_HASHES` on the orchestrator
   (comma-separated). **Add before removing** old hashes so nodes mid-upgrade keep
   serving.
