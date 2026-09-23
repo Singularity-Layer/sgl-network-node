@@ -91,6 +91,11 @@ enum Commands {
         #[arg(long)]
         model_name: Option<String>,
 
+        /// System One sidecar base URL (for Laya/Jev-compatible typed decision models).
+        /// When set without --model-path, the node advertises --model-name or convaiinnovations/laya.
+        #[arg(long)]
+        systemone_sidecar_url: Option<String>,
+
         /// Vision (multimodal) models only: path to the mmproj (vision projector) GGUF.
         /// When set, llama-server accepts image inputs. The app/provisioner downloads +
         /// hash-verifies it alongside the model (same discipline as --model-path).
@@ -235,6 +240,10 @@ enum ServiceAction {
         #[arg(long)]
         model_name: Option<String>,
 
+        /// System One sidecar base URL (for Laya/Jev-compatible typed decision models).
+        #[arg(long)]
+        systemone_sidecar_url: Option<String>,
+
         /// Vision (multimodal) models only: path to the mmproj (vision projector) GGUF.
         #[arg(long)]
         mmproj_path: Option<String>,
@@ -364,6 +373,7 @@ async fn main() {
         Commands::Start {
             model_path,
             model_name,
+            systemone_sidecar_url,
             mmproj_path,
             image_max_tokens,
             inference_port,
@@ -394,11 +404,17 @@ async fn main() {
                 heartbeat_interval,
                 enable_streaming,
             );
+            let systemone_sidecar_url = systemone_sidecar_url.or_else(|| {
+                std::env::var("SGL_SYSTEMONE_SIDECAR_URL")
+                    .ok()
+                    .filter(|s| !s.trim().is_empty())
+            });
             if let Err(e) = node::start(
                 &config_dir,
                 &cli.orchestrator_url,
                 model_path.as_deref(),
                 model_name.as_deref(),
+                systemone_sidecar_url.as_deref(),
                 mmproj_path.as_deref(),
                 image_max_tokens,
                 inference_port,
@@ -486,6 +502,7 @@ async fn main() {
                 ServiceAction::Install {
                     model_path,
                     model_name,
+                    systemone_sidecar_url,
                     mmproj_path,
                     image_max_tokens,
                     resource_percent,
@@ -499,6 +516,11 @@ async fn main() {
                     let opts = service::ServiceStartOptions {
                         model_path,
                         model_name,
+                        systemone_sidecar_url: systemone_sidecar_url.or_else(|| {
+                            std::env::var("SGL_SYSTEMONE_SIDECAR_URL")
+                                .ok()
+                                .filter(|s| !s.trim().is_empty())
+                        }),
                         mmproj_path,
                         image_max_tokens,
                         orchestrator_url: cli.orchestrator_url.clone(),

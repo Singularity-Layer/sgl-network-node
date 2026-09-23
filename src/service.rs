@@ -22,6 +22,7 @@ const SERVICE_LABEL: &str = "cc.x402compute.sglnode";
 pub struct ServiceStartOptions {
     pub model_path: Option<String>,
     pub model_name: Option<String>,
+    pub systemone_sidecar_url: Option<String>,
     /// Vision (multimodal) models: path to the mmproj GGUF, baked into the service so the
     /// background node serves images across restarts. None for text/embedding models.
     pub mmproj_path: Option<String>,
@@ -53,6 +54,10 @@ impl ServiceStartOptions {
         if let Some(mn) = &self.model_name {
             args.push("--model-name".into());
             args.push(mn.clone());
+        }
+        if let Some(url) = &self.systemone_sidecar_url {
+            args.push("--systemone-sidecar-url".into());
+            args.push(url.clone());
         }
         if let Some(mm) = &self.mmproj_path {
             args.push("--mmproj-path".into());

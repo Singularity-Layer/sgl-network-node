@@ -533,6 +533,7 @@ fn maybe_spawn_job(
     job: PendingJob,
     client: Arc<OrchestratorClient>,
     engine: Option<Arc<InferenceEngine>>,
+    systemone_sidecar_url: Option<Arc<String>>,
     node_secret: [u8; 32],
     streaming_enabled: bool,
     active_jobs: Arc<AtomicU32>,
@@ -596,6 +597,7 @@ fn maybe_spawn_job(
         process_job(
             &client,
             &engine,
+            systemone_sidecar_url.clone(),
             &job,
             &node_secret,
             streaming_enabled,
@@ -932,6 +934,7 @@ pub async fn start(
     orchestrator_url: &str,
     model_path: Option<&str>,
     model_name: Option<&str>,
+    systemone_sidecar_url: Option<&str>,
     mmproj_path: Option<&str>,
     image_max_tokens: Option<u32>,
     inference_port: u16,
@@ -980,6 +983,16 @@ pub async fn start(
 
     let mut engine: Option<Arc<InferenceEngine>> = None;
     let mut models: Vec<String> = vec![];
+    let systemone_sidecar_url = if model_path.is_none() {
+        systemone_sidecar_url
+            .map(|s| s.trim().trim_end_matches('/').to_string())
+            .filter(|s| !s.is_empty())
+    } else {
+        if systemone_sidecar_url.is_some() {
+            tracing::warn!("--systemone-sidecar-url is ignored when --model-path is set");
+        }
+        None
+    };
     // Continuous-batching concurrency: how many requests this node serves at once.
     // Defaults to 1 (no model, or in-process engine); the server engine computes a
     // RAM-aware value below. Used for the LOCAL capacity gate AND advertised to the
@@ -1128,9 +1141,19 @@ pub async fn start(
         models.push(name);
         engine = Some(Arc::new(eng));
         tracing::info!("Inference engine ready ({engine_mode:?})");
+    } else if systemone_sidecar_url.is_some() {
+        let name = model_name.unwrap_or("convaiinnovations/laya").to_string();
+        models.push(name.clone());
+        if rc.max_jobs > 0 {
+            effective_slots = rc.max_jobs.max(1);
+        }
+        tracing::info!(
+            "System One sidecar mode enabled for {name} at {}",
+            systemone_sidecar_url.as_deref().unwrap_or_default()
+        );
     } else {
         tracing::warn!("No model specified — node will register but cannot process inference jobs");
-        tracing::warn!("Use --model-path <path.gguf> --model-name <name> to enable inference");
+        tracing::warn!("Use --model-path <path.gguf> --model-name <name> to enable inference, or --systemone-sidecar-url <url> --model-name convaiinnovations/laya for System One");
     }
 
     tracing::info!("Heartbeat interval: {}s", rc.heartbeat_interval);
@@ -1195,6 +1218,7 @@ pub async fn start(
     // Empty-completion self-heal state (shared across both dispatch paths + the heartbeat loop).
     // Catches the "answers /health but returns 0 tokens" zombie the other watchdogs miss.
     let empty_health = Arc::new(EmptyHealth::load(config_dir));
+    let systemone_sidecar = systemone_sidecar_url.map(Arc::new);
 
     // ── WebSocket push-dispatch (additive fast-path) ──────────────────
     // Connects to the orchestrator and processes jobs the instant they're pushed,
@@ -1208,6 +1232,7 @@ pub async fn start(
         let client_job = Arc::clone(&client);
         let client_tok = Arc::clone(&client);
         let engine_ws = engine.clone();
+        let systemone_ws = systemone_sidecar.clone();
         let secret = node_secret;
         let se = rc.streaming_enabled;
         let aj = Arc::clone(&active_jobs);
@@ -1231,6 +1256,7 @@ pub async fn start(
                         job,
                         Arc::clone(&client_job),
                         engine_ws.clone(),
+                        systemone_ws.clone(),
                         secret,
                         se,
                         Arc::clone(&aj),
@@ -1299,7 +1325,9 @@ pub async fn start(
     // kind="embedding" + its native dim so the orchestrator routes embeddings vs chat correctly
     // and can surface embeddings separately in /v1/models. Chat nodes send neither (byte-identical).
     let embed_dim: Option<u32> = engine.as_ref().and_then(|e| e.embedding_dim());
-    let node_kind: Option<&str> = if embed_dim.is_some() {
+    let node_kind: Option<&str> = if systemone_sidecar.is_some() {
+        Some("systemone")
+    } else if embed_dim.is_some() {
         Some("embedding")
     } else {
         None
@@ -1579,6 +1607,7 @@ pub async fn start(
                         job,
                         Arc::clone(&client),
                         engine.clone(),
+                        systemone_sidecar.clone(),
                         node_secret,
                         rc.streaming_enabled,
                         Arc::clone(&active_jobs),
@@ -1794,6 +1823,7 @@ pub async fn attest(config_dir: &Path, orchestrator_url: &str) -> Result<(), Str
 async fn process_job(
     client: &OrchestratorClient,
     engine: &Option<Arc<InferenceEngine>>,
+    systemone_sidecar_url: Option<Arc<String>>,
     job: &PendingJob,
     node_secret: &[u8; 32],
     streaming_enabled: bool,
@@ -1867,6 +1897,13 @@ async fn process_job(
     let result = match effective_job.job_type.as_str() {
         "inference" => execute_inference(engine, &effective_job, empty_health).await,
         "embedding" => execute_embedding(engine, &effective_job).await,
+        "systemone" => {
+            execute_systemone(
+                systemone_sidecar_url.as_deref().map(|s| s.as_str()),
+                &effective_job,
+            )
+            .await
+        }
         _ => {
             tracing::warn!("Unsupported job type: {}", effective_job.job_type);
             Err(format!("Unsupported job type: {}", effective_job.job_type))
@@ -2349,6 +2386,103 @@ async fn execute_embedding(
             }
         }))
     }
+}
+
+async fn execute_systemone(
+    sidecar_url: Option<&str>,
+    job: &PendingJob,
+) -> Result<serde_json::Value, String> {
+    let base = sidecar_url
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or("No System One sidecar configured — start with --systemone-sidecar-url")?;
+    let payload = job
+        .input_payload
+        .as_ref()
+        .ok_or("Job has no input payload")?;
+    let payload_obj = payload
+        .as_object()
+        .ok_or("System One payload must be a JSON object")?;
+
+    let mut request = serde_json::Map::new();
+    if let Some(model) = payload_obj.get("model").cloned().or_else(|| {
+        job.model
+            .as_ref()
+            .map(|m| serde_json::Value::String(m.clone()))
+    }) {
+        request.insert("model".to_string(), model);
+    }
+    for key in ["state", "questions", "task", "lang"] {
+        if let Some(v) = payload_obj.get(key) {
+            request.insert(key.to_string(), v.clone());
+        }
+    }
+    if !request.contains_key("state") {
+        return Err("System One payload missing 'state'".to_string());
+    }
+    if !request.contains_key("questions") {
+        return Err("System One payload missing 'questions'".to_string());
+    }
+
+    let request_value = serde_json::Value::Object(request);
+    let request_bytes = serde_json::to_vec(&request_value)
+        .map_err(|e| format!("failed to encode System One payload: {e}"))?;
+    const MAX_SYSTEMONE_PAYLOAD_BYTES: usize = 256 * 1024;
+    if request_bytes.len() > MAX_SYSTEMONE_PAYLOAD_BYTES {
+        return Err(format!(
+            "System One payload too large ({} bytes > {MAX_SYSTEMONE_PAYLOAD_BYTES})",
+            request_bytes.len()
+        ));
+    }
+
+    let url = format!("{}/v1/systemone", base.trim_end_matches('/'));
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(120))
+        .build()
+        .map_err(|e| format!("failed to create System One HTTP client: {e}"))?;
+    let resp = client
+        .post(&url)
+        .json(&request_value)
+        .send()
+        .await
+        .map_err(|e| format!("System One sidecar request failed: {e}"))?;
+    let status = resp.status();
+    let body = resp
+        .text()
+        .await
+        .map_err(|e| format!("System One sidecar response read failed: {e}"))?;
+    if !status.is_success() {
+        return Err(format!("System One sidecar returned HTTP {status}: {body}"));
+    }
+
+    let mut out: serde_json::Value = serde_json::from_str(&body)
+        .map_err(|e| format!("System One sidecar returned invalid JSON: {e}"))?;
+    let out_obj = out
+        .as_object_mut()
+        .ok_or("System One sidecar response must be a JSON object")?;
+    if !out_obj.contains_key("model") {
+        out_obj.insert(
+            "model".to_string(),
+            serde_json::Value::String(job.model.clone().unwrap_or_default()),
+        );
+    }
+    match out_obj.get_mut("usage") {
+        Some(serde_json::Value::Object(usage)) => {
+            usage
+                .entry("input_tokens".to_string())
+                .or_insert(serde_json::Value::Number(0.into()));
+            usage
+                .entry("output_tokens".to_string())
+                .or_insert(serde_json::Value::Number(0.into()));
+        }
+        _ => {
+            out_obj.insert(
+                "usage".to_string(),
+                serde_json::json!({ "input_tokens": 0, "output_tokens": 0 }),
+            );
+        }
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
