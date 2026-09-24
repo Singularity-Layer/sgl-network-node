@@ -916,6 +916,28 @@ fn inprocess_slots(
     }
 }
 
+/// System One sidecars do not load GGUF weights in this process, so the GGUF
+/// RAM estimator above cannot size slots for them. Laya/MLX can handle several
+/// tiny typed-decision calls concurrently on Apple Silicon, but keep the default
+/// conservative because third-party sidecars may serialize internally. Explicit
+/// `--max-jobs 1` still pins strict single-flight; `0` means this safe auto mode.
+fn systemone_sidecar_slots(memory_gb: f64, requested_max_jobs: u32) -> u32 {
+    const AUTO_MAX_SLOTS: u32 = 3;
+    let auto = if memory_gb >= 24.0 {
+        3
+    } else if memory_gb >= 12.0 {
+        2
+    } else {
+        1
+    };
+    let auto = auto.min(AUTO_MAX_SLOTS);
+    if requested_max_jobs > 0 {
+        auto.min(requested_max_jobs).max(1)
+    } else {
+        auto
+    }
+}
+
 fn wedge_timeout_ms(model_path: &Path) -> u64 {
     let gb = std::fs::metadata(model_path)
         .map(|m| m.len() as f64 / 1e9)
@@ -1149,11 +1171,9 @@ pub async fn start(
     } else if systemone_sidecar_url.is_some() {
         let name = model_name.unwrap_or("convaiinnovations/laya").to_string();
         models.push(name.clone());
-        if rc.max_jobs > 0 {
-            effective_slots = rc.max_jobs.max(1);
-        }
+        effective_slots = systemone_sidecar_slots(tee::detect().memory_gb, rc.max_jobs);
         tracing::info!(
-            "System One sidecar mode enabled for {name} at {}",
+            "System One sidecar mode enabled for {name} at {} (slots: {effective_slots})",
             systemone_sidecar_url.as_deref().unwrap_or_default()
         );
     } else {
@@ -2514,7 +2534,7 @@ fn validate_systemone_sidecar_url(raw: &str) -> Result<(), String> {
 
 #[cfg(test)]
 mod tool_extract_tests {
-    use super::{extract_text_tool_calls, validate_systemone_sidecar_url};
+    use super::{extract_text_tool_calls, systemone_sidecar_slots, validate_systemone_sidecar_url};
 
     fn allowed() -> Vec<String> {
         vec!["get_weather".to_string()]
@@ -2538,6 +2558,16 @@ mod tool_extract_tests {
         ] {
             assert!(validate_systemone_sidecar_url(url).is_err(), "{url}");
         }
+    }
+
+    #[test]
+    fn systemone_sidecar_slots_are_conservative_and_overridable() {
+        assert_eq!(systemone_sidecar_slots(8.0, 0), 1);
+        assert_eq!(systemone_sidecar_slots(16.0, 0), 2);
+        assert_eq!(systemone_sidecar_slots(32.0, 0), 3);
+        assert_eq!(systemone_sidecar_slots(32.0, 1), 1);
+        assert_eq!(systemone_sidecar_slots(32.0, 2), 2);
+        assert_eq!(systemone_sidecar_slots(32.0, 99), 3);
     }
 
     #[test]
