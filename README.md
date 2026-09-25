@@ -72,6 +72,9 @@ layers / concurrent jobs), or fine-grained `--threads`, `--gpu-layers`, `--conte
 `--max-jobs`, `--batch-size`, `--inference-port`, `--heartbeat-interval`. The global
 `--orchestrator-url` defaults to `https://grid.x402compute.cc`.
 
+System One sidecars can be served with `--systemone-sidecar-url`. For a GPU CLM
+operator canary, see [Run CLM as a System One node](docs/systemone-clm.md).
+
 ## Run as a service (production)
 
 ```bash
