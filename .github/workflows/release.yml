@@ -12,11 +12,12 @@
 # release, each new sha256 must be appended to the orchestrator's
 # ALLOWED_NODE_BINARY_HASHES (add-before-remove) or the build cannot serve.
 #
-# NON-PUBLIC BY DESIGN: the release is a `--prerelease` and this repo is PRIVATE,
-# so assets are not anonymously downloadable. Nothing reaches the public download
-# endpoint (cloud.x402compute.cc/downloads/node/) until the owner syncs manually.
-# The Windows binary additionally does nothing until the owner allowlists its
-# sha256 — see WINDOWS.md / RELEASING.md.
+# PRIVATE REPO, NORMAL RELEASE: assets are not anonymously downloadable while the
+# repo remains private, but `sgl update` uses GitHub's `/releases/latest` endpoint,
+# which ignores prereleases. Nothing reaches the public download endpoint
+# (cloud.x402compute.cc/downloads/node/) until the owner syncs manually. The
+# Windows binary additionally does nothing until the owner allowlists its sha256 —
+# see WINDOWS.md / RELEASING.md.
 
 name: release
 
@@ -245,7 +246,6 @@ jobs:
             --repo "$REPO" \
             --title "sgl-node $TAG" \
             --generate-notes \
-            --prerelease \
             sgl-*
           # Globbed on purpose. This list used to be hardcoded, and when the Linux GPU
           # artifacts were added they BUILT green and were then silently dropped from the
