@@ -131,6 +131,13 @@ struct HeartbeatRequest {
     // (llama-server --parallel N). The orchestrator persists this to max_concurrent_jobs
     // so its capacity gate dispatches up to N concurrent jobs to this node.
     max_concurrent_jobs: u32,
+    // Routing telemetry (runtime, accelerator, engine state, slot use, recent speed). ONE
+    // additive top-level object so an orchestrator that doesn't know it ignores it entirely.
+    // Deliberately NOT inside `capabilities` (persisted wholesale into metadata on change, so
+    // volatile values would be stored stale) and NOT in `current_load` (compared for heartbeat
+    // coalescing, so a changing value would force a DB write every beat). See telemetry.rs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    telemetry: Option<crate::telemetry::HeartbeatTelemetry>,
 }
 
 #[derive(Serialize)]
@@ -412,6 +419,8 @@ impl OrchestratorClient {
         // can (llama-server does it), the in-process engine only if the loaded model's chat
         // template can express a call.
         tools_capable: bool,
+        // Additive routing telemetry; None (kill switch) omits the key entirely.
+        telemetry: Option<crate::telemetry::HeartbeatTelemetry>,
     ) -> Result<HeartbeatResponse, String> {
         let url = format!("{}/grid/nodes/heartbeat", self.base_url);
         let token = self.get_token()?;
@@ -439,6 +448,7 @@ impl OrchestratorClient {
             active_job_ids,
             binary_hash,
             max_concurrent_jobs,
+            telemetry,
         };
 
         let resp = self
@@ -811,5 +821,77 @@ impl OrchestratorClient {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod heartbeat_wire_tests {
+    use super::*;
+
+    fn body(telemetry: Option<crate::telemetry::HeartbeatTelemetry>) -> serde_json::Value {
+        serde_json::to_value(HeartbeatRequest {
+            current_load: 0.5,
+            available_models: vec!["m".into()],
+            encryption_public_key: None,
+            encryption_public_key_signature: None,
+            key_version: None,
+            capabilities: NodeCapabilities {
+                streaming: true,
+                streaming_tools: true,
+                context_size: 4096,
+                kind: None,
+                dim: None,
+                vision: None,
+                engine: Some("inprocess".into()),
+            },
+            active_job_ids: vec![],
+            binary_hash: None,
+            max_concurrent_jobs: 2,
+            telemetry,
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn telemetry_off_sends_exactly_the_pre_telemetry_keys() {
+        let v = body(None);
+        let keys: Vec<&str> = v.as_object().unwrap().keys().map(|k| k.as_str()).collect();
+        assert_eq!(
+            keys,
+            [
+                "active_job_ids",
+                "available_models",
+                "capabilities",
+                "current_load",
+                "max_concurrent_jobs"
+            ]
+        );
+    }
+
+    #[test]
+    fn telemetry_is_one_top_level_key_and_leaves_capabilities_alone() {
+        let t = crate::telemetry::Telemetry::new();
+        let models = vec!["m".to_string()];
+        let snap = t.snapshot(crate::telemetry::SnapshotInputs {
+            has_engine: true,
+            has_sidecar: false,
+            unhealthy_streak: 0,
+            quarantined: false,
+            accelerator: Some("metal"),
+            models: &models,
+            slots_busy: 0,
+            slots_total: 2,
+        });
+        let (with, without) = (body(snap), body(None));
+        assert_eq!(with["telemetry"]["schema"], 1);
+        assert_eq!(
+            with["telemetry"]["slots_total"],
+            with["max_concurrent_jobs"]
+        );
+        assert_eq!(with["capabilities"], without["capabilities"]);
+        assert_eq!(with["current_load"], without["current_load"]);
+        let mut stripped = with.clone();
+        stripped.as_object_mut().unwrap().remove("telemetry");
+        assert_eq!(stripped, without);
     }
 }

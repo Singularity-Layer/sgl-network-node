@@ -543,6 +543,7 @@ fn maybe_spawn_job(
     last_activity: Arc<AtomicU64>,
     completions: Arc<AtomicU64>,
     empty_health: Arc<EmptyHealth>,
+    telemetry: Arc<crate::telemetry::Telemetry>,
 ) {
     // Empty-suspect quarantine: while the heartbeat loop is canary-probing (or a
     // canary-confirmed-dead engine is parked), refuse new work so no request hits a suspect
@@ -569,6 +570,7 @@ fn maybe_spawn_job(
         .is_err()
     {
         // At capacity. Not marked seen, so the next REST poll retries it.
+        telemetry.note_deferred_at_capacity();
         tracing::warn!(
             "At max concurrent jobs ({max_jobs}), deferring job {}",
             job.id
@@ -602,6 +604,7 @@ fn maybe_spawn_job(
             &node_secret,
             streaming_enabled,
             &empty_health,
+            &telemetry,
         )
         .await;
         // Release the slot ONLY if this job is still tracked. The watchdog may have already
@@ -1244,6 +1247,8 @@ pub async fn start(
     // Catches the "answers /health but returns 0 tokens" zombie the other watchdogs miss.
     let empty_health = Arc::new(EmptyHealth::load(config_dir));
     let systemone_sidecar = systemone_sidecar_url.map(Arc::new);
+    // Additive heartbeat telemetry (telemetry.rs), fed by both dispatch paths.
+    let telemetry = Arc::new(crate::telemetry::Telemetry::new());
 
     // ── WebSocket push-dispatch (additive fast-path) ──────────────────
     // Connects to the orchestrator and processes jobs the instant they're pushed,
@@ -1267,6 +1272,7 @@ pub async fn start(
         let la = Arc::clone(&last_activity);
         let co = Arc::clone(&completions);
         let eh = Arc::clone(&empty_health);
+        let tm = Arc::clone(&telemetry);
         let st = Arc::clone(&ws_state);
         let cfg_tok = cfg.clone();
         let config_dir_buf = config_dir.to_path_buf();
@@ -1291,6 +1297,7 @@ pub async fn start(
                         Arc::clone(&la),
                         Arc::clone(&co),
                         Arc::clone(&eh),
+                        Arc::clone(&tm),
                     );
                 },
                 move |new_tok, _exp| {
@@ -1584,6 +1591,16 @@ pub async fn start(
         } else {
             health_advertised
         };
+        let heartbeat_telemetry = telemetry.snapshot(crate::telemetry::SnapshotInputs {
+            has_sidecar: systemone_sidecar.is_some(),
+            accelerator: engine.as_ref().map(|e| e.accelerator_hint(rc.gpu_layers)),
+            has_engine: engine.is_some(),
+            unhealthy_streak,
+            quarantined: empty_quarantined,
+            models: &models,
+            slots_busy: active_jobs.load(Ordering::Relaxed),
+            slots_total: effective_slots,
+        });
 
         match client
             .heartbeat(
@@ -1603,6 +1620,7 @@ pub async fn start(
                 node_vision,
                 node_engine,
                 node_tools_capable,
+                heartbeat_telemetry,
             )
             .await
         {
@@ -1642,6 +1660,7 @@ pub async fn start(
                         Arc::clone(&last_activity),
                         Arc::clone(&completions),
                         Arc::clone(&empty_health),
+                        Arc::clone(&telemetry),
                     );
                 }
             }
@@ -1845,6 +1864,7 @@ pub async fn attest(config_dir: &Path, orchestrator_url: &str) -> Result<(), Str
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn process_job(
     client: &OrchestratorClient,
     engine: &Option<Arc<InferenceEngine>>,
@@ -1853,6 +1873,7 @@ async fn process_job(
     node_secret: &[u8; 32],
     streaming_enabled: bool,
     empty_health: &EmptyHealth,
+    telemetry: &crate::telemetry::Telemetry,
 ) {
     tracing::info!("Processing job {} (type: {})", job.id, job.job_type);
 
@@ -1906,7 +1927,8 @@ async fn process_job(
         && effective_job.job_type == "inference"
     {
         if let Some(resp_pub) = response_pubkey {
-            process_inference_stream(
+            let started = std::time::Instant::now();
+            let (end, output_tokens) = process_inference_stream(
                 client,
                 engine,
                 &effective_job,
@@ -1915,10 +1937,12 @@ async fn process_job(
                 empty_health,
             )
             .await;
+            telemetry.record_stream(end, started.elapsed(), output_tokens);
             return;
         }
     }
 
+    let started = std::time::Instant::now(); // engine time only, for telemetry
     let result = match effective_job.job_type.as_str() {
         "inference" => execute_inference(engine, &effective_job, empty_health).await,
         "embedding" => execute_embedding(engine, &effective_job).await,
@@ -1934,6 +1958,7 @@ async fn process_job(
             Err(format!("Unsupported job type: {}", effective_job.job_type))
         }
     };
+    telemetry.record_buffered_result(&effective_job.job_type, started.elapsed(), &result);
 
     match result {
         Ok(output) => {
@@ -2873,14 +2898,15 @@ async fn process_inference_stream(
     node_secret: &[u8; 32],
     resp_pub: &[u8; 32],
     empty_health: &EmptyHealth,
-) {
+) -> (crate::telemetry::JobEnd, Option<u64>) {
+    use crate::telemetry::JobEnd::{ClientGone, Failed, Ok as Done};
     let engine = match engine {
         Some(e) => e.clone(),
         None => {
             let _ = client
                 .fail_job(&job.id, "No inference engine configured")
                 .await;
-            return;
+            return (Failed, None);
         }
     };
 
@@ -2888,7 +2914,7 @@ async fn process_inference_stream(
         Ok(v) => v,
         Err(e) => {
             let _ = client.fail_job(&job.id, &e).await;
-            return;
+            return (Failed, None);
         }
     };
     let (temperature, max_tokens) = (p.temperature, p.max_tokens);
@@ -2922,14 +2948,14 @@ async fn process_inference_stream(
                     let _ = client
                         .fail_job(&job.id, &format!("Invalid messages format: {e}"))
                         .await;
-                    return;
+                    return (Failed, None);
                 }
             },
             Err(e) => {
                 let _ = client
                     .fail_job(&job.id, &format!("Invalid messages format: {e}"))
                     .await;
-                return;
+                return (Failed, None);
             }
         }
     };
@@ -2963,7 +2989,7 @@ async fn process_inference_stream(
                      string inside the sealed payload)",
                 )
                 .await;
-            return;
+            return (Failed, None);
         }
     };
     let sealer = match crate::encryption::StreamSealer::new(resp_pub, req_nonce) {
@@ -2972,7 +2998,7 @@ async fn process_inference_stream(
             let _ = client
                 .fail_job(&job.id, &format!("stream seal init failed: {e}"))
                 .await;
-            return;
+            return (Failed, None);
         }
     };
     let eph_b58 = sealer.ephemeral_public_b58().to_string();
@@ -3006,6 +3032,7 @@ async fn process_inference_stream(
     // whitespace-only zombie; track real content separately for the empty-completion signal.
     let mut emitted_nonws = false;
     let mut final_sent = false;
+    let mut final_tokens: Option<u64> = None; // telemetry only
     let mut client_gone = false;
     let mut homura_cleaner = is_homura_model(job).then(HomuraStreamCleaner::new);
     let mut stream_failure_reason: Option<String> = None;
@@ -3165,6 +3192,7 @@ async fn process_inference_stream(
                 {
                     Ok(_) => {
                         final_sent = true;
+                        final_tokens = Some(completion_tokens as u64);
                         // Empty-completion health signal (streaming). `emitted_nonws` is true iff any
                         // non-whitespace content was streamed — the streaming twin of content
                         // emptiness, independent of whether the build reported usage. Only counted
@@ -3189,7 +3217,7 @@ async fn process_inference_stream(
     if final_sent {
         inf.abort(); // generation already finished; ensure the task is reaped
         tracing::info!("Job {} completed (E2E stream, {} chunk(s))", job.id, seq);
-        return;
+        return (Done, final_tokens);
     }
 
     if client_gone {
@@ -3224,7 +3252,7 @@ async fn process_inference_stream(
             seq,
             emitted_tokens
         );
-        return;
+        return (ClientGone, None);
     }
 
     // Generation failure (upstream EOF without [DONE], or the final post failed) —
@@ -3250,4 +3278,5 @@ async fn process_inference_stream(
             .await;
     }
     tracing::warn!("Job {} stream failed: {reason}", job.id);
+    (Failed, None)
 }

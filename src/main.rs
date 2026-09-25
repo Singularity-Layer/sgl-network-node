@@ -15,6 +15,7 @@ mod runtime_hardening;
 mod service;
 mod setup;
 mod tee;
+mod telemetry;
 mod update;
 mod ws;
 

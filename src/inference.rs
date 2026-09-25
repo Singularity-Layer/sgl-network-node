@@ -62,6 +62,8 @@ pub struct ServerEngine {
     embed_spec: Option<&'static crate::embed_catalog::EmbedModelSpec>,
     /// Supervised-restart counter for the engine-variant auto-swap (see restart()).
     restart_count: std::sync::atomic::AtomicU32,
+    /// Telemetry hint for the binary actually launched; reset each start() (Vulkan→CPU swap).
+    accelerator: std::sync::Mutex<&'static str>,
 }
 
 /// Which llama.cpp variant `sgl setup` installed ("vulkan" | "cpu"), from the marker it
@@ -218,6 +220,7 @@ impl ServerEngine {
             config,
             embed_spec,
             restart_count: std::sync::atomic::AtomicU32::new(0),
+            accelerator: std::sync::Mutex::new("unknown"),
         }
     }
 
@@ -402,6 +405,13 @@ impl ServerEngine {
             };
 
         let llama_server = find_llama_server()?;
+        let variant = installed_engine_variant();
+        let hint = crate::telemetry::server_accelerator(
+            &llama_server,
+            self.config.gpu_layers,
+            variant.as_deref(),
+        );
+        *self.accelerator.lock().unwrap_or_else(|p| p.into_inner()) = hint;
         tracing::info!(
             "Starting llama-server with model: {}",
             self.config.model_path.display()
@@ -1011,6 +1021,16 @@ impl InferenceEngine {
             InferenceEngine::InProcess(_) => "inprocess",
             #[cfg(feature = "inprocess")]
             InferenceEngine::Embed(_) => "inprocess",
+        }
+    }
+
+    /// Heartbeat telemetry hint (see telemetry::server_accelerator). Never a trust signal.
+    #[cfg_attr(not(feature = "inprocess"), allow(unused_variables))]
+    pub fn accelerator_hint(&self, gpu_layers: u32) -> &'static str {
+        match self {
+            InferenceEngine::Server(e) => *e.accelerator.lock().unwrap_or_else(|p| p.into_inner()),
+            #[cfg(feature = "inprocess")]
+            _ => crate::telemetry::inprocess_accelerator(gpu_layers),
         }
     }
 

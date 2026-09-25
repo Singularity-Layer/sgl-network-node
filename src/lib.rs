@@ -14,4 +14,6 @@ pub mod inference;
 pub mod inprocess;
 pub mod multimodal;
 pub mod setup;
+// inference.rs labels its backend through it (heartbeat telemetry).
+pub mod telemetry;
 pub mod toolcall;
