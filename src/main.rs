@@ -14,6 +14,7 @@ mod orchestrator;
 mod runtime_hardening;
 mod service;
 mod setup;
+mod stream_relay;
 mod tee;
 mod telemetry;
 mod update;

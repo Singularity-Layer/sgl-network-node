@@ -528,6 +528,7 @@ use crate::config::{self, NodeConfig};
 use crate::crypto::NodeKeypair;
 use crate::inference::{ChatMessage, InferenceEngine, InferenceEngineConfig};
 use crate::orchestrator::{OrchestratorClient, PendingJob};
+use crate::stream_relay::seal_post_chunk;
 use crate::tee;
 
 pub struct ResourceConfig {
@@ -3128,32 +3129,8 @@ mod empty_health_tests {
 /// client over SSE). Each chunk's AAD binds its seq + final flag; the node also
 /// signs an envelope per chunk so the orchestrator can attribute it. Billing
 /// happens on the final chunk's usage; if the client aborts, chunk POSTs start
-/// failing and we stop early (no final → no charge).
-/// Seal one stream chunk, sign its envelope, and POST it. Returns `Ok(true)` if
-/// the orchestrator reports the client is gone (stop early), `Ok(false)` to keep
-/// going, `Err` on a hard failure.
-#[allow(clippy::too_many_arguments)]
-async fn seal_post_chunk(
-    client: &OrchestratorClient,
-    sealer: &crate::encryption::StreamSealer,
-    node_secret: &[u8; 32],
-    job_id: &str,
-    eph_b58: &str,
-    seq: u64,
-    is_final: bool,
-    plaintext: &[u8],
-    usage: Option<serde_json::Value>,
-    fmt: Option<&str>,
-) -> Result<bool, String> {
-    let ct = sealer.seal_chunk(plaintext, seq, is_final)?;
-    let kind = format!("stream:{seq}:{}", if is_final { 1 } else { 0 });
-    let sig = crate::crypto::sign_result_envelope(node_secret, job_id, &kind, ct.as_bytes());
-    let eph = if seq == 0 { Some(eph_b58) } else { None };
-    client
-        .post_chunk(job_id, seq, is_final, eph, &ct, usage, Some(sig), fmt)
-        .await
-}
-
+/// failing and we stop early (no final → no charge). Text deltas that queued up
+/// while a POST was in flight are coalesced into one chunk (`stream_relay`).
 async fn process_inference_stream(
     client: &OrchestratorClient,
     engine: &Option<Arc<InferenceEngine>>,
@@ -3299,8 +3276,18 @@ async fn process_inference_stream(
     let mut client_gone = false;
     let mut homura_cleaner = is_homura_model(job).then(HomuraStreamCleaner::new);
     let mut stream_failure_reason: Option<String> = None;
+    let coalesce_max = crate::stream_relay::coalesce_max_bytes();
+    // A tool-call/Done event pulled while coalescing text; handled before the next recv.
+    let mut held: Option<crate::inference::StreamEvent> = None;
 
-    while let Some(ev) = rx.recv().await {
+    loop {
+        let ev = match held.take() {
+            Some(ev) => ev,
+            None => match rx.recv().await {
+                Some(ev) => ev,
+                None => break,
+            },
+        };
         match ev {
             // Tool-call delta: forwarded verbatim inside the sealed payload. Counts as
             // real output (an agent's whole answer may be a tool call with no prose), so it
@@ -3337,19 +3324,28 @@ async fn process_inference_stream(
                 }
             }
             crate::inference::StreamEvent::Delta { text, tokens } => {
-                emitted_tokens = emitted_tokens.saturating_add(tokens);
-                let out_text = if let Some(cleaner) = homura_cleaner.as_mut() {
-                    cleaner.push(&text)
-                } else {
-                    text
-                };
-                if out_text.is_empty() {
+                // Merge text deltas already queued behind this one (never waits). Tokens
+                // are billed on accept; on a failed POST only `lead_tokens`, which is what
+                // the one-delta-per-chunk loop would have counted (see stream_relay).
+                let batch = crate::stream_relay::coalesce_deltas(
+                    text,
+                    tokens,
+                    coalesce_max,
+                    |t| match homura_cleaner.as_mut() {
+                        Some(cleaner) => cleaner.push(&t),
+                        None => t,
+                    },
+                    || rx.try_recv().ok(),
+                );
+                held = batch.held;
+                if batch.text.is_empty() {
+                    emitted_tokens = emitted_tokens.saturating_add(batch.tokens);
                     continue;
                 }
-                if !out_text.trim().is_empty() {
+                if !batch.text.trim().is_empty() {
                     emitted_nonws = true;
                 }
-                match seal_post_chunk(
+                let posted = seal_post_chunk(
                     client,
                     &sealer,
                     node_secret,
@@ -3357,23 +3353,22 @@ async fn process_inference_stream(
                     &eph_b58,
                     seq,
                     false,
-                    &encode_text(&out_text),
+                    &encode_text(&batch.text),
                     None,
                     chunk_fmt,
                 )
-                .await
-                {
-                    Ok(false) => seq += 1,
-                    Ok(true) => {
-                        client_gone = true;
-                        break;
-                    }
-                    Err(e) => {
-                        tracing::warn!("Job {} chunk {seq} post failed: {e}", job.id);
-                        client_gone = true;
-                        break;
-                    }
+                .await;
+                if matches!(posted, Ok(false)) {
+                    emitted_tokens = emitted_tokens.saturating_add(batch.tokens);
+                    seq += 1;
+                    continue;
                 }
+                emitted_tokens = emitted_tokens.saturating_add(batch.lead_tokens);
+                if let Err(e) = posted {
+                    tracing::warn!("Job {} chunk {seq} post failed: {e}", job.id);
+                }
+                client_gone = true;
+                break;
             }
             crate::inference::StreamEvent::Done {
                 prompt_tokens,
