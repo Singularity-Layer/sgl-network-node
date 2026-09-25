@@ -1112,6 +1112,19 @@ impl InferenceEngine {
         }
     }
 
+    /// True once the in-process engine hit a fatal llama.cpp backend error (sticky until the
+    /// process relaunches). Other engines never report it: the server engine's child is
+    /// restarted by the generic /health path, and the embedding engine does not classify errors.
+    pub fn backend_failed(&self) -> bool {
+        match self {
+            InferenceEngine::Server(_) => false,
+            #[cfg(feature = "inprocess")]
+            InferenceEngine::InProcess(e) => e.backend_failed(),
+            #[cfg(feature = "inprocess")]
+            InferenceEngine::Embed(_) => false,
+        }
+    }
+
     /// True iff this engine serves embeddings (routes `/v1/embeddings` jobs) rather than chat.
     pub fn is_embedding(&self) -> bool {
         match self {

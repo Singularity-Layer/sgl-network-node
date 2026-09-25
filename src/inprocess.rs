@@ -29,10 +29,13 @@ use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::params::LlamaModelParams;
 #[cfg(feature = "vision")]
+use llama_cpp_2::mtmd::MtmdEvalError;
+#[cfg(feature = "vision")]
 use llama_cpp_2::mtmd::{MtmdBitmap, MtmdContext, MtmdContextParams, MtmdInputText};
 use llama_cpp_2::model::{AddBos, LlamaModel, Special};
 use llama_cpp_2::sampling::LlamaSampler;
 use llama_cpp_2::token::LlamaToken;
+use llama_cpp_2::DecodeError;
 
 use crate::inference::{ChatMessage, StreamEvent};
 
@@ -60,6 +63,60 @@ const PREFILL_CHUNK: usize = 512;
 /// as WEDGED (deadlocked / hung native call) → is_healthy() goes false so the node stops
 /// advertising. Generous so a legitimately slow prefill/token never trips it.
 const WEDGE_MS: u64 = 120_000;
+
+/// `llama_decode` return code for `GGML_STATUS_FAILED`: the backend could not run the compute
+/// graph (llama-context.cpp maps FAILED -> -3, ALLOC_FAILED -> -2, ABORTED -> 2). On Metal this
+/// is STICKY: after one failed command buffer (GPU OOM, watchdog timeout, sleep/wake) ggml-metal
+/// sets `has_error` and fails every later graph compute until the backend is recreated. This
+/// engine creates its backend once and never recreates it, so no later job on this process can
+/// succeed.
+const FATAL_BACKEND_DECODE_CODE: i32 = -3;
+
+/// True only for the backend-failed decode code. Everything else stays a per-job failure:
+/// `NoKvCacheSlot` (1) and `NTokensZero` (-1) are request/occupancy shaped, `-2` (ALLOC_FAILED)
+/// is not sticky on Metal and can be transient, and `2` (ABORTED) is an abort callback.
+fn is_fatal_backend_error(e: &DecodeError) -> bool {
+    matches!(e, DecodeError::Unknown(FATAL_BACKEND_DECODE_CODE))
+}
+
+/// Vision prefill: mtmd's eval helper returns `llama_decode`'s code unchanged on a decode
+/// failure (its own encode failures are 1), so -3 here is the same sticky backend failure.
+#[cfg(feature = "vision")]
+fn is_fatal_mtmd_error(e: &MtmdEvalError) -> bool {
+    matches!(e, MtmdEvalError::EvalFailure(FATAL_BACKEND_DECODE_CODE))
+}
+
+/// Latch the engine as permanently failed. Called BEFORE the failing job is answered, so by the
+/// time anyone observes that failure the engine already reads unhealthy. The heartbeat loop then
+/// de-advertises and relaunches the process (the only way to get a fresh backend).
+fn mark_backend_failed(backend_failed: &AtomicBool, site: &str, detail: &dyn std::fmt::Display) {
+    if !backend_failed.swap(true, Ordering::Relaxed) {
+        tracing::error!(
+            "fatal inference backend error during {site} ({detail}): the GPU backend is in a \
+             sticky error state; marking the engine unhealthy so the node stops advertising and \
+             relaunches"
+        );
+    }
+}
+
+/// Health decision, split out so it can be tested without loading a model. `backend_failed`
+/// wins over everything: a failed backend is fast, not wedged, so the progress watchdog alone
+/// would read it as healthy forever.
+fn engine_health(
+    loaded: bool,
+    backend_failed: bool,
+    busy: bool,
+    last_progress_ms: u64,
+    now: u64,
+) -> bool {
+    if !loaded || backend_failed {
+        return false;
+    }
+    if !busy {
+        return true; // idle, model loaded
+    }
+    now.saturating_sub(last_progress_ms) < WEDGE_MS
+}
 
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
@@ -171,6 +228,10 @@ pub struct InProcessEngine {
     /// joining the worker. Always `Some` for a live engine.
     job_tx: Option<Sender<Job>>,
     healthy: Arc<AtomicBool>,
+    /// Latched (never cleared) when llama.cpp reports a fatal backend error. The context and
+    /// backend live for the whole process, so only a relaunch recovers. See
+    /// `is_fatal_backend_error`.
+    backend_failed: Arc<AtomicBool>,
     /// True while the worker is inside a scheduler iteration doing native work (admit/prefill
     /// OR decode). Set BEFORE the native calls so a wedge during a slot's prefill — when no
     /// slot is "active" yet — is still covered by the watchdog. Idle (false) is always healthy.
@@ -200,6 +261,7 @@ impl InProcessEngine {
     pub async fn start(cfg: InProcessConfig) -> Result<Self, String> {
         let (job_tx, job_rx) = std::sync::mpsc::channel::<Job>();
         let healthy = Arc::new(AtomicBool::new(false));
+        let backend_failed = Arc::new(AtomicBool::new(false));
         let busy = Arc::new(AtomicBool::new(false));
         let last_progress_ms = Arc::new(AtomicU64::new(0));
         // The worker reports the tool format it detected FROM THE LOADED MODEL's template.
@@ -213,11 +275,22 @@ impl InProcessEngine {
         let vision = cfg.mmproj_path.is_some();
 
         let w_healthy = Arc::clone(&healthy);
+        let w_backend_failed = Arc::clone(&backend_failed);
         let w_busy = Arc::clone(&busy);
         let w_progress = Arc::clone(&last_progress_ms);
         let worker = std::thread::Builder::new()
             .name("sgl-inference".into())
-            .spawn(move || worker_main(cfg, job_rx, w_healthy, w_busy, w_progress, ready_tx))
+            .spawn(move || {
+                worker_main(
+                    cfg,
+                    job_rx,
+                    w_healthy,
+                    w_backend_failed,
+                    w_busy,
+                    w_progress,
+                    ready_tx,
+                )
+            })
             .map_err(|e| format!("failed to spawn inference worker: {e}"))?;
 
         // Bound the startup wait. Model load + context creation are native llama.cpp/Metal
@@ -232,6 +305,7 @@ impl InProcessEngine {
             Ok(Ok(Ok(tool_format))) => Ok(Self {
                 job_tx: Some(job_tx),
                 healthy,
+                backend_failed,
                 busy,
                 last_progress_ms,
                 model_name,
@@ -335,14 +409,22 @@ impl InProcessEngine {
     /// current scheduler iteration). A wedged worker (busy but no progress for WEDGE_MS —
     /// including a wedge during a job's PREFILL, before any slot is "active") reads as
     /// UNHEALTHY so the heartbeat loop de-advertises it — closing the in-process zombie.
+    /// A fatal backend error (see `is_fatal_backend_error`) also reads UNHEALTHY, permanently.
     pub fn is_healthy(&self) -> bool {
-        if !self.healthy.load(Ordering::Relaxed) {
-            return false;
-        }
-        if !self.busy.load(Ordering::Relaxed) {
-            return true; // idle, model loaded
-        }
-        now_ms().saturating_sub(self.last_progress_ms.load(Ordering::Relaxed)) < WEDGE_MS
+        engine_health(
+            self.healthy.load(Ordering::Relaxed),
+            self.backend_failed.load(Ordering::Relaxed),
+            self.busy.load(Ordering::Relaxed),
+            self.last_progress_ms.load(Ordering::Relaxed),
+            now_ms(),
+        )
+    }
+
+    /// True once llama.cpp reported a fatal backend error. Sticky for the life of the process:
+    /// the heartbeat loop uses it to relaunch under a persisted crash-loop budget instead of the
+    /// generic (in-memory) restart budget.
+    pub fn backend_failed(&self) -> bool {
+        self.backend_failed.load(Ordering::Relaxed)
     }
 }
 
@@ -386,6 +468,7 @@ fn worker_main(
     cfg: InProcessConfig,
     job_rx: Receiver<Job>,
     healthy: Arc<AtomicBool>,
+    backend_failed: Arc<AtomicBool>,
     busy: Arc<AtomicBool>,
     progress: Arc<AtomicU64>,
     ready_tx: tokio::sync::oneshot::Sender<Result<crate::toolcall::ToolFormat, String>>,
@@ -546,6 +629,7 @@ fn worker_main(
                 &mut waiting,
                 &cfg,
                 &progress,
+                &backend_failed,
                 #[cfg(feature = "vision")]
                 mtmd.as_ref(),
             );
@@ -574,6 +658,7 @@ fn run_iteration(
     waiting: &mut VecDeque<Job>,
     cfg: &InProcessConfig,
     progress: &AtomicU64,
+    backend_failed: &AtomicBool,
     #[cfg(feature = "vision")] mtmd: Option<&MtmdContext>,
 ) {
     // 1. Admit: fill free slots from the waiting queue.
@@ -586,9 +671,9 @@ fn run_iteration(
         };
         let seq_id = idx as i32;
         #[cfg(feature = "vision")]
-        let outcome = admit(ctx, batch, seq_id, cfg, progress, mtmd, job);
+        let outcome = admit(ctx, batch, seq_id, cfg, progress, backend_failed, mtmd, job);
         #[cfg(not(feature = "vision"))]
-        let outcome = admit(ctx, batch, seq_id, cfg, progress, job);
+        let outcome = admit(ctx, batch, seq_id, cfg, progress, backend_failed, job);
         match outcome {
             AdmitOutcome::Active(slot) => slots[idx] = Some(slot),
             AdmitOutcome::Finished => { /* replied already; slot stays free */ }
@@ -616,7 +701,11 @@ fn run_iteration(
 
     if let Err(e) = ctx.decode(batch) {
         // A decode failure poisons the whole in-flight batch (shared context) — fail every
-        // sequence in this step with the error and free their slots. The node stays up.
+        // sequence in this step with the error and free their slots. The node stays up,
+        // unless the backend itself failed: then latch unhealthy first so it relaunches.
+        if is_fatal_backend_error(&e) {
+            mark_backend_failed(backend_failed, "decode", &e);
+        }
         let msg = format!("decode failed: {e}");
         for &idx in &order {
             if let Some(slot) = slots[idx].take() {
@@ -682,12 +771,14 @@ enum AdmitOutcome {
 /// Render + tokenize + prefill a new job into `seq_id`, then sample its first token. Returns
 /// an active Slot ready for the decode loop, or Finished if it completed immediately (empty
 /// prompt / error / instant EOG / max_tokens==1) — in which case the reply is already sent.
+#[allow(clippy::too_many_arguments)]
 fn admit(
     ctx: &mut LlamaContext,
     batch: &mut LlamaBatch,
     seq_id: i32,
     cfg: &InProcessConfig,
     progress: &AtomicU64,
+    backend_failed: &AtomicBool,
     #[cfg(feature = "vision")] mtmd: Option<&MtmdContext>,
     job: Job,
 ) -> AdmitOutcome {
@@ -771,6 +862,9 @@ fn admit(
         let n_past = match chunks.eval_chunks(mtmd, ctx, 0, seq_id, PREFILL_CHUNK as i32, true) {
             Ok(p) => p,
             Err(e) => {
+                if is_fatal_mtmd_error(&e) {
+                    mark_backend_failed(backend_failed, "multimodal prefill", &e);
+                }
                 let _ = ctx.clear_kv_cache_seq(Some(seq_id as u32), None, None);
                 return finish_admit_err(kind, format!("multimodal prefill failed: {e}"));
             }
@@ -812,6 +906,9 @@ fn admit(
             }
         }
         if let Err(e) = ctx.decode(batch) {
+            if is_fatal_backend_error(&e) {
+                mark_backend_failed(backend_failed, "prompt prefill", &e);
+            }
             let _ = ctx.clear_kv_cache_seq(Some(seq_id as u32), None, None);
             return finish_admit_err(kind, format!("prompt decode failed: {e}"));
         }
@@ -1253,4 +1350,63 @@ fn try_render_chat_prompt(
         }),
     }
     .map_err(|e| format!("chat template render failed: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_backend_failed_decode_is_fatal() {
+        // -3 = GGML_STATUS_FAILED, the sticky Metal state seen live on node 4344157b.
+        assert!(is_fatal_backend_error(&DecodeError::Unknown(-3)));
+        // Request/occupancy shaped or transient: these stay per-job failures.
+        assert!(!is_fatal_backend_error(&DecodeError::NoKvCacheSlot)); // 1
+        assert!(!is_fatal_backend_error(&DecodeError::NTokensZero)); // -1
+        assert!(!is_fatal_backend_error(&DecodeError::Unknown(-2))); // ALLOC_FAILED
+        assert!(!is_fatal_backend_error(&DecodeError::Unknown(2))); // ABORTED
+        assert!(!is_fatal_backend_error(&DecodeError::Unknown(-4)));
+    }
+
+    #[test]
+    fn fatal_decode_error_text_is_unchanged() {
+        // The job still fails with exactly this text; the orchestrator's failure_reason and any
+        // log greps depend on it.
+        assert_eq!(
+            format!("decode failed: {}", DecodeError::Unknown(-3)),
+            "decode failed: Decode Error -3: unknown"
+        );
+    }
+
+    #[cfg(feature = "vision")]
+    #[test]
+    fn only_backend_failed_mtmd_eval_is_fatal() {
+        assert!(is_fatal_mtmd_error(&MtmdEvalError::EvalFailure(-3)));
+        assert!(!is_fatal_mtmd_error(&MtmdEvalError::EvalFailure(1))); // encode failure
+        assert!(!is_fatal_mtmd_error(&MtmdEvalError::EvalFailure(-2)));
+        assert!(!is_fatal_mtmd_error(&MtmdEvalError::EvalFailure(-1)));
+    }
+
+    #[test]
+    fn mark_backend_failed_latches() {
+        let flag = AtomicBool::new(false);
+        mark_backend_failed(&flag, "decode", &DecodeError::Unknown(-3));
+        assert!(flag.load(Ordering::Relaxed));
+        mark_backend_failed(&flag, "prompt prefill", &DecodeError::Unknown(-3));
+        assert!(flag.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn backend_failed_is_unhealthy_even_when_idle() {
+        let now = 1_000_000;
+        // Existing behaviour unchanged.
+        assert!(engine_health(true, false, false, 0, now)); // idle
+        assert!(engine_health(true, false, true, now - 1_000, now)); // busy, progressing
+        assert!(!engine_health(true, false, true, now - WEDGE_MS, now)); // wedged
+        assert!(!engine_health(false, false, false, 0, now)); // not loaded
+
+        // A failed backend is unhealthy whether idle or busy-and-progressing.
+        assert!(!engine_health(true, true, false, 0, now));
+        assert!(!engine_health(true, true, true, now, now));
+    }
 }

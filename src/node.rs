@@ -162,6 +162,111 @@ impl EmptyHealth {
     }
 }
 
+// Fatal backend relaunch budget (see FatalBackendBudget). Max relaunches inside the window,
+// with a minimum gap between them, so a box whose GPU fails on every job cannot relaunch-loop.
+const FATAL_BACKEND_MAX_RESTARTS: u32 = 3;
+const FATAL_BACKEND_MIN_INTERVAL_MS: u64 = 600_000; // >=10 min between fatal-backend relaunches
+const FATAL_BACKEND_WINDOW_MS: u64 = 3_600_000; // relaunches older than 1h don't count
+/// Unhealthy heartbeats to wait before relaunching, so the job that hit the error finishes
+/// reporting its failure to the orchestrator before the process goes away. Past the minimum we
+/// keep waiting while jobs are still in flight (their failure reports are still being sent), up
+/// to the maximum, so a stuck report can't hold the node down.
+const FATAL_BACKEND_SETTLE_CHECKS: u32 = 2;
+const FATAL_BACKEND_MAX_SETTLE_CHECKS: u32 = 12;
+
+/// Relaunch budget for a fatal in-process backend error (llama.cpp decode -3, ggml-metal's sticky
+/// error state; see `inprocess::is_fatal_backend_error`). The only recovery is a process relaunch,
+/// which is `abort()`, so the generic in-memory `restart_attempts` cap resets on every relaunch and
+/// cannot stop a relaunch loop. This mirrors `EmptyHealth`'s persisted cap + cooldown instead.
+/// Owned by the heartbeat loop alone, so no atomics.
+struct FatalBackendBudget {
+    restarts: u32,
+    last_restart_ms: u64,
+    state_path: PathBuf,
+}
+
+impl FatalBackendBudget {
+    fn load(config_dir: &Path) -> Self {
+        Self::load_from(config_dir.join("fatal_backend_restart_state.json"))
+    }
+    fn load_from(state_path: PathBuf) -> Self {
+        let (restarts, last_restart_ms) = std::fs::read_to_string(&state_path)
+            .ok()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+            .map(|v| {
+                (
+                    v.get("restarts").and_then(|x| x.as_u64()).unwrap_or(0) as u32,
+                    v.get("last_restart_ms")
+                        .and_then(|x| x.as_u64())
+                        .unwrap_or(0),
+                )
+            })
+            .unwrap_or((0, 0));
+        Self {
+            restarts,
+            last_restart_ms,
+            state_path,
+        }
+    }
+    /// Relaunches within `window_ms` of the last one; decays to 0 (and persists) once it lapses.
+    fn effective_restarts(&mut self, now: u64, window_ms: u64) -> u32 {
+        if self.last_restart_ms != 0 && now.saturating_sub(self.last_restart_ms) > window_ms {
+            self.restarts = 0;
+            self.persist();
+        }
+        self.restarts
+    }
+    /// Record a relaunch and persist it BEFORE the caller aborts, which never returns.
+    fn note_restart(&mut self, now: u64) {
+        self.restarts = self.restarts.saturating_add(1);
+        self.last_restart_ms = now;
+        self.persist();
+    }
+    fn persist(&self) {
+        let body = serde_json::json!({
+            "restarts": self.restarts,
+            "last_restart_ms": self.last_restart_ms,
+        })
+        .to_string();
+        // Atomic write (tmp + rename), as EmptyHealth: a torn file must never read back as (0,0).
+        let tmp = self.state_path.with_extension("json.tmp");
+        if std::fs::write(&tmp, &body).is_ok() {
+            let _ = std::fs::rename(&tmp, &self.state_path);
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FatalBackendAction {
+    /// Just flagged: stay de-advertised and let the failing job report before relaunching.
+    Settle,
+    /// Relaunched recently: stay de-advertised until the minimum interval passes.
+    Cooldown,
+    /// Budget used up for this window: stay de-advertised, alive, and do not relaunch.
+    Parked,
+    /// Relaunch now (persist the budget first).
+    Relaunch,
+}
+
+fn fatal_backend_action(
+    unhealthy_streak: u32,
+    jobs_in_flight: bool,
+    prior_restarts: u32,
+    since_last_restart_ms: u64,
+) -> FatalBackendAction {
+    if unhealthy_streak < FATAL_BACKEND_SETTLE_CHECKS
+        || (jobs_in_flight && unhealthy_streak < FATAL_BACKEND_MAX_SETTLE_CHECKS)
+    {
+        FatalBackendAction::Settle
+    } else if prior_restarts >= FATAL_BACKEND_MAX_RESTARTS {
+        FatalBackendAction::Parked
+    } else if prior_restarts > 0 && since_last_restart_ms < FATAL_BACKEND_MIN_INTERVAL_MS {
+        FatalBackendAction::Cooldown
+    } else {
+        FatalBackendAction::Relaunch
+    }
+}
+
 /// True iff a message's `content` carries non-whitespace text. Handles both the string form and
 /// OpenAI's array-of-parts form (`[{"type":"text","text":"..."}]`); anything else (null, tool
 /// scaffolding) is treated as no-text.
@@ -1352,6 +1457,11 @@ pub async fn start(
     let empty_restart_enabled = std::env::var("SGL_EMPTY_RESTART")
         .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
         .unwrap_or(true);
+    // Persisted relaunch budget for a fatal in-process backend error (see FatalBackendBudget).
+    let mut fatal_budget = FatalBackendBudget::load(config_dir);
+    // Last fatal-backend action logged, so a parked node logs on change (and periodically), not
+    // on every heartbeat.
+    let mut last_fatal_action: Option<FatalBackendAction> = None;
 
     // #231: advertise the node's modality once (static per engine). An embedding node reports
     // kind="embedding" + its native dim so the orchestrator routes embeddings vs chat correctly
@@ -1556,7 +1666,48 @@ pub async fn start(
                 models.clone()
             } else {
                 unhealthy_streak += 1;
-                if unhealthy_streak >= 2 {
+                if eng.backend_failed() {
+                    // Fatal backend error (llama.cpp decode -3): the in-process GPU backend is in
+                    // a sticky error state and every job would fail. Unlike a crash this is
+                    // definitive, so stop advertising NOW (no one-blip tolerance). Relaunch once
+                    // the failing job has had time to report, under a PERSISTED budget: the
+                    // relaunch is abort(), which would reset the in-memory restart_attempts cap.
+                    let now = now_ms();
+                    let prior = fatal_budget.effective_restarts(now, FATAL_BACKEND_WINDOW_MS);
+                    let since = now.saturating_sub(fatal_budget.last_restart_ms);
+                    let in_flight = active_jobs.load(Ordering::Relaxed) > 0;
+                    let action = fatal_backend_action(unhealthy_streak, in_flight, prior, since);
+                    let loud = last_fatal_action.as_ref() != Some(&action)
+                        || unhealthy_streak.is_multiple_of(60);
+                    match action {
+                        FatalBackendAction::Settle if loud => tracing::error!(
+                            "inference backend failed (fatal decode error) — model de-advertised; relaunch (budget permitting) after the failed job reports"
+                        ),
+                        FatalBackendAction::Cooldown if loud => tracing::warn!(
+                            "inference backend failed again within {}s of the last relaunch — staying de-advertised until then",
+                            FATAL_BACKEND_MIN_INTERVAL_MS / 1000
+                        ),
+                        FatalBackendAction::Parked if loud => tracing::error!(
+                            "inference backend still failing after {FATAL_BACKEND_MAX_RESTARTS} relaunches this hour — staying de-advertised; needs operator attention (GPU memory? try a smaller model or context)"
+                        ),
+                        FatalBackendAction::Settle
+                        | FatalBackendAction::Cooldown
+                        | FatalBackendAction::Parked => {}
+                        FatalBackendAction::Relaunch => {
+                            tracing::error!(
+                                "inference backend failed — relaunching for a fresh GPU backend (relaunch {}/{FATAL_BACKEND_MAX_RESTARTS} this hour)",
+                                prior + 1
+                            );
+                            // Persist BEFORE restart(): in-process restart is abort(), no return.
+                            fatal_budget.note_restart(now);
+                            if let Err(e) = eng.restart().await {
+                                tracing::error!("engine restart failed: {e}");
+                            }
+                        }
+                    }
+                    last_fatal_action = Some(action);
+                    Vec::new()
+                } else if unhealthy_streak >= 2 {
                     // Engine is down: stop advertising (grid routes elsewhere) AND try to
                     // self-heal by relaunching llama-server, up to the cap.
                     if restart_attempts < MAX_ENGINE_RESTARTS {
@@ -2719,6 +2870,118 @@ mod homura_normalizer_tests {
         let mut c = HomuraStreamCleaner::new();
         assert_eq!(c.push("to=user<|message|>Hello<|e"), "Hello");
         assert_eq!(c.finish(), "");
+    }
+}
+
+#[cfg(test)]
+mod fatal_backend_tests {
+    use super::{
+        fatal_backend_action, FatalBackendAction, FatalBackendBudget, FATAL_BACKEND_MAX_RESTARTS,
+        FATAL_BACKEND_MAX_SETTLE_CHECKS, FATAL_BACKEND_MIN_INTERVAL_MS, FATAL_BACKEND_WINDOW_MS,
+    };
+
+    fn temp_state(name: &str) -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(format!(
+            "sgl_fatal_backend_{name}_{}.json",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&p);
+        p
+    }
+
+    #[test]
+    fn waits_for_the_failed_job_to_report_before_relaunching() {
+        assert_eq!(
+            fatal_backend_action(1, false, 0, u64::MAX),
+            FatalBackendAction::Settle
+        );
+        assert_eq!(
+            fatal_backend_action(2, false, 0, u64::MAX),
+            FatalBackendAction::Relaunch
+        );
+        // A job is still reporting its failure: keep waiting, but only up to the cap.
+        assert_eq!(
+            fatal_backend_action(2, true, 0, u64::MAX),
+            FatalBackendAction::Settle
+        );
+        assert_eq!(
+            fatal_backend_action(FATAL_BACKEND_MAX_SETTLE_CHECKS - 1, true, 0, u64::MAX),
+            FatalBackendAction::Settle
+        );
+        assert_eq!(
+            fatal_backend_action(FATAL_BACKEND_MAX_SETTLE_CHECKS, true, 0, u64::MAX),
+            FatalBackendAction::Relaunch
+        );
+    }
+
+    #[test]
+    fn cooldown_then_park_bound_the_relaunch_loop() {
+        // Relaunched a minute ago: wait out the interval instead of relaunching again.
+        assert_eq!(
+            fatal_backend_action(2, false, 1, 60_000),
+            FatalBackendAction::Cooldown
+        );
+        assert_eq!(
+            fatal_backend_action(2, false, 1, FATAL_BACKEND_MIN_INTERVAL_MS),
+            FatalBackendAction::Relaunch
+        );
+        // Budget used up: park, however long ago the last relaunch was (the window decay in
+        // effective_restarts is what re-opens it).
+        assert_eq!(
+            fatal_backend_action(9, false, FATAL_BACKEND_MAX_RESTARTS, u64::MAX),
+            FatalBackendAction::Parked
+        );
+    }
+
+    #[test]
+    fn budget_survives_a_relaunch() {
+        // The relaunch is abort(): the count must come back from disk, or it never binds.
+        let p = temp_state("persist");
+        let mut b = FatalBackendBudget::load_from(p.clone());
+        assert_eq!(b.effective_restarts(1_000, FATAL_BACKEND_WINDOW_MS), 0);
+        b.note_restart(1_000);
+        b.note_restart(2_000);
+        let mut reloaded = FatalBackendBudget::load_from(p.clone());
+        assert_eq!(
+            reloaded.effective_restarts(3_000, FATAL_BACKEND_WINDOW_MS),
+            2
+        );
+        assert_eq!(reloaded.last_restart_ms, 2_000);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn budget_decays_after_the_window() {
+        let p = temp_state("decay");
+        let mut b = FatalBackendBudget::load_from(p.clone());
+        for _ in 0..FATAL_BACKEND_MAX_RESTARTS {
+            b.note_restart(10_000);
+        }
+        assert_eq!(
+            b.effective_restarts(10_000 + FATAL_BACKEND_WINDOW_MS, FATAL_BACKEND_WINDOW_MS),
+            FATAL_BACKEND_MAX_RESTARTS
+        );
+        assert_eq!(
+            b.effective_restarts(10_001 + FATAL_BACKEND_WINDOW_MS, FATAL_BACKEND_WINDOW_MS),
+            0
+        );
+        // The decay is persisted too.
+        let mut reloaded = FatalBackendBudget::load_from(p.clone());
+        assert_eq!(
+            reloaded.effective_restarts(10_001 + FATAL_BACKEND_WINDOW_MS, FATAL_BACKEND_WINDOW_MS),
+            0
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn missing_or_corrupt_state_starts_empty() {
+        let p = temp_state("corrupt");
+        assert_eq!(FatalBackendBudget::load_from(p.clone()).restarts, 0);
+        std::fs::write(&p, "not json").unwrap();
+        let b = FatalBackendBudget::load_from(p.clone());
+        assert_eq!((b.restarts, b.last_restart_ms), (0, 0));
+        let _ = std::fs::remove_file(&p);
     }
 }
 
