@@ -199,7 +199,12 @@ fn normalize_id(id: &str) -> String {
     let mut s = id.to_ascii_lowercase();
     if let Some(pos) = s.find("-q") {
         // Strip a trailing quant tag like "-q4_k_m" only if it looks like one (digit after -q).
-        if s[pos + 2..].chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false) {
+        if s[pos + 2..]
+            .chars()
+            .next()
+            .map(|c| c.is_ascii_digit())
+            .unwrap_or(false)
+        {
             s.truncate(pos);
         }
     }
@@ -217,14 +222,16 @@ pub fn embed_model_spec(id: &str) -> Option<&'static EmbedModelSpec> {
     EMBED_CATALOG.iter().find(|m| {
         m.id.eq_ignore_ascii_case(&want)
             || m.id.eq_ignore_ascii_case(&want_norm)
-            || m.aliases.iter().any(|a| a.eq_ignore_ascii_case(&want) || a.eq_ignore_ascii_case(&want_norm))
+            || m.aliases
+                .iter()
+                .any(|a| a.eq_ignore_ascii_case(&want) || a.eq_ignore_ascii_case(&want_norm))
     })
 }
 
 /// True iff the given model id is a known embedding model — the node uses this to pick the
 /// embedding engine over the chat engine at startup.
 pub fn is_embedding_model(id: &str) -> bool {
-    embed_model_spec(id).is_some()
+    is_multimodal_embedding_model(id) || embed_model_spec(id).is_some()
 }
 
 /// L2-normalize in place (no-op for a zero vector). Guarantees a unit vector so cosine == dot and
@@ -236,4 +243,9 @@ pub fn l2_normalize(v: &mut [f32]) {
             *x /= norm;
         }
     }
+}
+
+/// EG2 has a processor runtime, never a llama.cpp pooling specification.
+pub fn is_multimodal_embedding_model(id: &str) -> bool {
+    id.eq_ignore_ascii_case("embeddinggemma-2")
 }

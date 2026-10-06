@@ -3,6 +3,9 @@
 //! can drive them directly (e.g. examples/inproc_batch_test.rs). The binary keeps its own
 //! `mod` declarations and does not depend on this lib.
 
+pub mod eg2;
+pub mod embedding_input;
+
 #[cfg(feature = "inprocess")]
 pub mod embed;
 pub mod embed_catalog;

@@ -56,6 +56,7 @@ pub async fn run<FJob, FTok>(
     node_id: String,
     client: Arc<OrchestratorClient>,
     state: Arc<WsState>,
+    embedding_heartbeat: Option<Arc<dyn Fn() -> serde_json::Value + Send + Sync>>,
     on_job: FJob,
     on_token: FTok,
 ) where
@@ -83,7 +84,16 @@ pub async fn run<FJob, FTok>(
 
                 let (mut write, mut read) = ws_stream.split();
 
-                while let Some(msg) = read.next().await {
+                let mut heartbeat_tick = tokio::time::interval(Duration::from_secs(1));
+                loop {
+                    let msg = tokio::select! {
+                        msg = read.next() => match msg { Some(msg) => msg, None => break },
+                        _ = heartbeat_tick.tick(), if embedding_heartbeat.is_some() => {
+                            let snapshot = embedding_heartbeat.as_ref().unwrap()();
+                            if write.send(Message::Text(snapshot.to_string())).await.is_err() { break; }
+                            continue;
+                        }
+                    };
                     match msg {
                         Ok(Message::Text(txt)) => {
                             let v: serde_json::Value = match serde_json::from_str(&txt) {
@@ -93,7 +103,8 @@ pub async fn run<FJob, FTok>(
                             match v.get("type").and_then(|t| t.as_str()) {
                                 Some("job") => {
                                     if let Some(job_val) = v.get("job") {
-                                        match serde_json::from_value::<PendingJob>(job_val.clone()) {
+                                        match serde_json::from_value::<PendingJob>(job_val.clone())
+                                        {
                                             Ok(job) => on_job(job),
                                             Err(e) => {
                                                 tracing::warn!("WS job parse failed: {e}")

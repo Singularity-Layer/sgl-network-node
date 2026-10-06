@@ -1,0 +1,277 @@
+#!/usr/bin/env python3
+"""Candidate EG2 JSONL worker. Listing and deployment require a separate release.
+
+The caller owns the interpreter, verified snapshot and smoke fixtures. Only inline
+media enters this protocol; private temporary files never enter logs or survive a job.
+"""
+import argparse
+import base64
+import contextlib
+import hashlib
+import importlib.metadata
+import io
+import json
+import math
+import os
+from pathlib import Path
+import sys
+import tempfile
+
+PROTOCOL = "embedding-multimodal-v1"
+OFFICIAL_REVISION = "914f7f89142e33e77833254d9c9b90c3cef7303b"
+MODEL_REVISION = "1a4ffddb7905d3f63486748deabe091a01fb6201"
+RUNTIME_REVISION = "30f177f03cbcb42bc2f65496458de79f51b80c28"
+MAX_FRAME = 24 * 1024 * 1024
+DIMENSIONS = (768, 512, 256, 128)
+PREFIXES = {"query": "task: search result | query: ", "document": "title: none | text: ", "unspecified": ""}
+MIME = {"image": {"image/png": ".png", "image/jpeg": ".jpg", "image/webp": ".webp"}, "audio": {"audio/wav": ".wav", "audio/flac": ".flac", "audio/mpeg": ".mp3"}, "video": {"video/mp4": ".mp4"}}
+
+
+def verify_install(snapshot):
+    for name, version in (("mlx", "0.32.3"), ("transformers", "5.19.0")):
+        if importlib.metadata.version(name) != version:
+            raise ValueError("runtime version mismatch")
+    direct = json.loads(importlib.metadata.distribution("mlx-vlm").read_text("direct_url.json") or "{}")
+    if direct.get("vcs_info", {}).get("commit_id") != RUNTIME_REVISION:
+        raise ValueError("runtime revision mismatch")
+    manifest = json.loads(Path(__file__).with_name("embeddinggemma_model_files.json").read_text())
+    for name, size, sha in manifest:
+        file = snapshot / name
+        if not file.is_file() or file.stat().st_size != size:
+            raise ValueError("model asset mismatch")
+        digest = hashlib.sha256()
+        with file.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+        if digest.hexdigest() != sha:
+            raise ValueError("model asset digest mismatch")
+
+
+def check_duration(actual, declared, maximum):
+    if not all(isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) for v in (actual, declared)):
+        raise ValueError("invalid duration")
+    # Small decoder rounding is tolerated; understated work is rejected.
+    if min(actual, declared) <= 0 or max(actual, declared) > maximum or actual > declared + 0.001:
+        raise ValueError("media duration mismatch")
+
+
+def verify_video(processor, file, declared):
+    """Pinned video processor signature: _decode_video(path, sampler)."""
+    sampler = processor.video_processor.sample_frames
+    def verify_sample(metadata, **kwargs):
+        check_duration(metadata.duration, declared, 32)
+        frames = sampler(metadata, **kwargs)
+        if len(frames) > 32:
+            raise ValueError("video frame count exceeds limit")
+        return frames
+    return processor.video_processor._decode_video(str(file), verify_sample)
+
+
+def verify_parameter_dtypes(parameters, mx, flatten):
+    leaves = flatten(parameters)
+    if not leaves or any(value.dtype not in (mx.bfloat16, mx.float32) for _, value in leaves):
+        raise ValueError("model parameters must be BF16 or FP32")
+
+
+def processed_usage(item, active_size, image, audio, video):
+    row = {"text":int(active_size)-image-audio-video,"image":image,"audio":audio,"video":video}
+    for kind, tokens in (("image",image),("audio",audio),("video",video)):
+        if any(part["type"] == kind for part in item["content"]) and tokens <= 0:
+            raise ValueError("processor omitted requested modality")
+    image_count = sum(part["type"] == "image" for part in item["content"])
+    if min(row.values()) < 0 or image > image_count*280 or video > 32*140 or not 0 < active_size <= 8192:
+        raise ValueError("processed sample exceeds budget")
+    return row
+
+
+class Runtime:
+    def __init__(self, model_path, smoke_dir):
+        if sys.platform != "darwin" or os.uname().machine != "arm64":
+            raise ValueError("candidate runtime requires Apple Silicon")
+        snapshot = Path(model_path).resolve(strict=True)
+        verify_install(snapshot)
+        import mlx.core as mx
+        from mlx_vlm import load
+        self.mx = mx
+        self.model, self.processor = load(str(snapshot))
+        from mlx.utils import tree_flatten
+        verify_parameter_dtypes(self.model.parameters(), mx, tree_flatten)
+        self.smoke_dir = Path(smoke_dir).resolve(strict=True)
+        # Guard verified video metadata BEFORE the upstream sampler starts decoding.
+        original_sample = self.processor.video_processor.sample_frames
+        def bounded_sample(metadata, **kwargs):
+            duration = metadata.duration
+            if duration is None or not math.isfinite(duration) or not 0 < duration <= 32:
+                raise ValueError("video duration exceeds limit")
+            frames = original_sample(metadata, fps=1, max_frames=32)
+            if len(frames) > 32:
+                raise ValueError("video frame count exceeds limit")
+            return frames
+        self.processor.video_processor.sample_frames = bounded_sample
+        self._ready = None
+
+    def _conversations(self, items, input_type, directory):
+        from PIL import Image
+        import numpy as np
+        from mlx_vlm.utils import load_audio
+        conversations, total_bytes = [], 0
+        for index, item in enumerate(items):
+            if not isinstance(item, dict) or set(item) != {"content"} or not isinstance(item["content"], list) or not 1 <= len(item["content"]) <= 16:
+                raise ValueError("invalid item")
+            content, counts, image_bytes = [], {"image": 0, "audio": 0, "video": 0}, 0
+            for part_index, part in enumerate(item["content"]):
+                kind = part.get("type")
+                if kind == "text":
+                    if set(part) != {"type", "text"} or not isinstance(part["text"], str):
+                        raise ValueError("invalid text")
+                    content.append({"type": "text", "text": part["text"]})
+                    continue
+                if kind not in MIME:
+                    raise ValueError("unsupported part")
+                allowed = {"type", "media"} | ({"duration_seconds"} if kind in ("audio", "video") else set())
+                if set(part) != allowed:
+                    raise ValueError("invalid media part")
+                media = part["media"]
+                if not isinstance(media, dict) or set(media) != {"encoding", "mime_type", "data", "sha256"} or media.get("encoding") != "base64" or media.get("mime_type") not in MIME[kind]:
+                    raise ValueError("unsupported transport")
+                cap = (16 if kind == "video" else 8) * 1024 * 1024
+                encoded = media.get("data")
+                if not isinstance(encoded, str) or len(encoded) > ((cap + 2) // 3) * 4:
+                    raise ValueError("encoded media exceeds limit")
+                raw = base64.b64decode(encoded, validate=True)
+                if base64.b64encode(raw).decode() != encoded:
+                    raise ValueError("noncanonical base64")
+                if not raw or len(raw) > cap:
+                    raise ValueError("decoded media exceeds limit")
+                if not isinstance(media["sha256"],str) or hashlib.sha256(raw).hexdigest() != media["sha256"]:
+                    raise ValueError("media digest mismatch")
+                counts[kind] += 1
+                total_bytes += len(raw)
+                image_bytes += len(raw) if kind == "image" else 0
+                if counts["image"] > 8 or counts["audio"] > 1 or counts["video"] > 1 or image_bytes > 8*1024*1024 or total_bytes > 20*1024*1024:
+                    raise ValueError("media aggregate exceeds limit")
+                file = Path(directory) / f"{index}-{part_index}{MIME[kind][media['mime_type']]}"
+                file.write_bytes(raw)
+                if kind == "image":
+                    with Image.open(io.BytesIO(raw)) as image:
+                        if image.width * image.height > 16_000_000 or Image.MIME.get(image.format) != media["mime_type"]:
+                            raise ValueError("image shape or MIME mismatch")
+                        image.verify()
+                elif kind == "audio":
+                    magic = {"audio/wav": raw[:4] == b"RIFF" and raw[8:12] == b"WAVE", "audio/flac": raw[:4] == b"fLaC", "audio/mpeg": raw[:3] == b"ID3" or raw[:2] in (b"\xff\xfb", b"\xff\xf3", b"\xff\xf2")}
+                    if not magic[media["mime_type"]]:
+                        raise ValueError("audio MIME mismatch")
+                    waveform = load_audio(str(file), sr=16000)
+                    waveform = np.asarray(waveform)
+                    if waveform.ndim != 1 or waveform.size > 480000 or not np.isfinite(waveform).all():
+                        raise ValueError("audio shape exceeds limit")
+                    check_duration(waveform.size / 16000, part["duration_seconds"], 30)
+                else:
+                    if len(raw) < 12 or raw[4:8] != b"ftyp":
+                        raise ValueError("video MIME mismatch")
+                    declared = part["duration_seconds"]
+                    check_duration(declared, declared, 32)
+                    verify_video(self.processor, file, declared)
+                content.append({"type": kind, "url": str(file)})
+            conversation = []
+            if PREFIXES[input_type]:
+                conversation.append({"role": "system", "content": PREFIXES[input_type]})
+            conversation.append({"role": "user", "content": content})
+            conversations.append(conversation)
+        return conversations
+
+    def embed(self, request):
+        import numpy as np
+        if request.get("type") != "embed" or request.get("protocol") != PROTOCOL or request.get("input_type") not in PREFIXES:
+            raise ValueError("request identity mismatch")
+        request_id = request.get("request_id")
+        if type(request_id) is not int or not 0 <= request_id < 2**64:
+            raise ValueError("invalid request ID")
+        items = request.get("input")
+        if not isinstance(items, list) or not 1 <= len(items) <= 16 or request.get("dimensions", 768) not in DIMENSIONS:
+            raise ValueError("invalid batch or dimensions")
+        with tempfile.TemporaryDirectory(prefix="sgl-eg2-") as directory:
+            conversations = self._conversations(items, request["input_type"], directory)
+            inputs = self.processor.apply_chat_template(conversations, tokenize=True, return_dict=True, return_tensors="mlx", images_kwargs={"max_soft_tokens":280}, videos_kwargs={"fps":1,"max_frames":32,"max_soft_tokens":140}, audio_kwargs={"sampling_rate":16000})
+            ids = np.asarray(inputs["input_ids"])
+            mask = np.asarray(inputs["attention_mask"]) if "attention_mask" in inputs else np.ones(ids.shape)
+            usage = {"text":0,"image":0,"audio":0,"video":0}
+            for row, row_mask, item in zip(ids, mask, items):
+                active = row[row_mask.astype(bool)]
+                image = int(np.sum(active == self.processor.image_token_id))
+                audio = int(np.sum(active == self.processor.audio_token_id))
+                video = int(np.sum(active == self.processor.video_token_id))
+                row_usage = processed_usage(item,active.size,image,audio,video)
+                for kind, tokens in row_usage.items():
+                    usage[kind] += tokens
+            vectors = self.model(**inputs).text_embeds.astype(self.mx.float32)
+            self.mx.eval(vectors)
+            vectors = np.asarray(vectors, dtype=np.float32)
+            if vectors.shape != (len(items),768) or not np.isfinite(vectors).all():
+                raise ValueError("invalid native output")
+            native_norms = np.linalg.norm(vectors, axis=1)
+            if not np.isfinite(native_norms).all() or not np.allclose(native_norms,1.0,rtol=0,atol=0.001):
+                raise ValueError("native output is not normalized")
+            dimensions = request.get("dimensions",768)
+            vectors = vectors[:,:dimensions]
+            norms = np.linalg.norm(vectors, axis=1, keepdims=True)
+            if not np.isfinite(norms).all() or (norms <= 0).any():
+                raise ValueError("invalid native norm")
+            vectors /= norms
+            return {"type":"result","request_id":request_id,"vectors":vectors.tolist(),"usage":usage}
+
+    def ready(self):
+        if self._ready is None:
+            def fixture(kind, filename, mime, duration=None):
+                raw = (self.smoke_dir/filename).read_bytes()
+                part = {"type":kind,"media":{"encoding":"base64","mime_type":mime,"data":base64.b64encode(raw).decode(),"sha256":hashlib.sha256(raw).hexdigest()}}
+                if duration is not None:
+                    part["duration_seconds"] = duration
+                return part
+            # Fixture manifests are supplied only after real canaries; durations are verified.
+            manifest = json.loads((self.smoke_dir/"durations.json").read_text())
+            image = fixture("image","image.png","image/png")
+            audio = fixture("audio","audio.wav","audio/wav",manifest["audio_seconds"])
+            video = fixture("video","video.mp4","video/mp4",manifest["video_seconds"])
+            text = {"type":"text","text":"startup smoke"}
+            smoke = []
+            for content in ([text],[image],[audio],[video],[text,image,audio,video]):
+                output = self.embed({"type":"embed","protocol":PROTOCOL,"request_id":0,"input_type":"unspecified","dimensions":768,"input":[{"content":content}]})
+                smoke.append(output["vectors"][0])
+            self._ready = {"type":"ready","protocol":PROTOCOL,"runtime":"mlx-vlm","processor_revision":RUNTIME_REVISION,"model_revision":MODEL_REVISION,"modalities":["text","image","audio","video"],"dimensions":list(DIMENSIONS),"smoke_vectors":smoke}
+        return self._ready
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model-path", required=True)
+    parser.add_argument("--smoke-dir", required=True)
+    args = parser.parse_args()
+    protocol_out = sys.stdout
+    # Suppress native/library stdout and tracebacks: stdout is exclusively bounded frames.
+    with open(os.devnull,"w") as null:
+        os.dup2(null.fileno(), 2)
+        saved = os.dup(1)
+        os.dup2(null.fileno(),1)
+        protocol_out = os.fdopen(saved,"w", buffering=1)
+        with contextlib.redirect_stdout(null), contextlib.redirect_stderr(null):
+            try:
+                runtime = Runtime(args.model_path,args.smoke_dir)
+                protocol_out.write(json.dumps(runtime.ready(), allow_nan=False)+"\n")
+                while True:
+                    frame = sys.stdin.buffer.readline(MAX_FRAME+1)
+                    if not frame:
+                        return 0
+                    if len(frame)>MAX_FRAME or not frame.endswith(b"\n"):
+                        return 2
+                    result = runtime.embed(json.loads(frame))
+                    encoded = json.dumps(result, allow_nan=False)
+                    if len(encoded.encode()) > 1024*1024:
+                        return 2
+                    protocol_out.write(encoded+"\n")
+            except Exception:
+                return 2
+    return 0
+
+if __name__ == "__main__":
+    raise SystemExit(main())
