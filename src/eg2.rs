@@ -655,7 +655,12 @@ fn run_job(
     {
         return Err("embedding worker response mismatch".into());
     }
-    validate_item_usage(&job.batch, &result.usage, &result.item_usage)?;
+    validate_item_usage(
+        &job.batch,
+        job.input_type,
+        &result.usage,
+        &result.item_usage,
+    )?;
     for vector in &mut result.vectors {
         normalize_native(vector, job.dimensions)?;
     }
@@ -667,6 +672,7 @@ fn run_job(
 
 fn validate_item_usage(
     batch: &EmbeddingBatch,
+    input_type: InputType,
     usage: &Usage,
     rows: &[Usage],
 ) -> Result<(), String> {
@@ -681,14 +687,20 @@ fn validate_item_usage(
             return Err("embedding item usage exceeds context budget".into());
         }
         let mut images = 0u32;
-        let mut audio = false;
+        let mut audio_bound = 0u32;
+        let mut text_bytes = 0usize;
         let mut video_bound = 0u32;
         let mut text = false;
         for part in &item.content {
             match part {
-                Part::Text { .. } => text = true,
+                Part::Text { text: content } => {
+                    text = true;
+                    text_bytes += content.len();
+                }
                 Part::Image { .. } => images += 1,
-                Part::Audio { .. } => audio = true,
+                Part::Audio {
+                    duration_seconds, ..
+                } => audio_bound += duration_seconds.ceil() as u32 * 25,
                 Part::Video {
                     duration_seconds, ..
                 } => video_bound += duration_seconds.ceil() as u32 * 140,
@@ -696,12 +708,23 @@ fn validate_item_usage(
         }
         if (images == 0) != (row.image == 0)
             || row.image > images * 280
-            || audio != (row.audio > 0)
+            || (audio_bound > 0) != (row.audio > 0)
+            || row.audio > audio_bound
             || (video_bound == 0) != (row.video == 0)
             || row.video > video_bound
             || (text && row.text == 0)
         {
             return Err("embedding item usage modality mismatch".into());
+        }
+        let prefix = match input_type {
+            InputType::Query => "task: search result | query: ",
+            InputType::Document => "title: none | text: ",
+            InputType::Unspecified => "",
+        };
+        let bound =
+            text_bytes + prefix.len() + 12 + (images * 280 + audio_bound + video_bound) as usize;
+        if total as usize > bound.min(8192) {
+            return Err("embedding usage exceeds quoted work bound".into());
         }
         // Each row total <=8192 and batch <=16, so these additions cannot overflow u32.
         aggregate.text += row.text;
@@ -785,7 +808,7 @@ mod item_usage_tests {
     use super::*;
     use serde_json::json;
     fn text_batch(n: usize) -> EmbeddingBatch {
-        EmbeddingBatch::parse(&json!(vec!["text"; n]), true).unwrap()
+        EmbeddingBatch::parse(&json!(vec!["x".repeat(8180); n]), true).unwrap()
     }
     #[test]
     fn oversized_item_cannot_hide_in_valid_aggregate() {
@@ -801,6 +824,7 @@ mod item_usage_tests {
         ];
         assert!(validate_item_usage(
             &text_batch(2),
+            InputType::Unspecified,
             &Usage {
                 text: 8194,
                 ..Usage::default()
@@ -820,6 +844,7 @@ mod item_usage_tests {
         ];
         assert!(validate_item_usage(
             &text_batch(2),
+            InputType::Unspecified,
             &Usage {
                 text: 16384,
                 ..Usage::default()
@@ -829,6 +854,7 @@ mod item_usage_tests {
         .is_ok());
         assert!(validate_item_usage(
             &text_batch(2),
+            InputType::Unspecified,
             &Usage {
                 text: 16383,
                 ..Usage::default()
@@ -836,7 +862,68 @@ mod item_usage_tests {
             &good
         )
         .is_err());
-        assert!(validate_item_usage(&text_batch(2), &Usage::default(), &[]).is_err());
+        assert!(validate_item_usage(
+            &text_batch(2),
+            InputType::Unspecified,
+            &Usage::default(),
+            &[]
+        )
+        .is_err());
+    }
+    #[test]
+    fn actual_usage_cannot_exceed_utf8_prefix_and_declared_media_quote() {
+        let batch = EmbeddingBatch::parse(&json!("é"), true).unwrap();
+        for (input_type, prefix) in [
+            (InputType::Unspecified, ""),
+            (InputType::Query, "task: search result | query: "),
+            (InputType::Document, "title: none | text: "),
+        ] {
+            let bound = 2 + prefix.len() as u32 + 12;
+            let exact = Usage {
+                text: bound,
+                ..Usage::default()
+            };
+            assert!(validate_item_usage(
+                &batch,
+                input_type,
+                &exact,
+                &[Usage {
+                    text: bound,
+                    ..Usage::default()
+                }]
+            )
+            .is_ok());
+            let inflated = Usage {
+                text: bound + 1,
+                ..Usage::default()
+            };
+            assert!(validate_item_usage(
+                &batch,
+                input_type,
+                &inflated,
+                &[Usage {
+                    text: bound + 1,
+                    ..Usage::default()
+                }]
+            )
+            .is_err());
+        }
+        let audio=EmbeddingBatch::parse(&json!([{"content":[{"type":"audio","duration_seconds":1,"media":{"encoding":"base64","mime_type":"audio/wav","data":"aGk=","sha256":"8f434346648f6b96df89dda901c5176b10a6d83961dd3c1ac88b59b2dc327aa4"}}]}]),true).unwrap();
+        assert!(validate_item_usage(
+            &audio,
+            InputType::Unspecified,
+            &Usage {
+                text: 11,
+                audio: 26,
+                ..Usage::default()
+            },
+            &[Usage {
+                text: 11,
+                audio: 26,
+                ..Usage::default()
+            }]
+        )
+        .is_err());
     }
     #[test]
     fn per_item_media_usage_is_bounded_and_cannot_shift_between_rows() {
@@ -859,7 +946,9 @@ mod item_usage_tests {
             audio: 25,
             video: 121,
         };
-        assert!(validate_item_usage(&batch, &total, &[valid, text]).is_ok());
+        assert!(
+            validate_item_usage(&batch, InputType::Unspecified, &total, &[valid, text]).is_ok()
+        );
         for bad in [
             Usage {
                 text: 12,
@@ -888,6 +977,7 @@ mod item_usage_tests {
         ] {
             assert!(validate_item_usage(
                 &batch,
+                InputType::Unspecified,
                 &total,
                 &[
                     bad,
@@ -901,6 +991,7 @@ mod item_usage_tests {
         }
         assert!(validate_item_usage(
             &text_batch(1),
+            InputType::Unspecified,
             &Usage {
                 text: 1,
                 image: 1,
@@ -915,6 +1006,7 @@ mod item_usage_tests {
         .is_err());
         assert!(validate_item_usage(
             &batch,
+            InputType::Unspecified,
             &total,
             &[
                 Usage {
