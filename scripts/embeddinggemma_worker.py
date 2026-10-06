@@ -5,6 +5,8 @@ The caller owns the interpreter, verified snapshot and smoke fixtures. Only inli
 media enters this protocol; private temporary files never enter logs or survive a job.
 """
 import argparse
+import array
+import binascii
 import base64
 import contextlib
 import hashlib
@@ -29,32 +31,36 @@ PREFIXES = {"query": "task: search result | query: ", "document": "title: none |
 MIME = {"image": {"image/png": ".png", "image/jpeg": ".jpg", "image/webp": ".webp"}, "audio": {"audio/wav": ".wav", "audio/flac": ".flac", "audio/mpeg": ".mp3"}, "video": {"video/mp4": ".mp4"}}
 
 
+class InputValidationError(ValueError):
+    """A known explicit input/media policy failure; no library exception inherits it."""
+
+
 def verify_install(snapshot):
     for name, version in (("mlx", "0.32.3"), ("transformers", "5.19.0")):
         if importlib.metadata.version(name) != version:
-            raise ValueError("runtime version mismatch")
+            raise RuntimeError("runtime version mismatch")
     direct = json.loads(importlib.metadata.distribution("mlx-vlm").read_text("direct_url.json") or "{}")
     if direct.get("vcs_info", {}).get("commit_id") != RUNTIME_REVISION:
-        raise ValueError("runtime revision mismatch")
+        raise RuntimeError("runtime revision mismatch")
     manifest = json.loads(Path(__file__).with_name("embeddinggemma_model_files.json").read_text())
     for name, size, sha in manifest:
         file = snapshot / name
         if not file.is_file() or file.stat().st_size != size:
-            raise ValueError("model asset mismatch")
+            raise RuntimeError("model asset mismatch")
         digest = hashlib.sha256()
         with file.open("rb") as stream:
             for chunk in iter(lambda: stream.read(1024 * 1024), b""):
                 digest.update(chunk)
         if digest.hexdigest() != sha:
-            raise ValueError("model asset digest mismatch")
+            raise RuntimeError("model asset digest mismatch")
 
 
 def check_duration(actual, declared, maximum):
     if not all(isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) for v in (actual, declared)):
-        raise ValueError("invalid duration")
+        raise InputValidationError("invalid duration")
     # Small decoder rounding is tolerated; understated work is rejected.
     if min(actual, declared) <= 0 or max(actual, declared) > maximum or actual > declared + 0.001:
-        raise ValueError("media duration mismatch")
+        raise InputValidationError("media duration mismatch")
 
 
 def verify_video(processor, file, declared):
@@ -64,7 +70,7 @@ def verify_video(processor, file, declared):
         check_duration(metadata.duration, declared, 32)
         frames = sampler(metadata, **kwargs)
         if len(frames) > 32:
-            raise ValueError("video frame count exceeds limit")
+            raise InputValidationError("video frame count exceeds limit")
         return frames
     return processor.video_processor._decode_video(str(file), verify_sample)
 
@@ -72,7 +78,7 @@ def verify_video(processor, file, declared):
 def verify_parameter_dtypes(parameters, mx, flatten):
     leaves = flatten(parameters)
     if not leaves or any(value.dtype not in (mx.bfloat16, mx.float32) for _, value in leaves):
-        raise ValueError("model parameters must be BF16 or FP32")
+        raise RuntimeError("model parameters must be BF16 or FP32")
 
 
 def processed_usage(item,active_size,image,audio,video):
@@ -90,33 +96,44 @@ def processed_usage(item,active_size,image,audio,video):
     if image>image_count*280 or video>video_bound:
         raise RuntimeError("processor media usage exceeds declared bound")
     if active_size>8192:
-        raise ValueError("processed sample exceeds budget")
+        raise InputValidationError("processed sample exceeds budget")
     return row
 
 
 def validate_text_budget(items, input_type):
     """Cheap preflight runs before media decoding, tokenization or model execution."""
     if not isinstance(input_type,str) or input_type not in PREFIXES:
-        raise ValueError("invalid input type")
+        raise InputValidationError("invalid input type")
     prefix_bytes = len(PREFIXES[input_type].encode("utf-8"))
     aggregate = 0
     for item in items:
         if not isinstance(item,dict) or not isinstance(item.get("content"),list):
-            raise ValueError("invalid item")
+            raise InputValidationError("invalid item")
         text_bytes = 0
         for part in item["content"]:
             if not isinstance(part,dict):
-                raise ValueError("invalid part")
+                raise InputValidationError("invalid part")
             if part.get("type") == "text":
                 text = part.get("text")
                 if set(part) != {"type","text"} or not isinstance(text,str) or not text.strip():
-                    raise ValueError("invalid text")
-                text_bytes += len(text.encode("utf-8"))
+                    raise InputValidationError("invalid text")
+                try:
+                    text_bytes += len(text.encode("utf-8"))
+                except UnicodeEncodeError:
+                    raise InputValidationError("invalid UTF-8 text") from None
         aggregate += text_bytes
         if aggregate > MAX_AGGREGATE_TEXT_BYTES:
-            raise ValueError("aggregate text exceeds limit")
-        if text_bytes + prefix_bytes + TEXT_TEMPLATE_RESERVE > 8192:
-            raise ValueError("text exceeds processed sample budget")
+            raise InputValidationError("aggregate text exceeds limit")
+        media_bound=0
+        for part in item["content"]:
+            if part.get("type")=="image": media_bound+=280
+            elif part.get("type") in ("audio","video"):
+                maximum=30 if part["type"]=="audio" else 32
+                duration=part.get("duration_seconds")
+                check_duration(duration,duration,maximum)
+                media_bound+=math.ceil(duration)*(25 if part["type"]=="audio" else 140)
+        if text_bytes+prefix_bytes+TEXT_TEMPLATE_RESERVE+media_bound>8192:
+            raise InputValidationError("input exceeds processed sample budget")
 
 
 def normalize_native_output(vectors, rows, dimensions, np):
@@ -138,18 +155,18 @@ MP4_BRANDS = {b"isom",b"iso2",b"iso3",b"iso4",b"iso5",b"iso6",b"iso7",b"iso8",b"
 
 def validate_mp4_container(raw):
     if len(raw)<16 or raw[4:8]!=b"ftyp":
-        raise ValueError("video MIME mismatch")
+        raise InputValidationError("video MIME mismatch")
     size = int.from_bytes(raw[:4],"big")
     start = 8
     if size==1:
-        if len(raw)<24: raise ValueError("invalid video container")
+        if len(raw)<24: raise InputValidationError("invalid video container")
         size = int.from_bytes(raw[8:16],"big")
         start = 16
     if size<start+8 or size>len(raw) or (size-start-8)%4:
-        raise ValueError("invalid video container")
+        raise InputValidationError("invalid video container")
     brands = [raw[start:start+4]] + [raw[index:index+4] for index in range(start+8,size,4)]
     if any(brand not in MP4_BRANDS for brand in brands):
-        raise ValueError("unsupported video container brand")
+        raise InputValidationError("unsupported video container brand")
 
 
 def dispatch_request(runtime, request):
@@ -158,14 +175,51 @@ def dispatch_request(runtime, request):
         raise RuntimeError("worker request protocol mismatch")
     try:
         return runtime.embed(request)
-    except ValueError:
+    except InputValidationError:
         return {"type":"request_error","request_id":request["request_id"],"code":"invalid_input"}
+    except Exception:
+        raise RuntimeError("embedding runtime library failed") from None
+
+
+def decode_audio_bounded(file,mime,declared,miniaudio_module=None):
+    """Verify source metadata before streaming at most 480000 mono 16 kHz samples."""
+    if miniaudio_module is None:
+        import miniaudio as miniaudio_module
+    audio=miniaudio_module
+    check_duration(declared,declared,30)
+    try:
+        info=audio.get_file_info(str(file))
+    except (audio.MiniaudioError,OSError,EOFError):
+        raise InputValidationError("invalid audio metadata") from None
+    formats={"audio/wav":audio.FileFormat.WAV,"audio/flac":audio.FileFormat.FLAC,"audio/mpeg":audio.FileFormat.MP3}
+    if info.file_format!=formats[mime] or info.nchannels<=0 or info.sample_rate<=0 or info.num_frames<=0:
+        raise InputValidationError("audio metadata or MIME mismatch")
+    check_duration(info.duration,declared,30)
+    check_duration(info.num_frames/info.sample_rate,declared,30)
+    samples=array.array("f")
+    stream=None
+    try:
+        stream=audio.stream_file(str(file),output_format=audio.SampleFormat.FLOAT32,nchannels=1,sample_rate=16000,frames_to_read=4096)
+        for chunk in stream:
+            if len(chunk)>4096 or len(samples)+len(chunk)>480000:
+                raise InputValidationError("decoded audio exceeds sample limit")
+            if not chunk: continue
+            check_duration((len(samples)+len(chunk))/16000,declared,30)
+            if not all(math.isfinite(sample) for sample in chunk):
+                raise InputValidationError("invalid audio samples")
+            samples.extend(chunk)
+    except (audio.MiniaudioError,OSError,EOFError):
+        raise InputValidationError("invalid audio stream") from None
+    finally:
+        if stream is not None: stream.close()
+    check_duration(len(samples)/16000,declared,30)
+    return samples
 
 
 class Runtime:
     def __init__(self, model_path, smoke_dir):
         if sys.platform != "darwin" or os.uname().machine != "arm64":
-            raise ValueError("candidate runtime requires Apple Silicon")
+            raise RuntimeError("candidate runtime requires Apple Silicon")
         snapshot = Path(model_path).resolve(strict=True)
         verify_install(snapshot)
         import mlx.core as mx
@@ -180,10 +234,10 @@ class Runtime:
         def bounded_sample(metadata, **kwargs):
             duration = metadata.duration
             if duration is None or not math.isfinite(duration) or not 0 < duration <= 32:
-                raise ValueError("video duration exceeds limit")
+                raise InputValidationError("video duration exceeds limit")
             frames = original_sample(metadata, fps=1, max_frames=32)
             if len(frames) > 32:
-                raise ValueError("video frame count exceeds limit")
+                raise InputValidationError("video frame count exceeds limit")
             return frames
         self.processor.video_processor.sample_frames = bounded_sample
         self._ready = None
@@ -191,74 +245,70 @@ class Runtime:
     def _conversations(self, items, input_type, directory):
         from PIL import Image
         import numpy as np
-        from mlx_vlm.utils import load_audio
         conversations, total_bytes = [], 0
         for index, item in enumerate(items):
             if not isinstance(item, dict) or set(item) != {"content"} or not isinstance(item["content"], list) or not 1 <= len(item["content"]) <= 16:
-                raise ValueError("invalid item")
+                raise InputValidationError("invalid item")
             content, counts, image_bytes = [], {"image": 0, "audio": 0, "video": 0}, 0
             for part_index, part in enumerate(item["content"]):
                 kind = part.get("type")
                 if kind == "text":
                     if set(part) != {"type", "text"} or not isinstance(part["text"], str) or not part["text"].strip():
-                        raise ValueError("invalid text")
+                        raise InputValidationError("invalid text")
                     content.append({"type": "text", "text": part["text"]})
                     continue
                 if kind not in MIME:
-                    raise ValueError("unsupported part")
+                    raise InputValidationError("unsupported part")
                 allowed = {"type", "media"} | ({"duration_seconds"} if kind in ("audio", "video") else set())
                 if set(part) != allowed:
-                    raise ValueError("invalid media part")
+                    raise InputValidationError("invalid media part")
                 media = part["media"]
                 if not isinstance(media, dict) or set(media) != {"encoding", "mime_type", "data", "sha256"} or media.get("encoding") != "base64" or media.get("mime_type") not in MIME[kind]:
-                    raise ValueError("unsupported transport")
+                    raise InputValidationError("unsupported transport")
                 cap = (16 if kind == "video" else 8) * 1024 * 1024
                 encoded = media.get("data")
                 if not isinstance(encoded, str) or len(encoded) > ((cap + 2) // 3) * 4:
-                    raise ValueError("encoded media exceeds limit")
-                raw = base64.b64decode(encoded, validate=True)
+                    raise InputValidationError("encoded media exceeds limit")
+                if not encoded.isascii(): raise InputValidationError("invalid media base64")
+                try:
+                    raw=base64.b64decode(encoded,validate=True)
+                except binascii.Error:
+                    raise InputValidationError("invalid media base64") from None
                 if base64.b64encode(raw).decode() != encoded:
-                    raise ValueError("noncanonical base64")
+                    raise InputValidationError("noncanonical base64")
                 if not raw or len(raw) > cap:
-                    raise ValueError("decoded media exceeds limit")
+                    raise InputValidationError("decoded media exceeds limit")
                 if not isinstance(media["sha256"],str) or hashlib.sha256(raw).hexdigest() != media["sha256"]:
-                    raise ValueError("media digest mismatch")
+                    raise InputValidationError("media digest mismatch")
                 counts[kind] += 1
                 total_bytes += len(raw)
                 image_bytes += len(raw) if kind == "image" else 0
                 if counts["image"] > 8 or counts["audio"] > 1 or counts["video"] > 1 or image_bytes > 8*1024*1024 or total_bytes > 20*1024*1024:
-                    raise ValueError("media aggregate exceeds limit")
+                    raise InputValidationError("media aggregate exceeds limit")
                 file = Path(directory) / f"{index}-{part_index}{MIME[kind][media['mime_type']]}"
                 file.write_bytes(raw)
                 if kind == "image":
                     try:
                         with Image.open(io.BytesIO(raw)) as image:
                             if image.width*image.height>16_000_000 or Image.MIME.get(image.format)!=media["mime_type"]:
-                                raise ValueError("image shape or MIME mismatch")
+                                raise InputValidationError("image shape or MIME mismatch")
                             image.verify()
-                    except (OSError,ValueError,SyntaxError,EOFError,Image.DecompressionBombError):
-                        raise ValueError("invalid image media") from None
+                    except (OSError,SyntaxError,EOFError,Image.DecompressionBombError):
+                        raise InputValidationError("invalid image media") from None
                 elif kind == "audio":
                     magic = {"audio/wav": raw[:4] == b"RIFF" and raw[8:12] == b"WAVE", "audio/flac": raw[:4] == b"fLaC", "audio/mpeg": raw[:3] == b"ID3" or raw[:2] in (b"\xff\xfb", b"\xff\xf3", b"\xff\xf2")}
                     if not magic[media["mime_type"]]:
-                        raise ValueError("audio MIME mismatch")
-                    try:
-                        waveform = load_audio(str(file),sr=16000)
-                    except (OSError,ValueError,EOFError,RuntimeError):
-                        raise ValueError("invalid audio media") from None
-                    waveform = np.asarray(waveform)
-                    if waveform.ndim != 1 or waveform.size > 480000 or not np.isfinite(waveform).all():
-                        raise ValueError("audio shape exceeds limit")
-                    check_duration(waveform.size / 16000, part["duration_seconds"], 30)
+                        raise InputValidationError("audio MIME mismatch")
+                    waveform=np.asarray(decode_audio_bounded(file,media["mime_type"],part["duration_seconds"]),dtype=np.float32)
                 else:
                     validate_mp4_container(raw)
                     declared = part["duration_seconds"]
                     check_duration(declared, declared, 32)
                     try:
                         verify_video(self.processor,file,declared)
-                    except (OSError,ValueError,EOFError,RuntimeError):
-                        raise ValueError("invalid video media") from None
-                content.append({"type": kind, "url": str(file)})
+                    except (OSError,EOFError):
+                        raise InputValidationError("invalid video media") from None
+                content.append({"type":kind,"url":waveform if kind=="audio" else str(file)})
             conversation = []
             if PREFIXES[input_type]:
                 conversation.append({"role": "system", "content": PREFIXES[input_type]})
@@ -268,18 +318,23 @@ class Runtime:
 
     def embed(self, request):
         if request.get("type") != "embed" or request.get("protocol") != PROTOCOL or request.get("input_type") not in PREFIXES:
-            raise ValueError("request identity mismatch")
+            raise InputValidationError("request identity mismatch")
         request_id = request.get("request_id")
         if type(request_id) is not int or not 0 <= request_id < 2**64:
-            raise ValueError("invalid request ID")
+            raise InputValidationError("invalid request ID")
         items = request.get("input")
         if not isinstance(items, list) or not 1 <= len(items) <= 16 or request.get("dimensions", 768) not in DIMENSIONS:
-            raise ValueError("invalid batch or dimensions")
+            raise InputValidationError("invalid batch or dimensions")
         validate_text_budget(items,request["input_type"])
         import numpy as np
         with tempfile.TemporaryDirectory(prefix="sgl-eg2-") as directory:
-            conversations = self._conversations(items, request["input_type"], directory)
-            inputs = self.processor.apply_chat_template(conversations, tokenize=True, return_dict=True, return_tensors="mlx", images_kwargs={"max_soft_tokens":280}, videos_kwargs={"fps":1,"max_frames":32,"max_soft_tokens":140}, audio_kwargs={"sampling_rate":16000})
+            try:
+                conversations=self._conversations(items,request["input_type"],directory)
+                inputs=self.processor.apply_chat_template(conversations,tokenize=True,return_dict=True,return_tensors="mlx",images_kwargs={"max_soft_tokens":280},videos_kwargs={"fps":1,"max_frames":32,"max_soft_tokens":140},audio_kwargs={"sampling_rate":16000})
+            except InputValidationError:
+                raise
+            except Exception:
+                raise RuntimeError("embedding media processor failed") from None
             ids = np.asarray(inputs["input_ids"])
             mask = np.asarray(inputs["attention_mask"]) if "attention_mask" in inputs else np.ones(ids.shape)
             usage = {"text":0,"image":0,"audio":0,"video":0}

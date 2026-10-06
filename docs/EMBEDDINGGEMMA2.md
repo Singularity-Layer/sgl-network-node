@@ -47,8 +47,10 @@ request and result has an integer `request_id`. The request contains the exact
 `embedding-multimodal-v1` protocol, typed batch, input type and native dimension
 768. The result contains ordered native vectors and integer modality token usage.
 The result also carries private `item_usage` rows. Rust validates each row's
-8192-token limit, requested media presence and image/video bounds, then requires
-that their exact sum equals aggregate usage. Private usage rows stay out of the
+8192-token limit, requested media presence and image/video/audio bounds, then
+requires that their exact sum equals aggregate usage. Each row is also capped at
+its quoted work: UTF-8 text and prefix bytes + 12 + images × 280 + ceiling(video
+seconds) × 140 + ceiling(audio seconds) × 25. Private usage rows stay out of the
 public OpenAI response. The Rust boundary validates output before returning any
 billable result, truncates
 MRL dimensions to 768/512/256/128, and normalizes again in FP32.
@@ -60,7 +62,12 @@ usage sums exact processor token counts, excluding padding. Decoded media shape,
 MIME and duration are checked before model inference; understated duration fails.
 MP4 requires whitelisted major and compatible ISO container brands. Text preflight
 counts UTF-8 bytes, the applied retrieval prefix and a 12-token template reserve
-before media decoding or tokenization. Empty EG2 text parts are rejected.
+before media decoding or tokenization. Declared image, audio and video budgets
+also enter this preflight. Empty EG2 text parts are rejected. Audio metadata is
+checked before miniaudio streams mono 16 kHz FLOAT32 chunks of at most 4096 samples.
+The worker closes and rejects the stream if it exceeds the declared duration or
+480000 samples. It passes the bounded waveform array to the processor, avoiding
+a second file decode.
 
 Worker stderr and library stdout are suppressed. Request errors contain no input,
 media, vectors or Python traceback. Startup has a 180-second deadline; each job
@@ -70,7 +77,9 @@ kills and reaps the process and removes its private media directory. Expected
 input errors use a bounded `request_error` frame and return the safe node reason
 `embedding_input_invalid`, while preserving worker readiness. Runtime or protocol
 failures return `embedding_runtime_failed` and remove readiness. Native output
-errors raise Python `RuntimeError`; invalid media stays a client `ValueError`.
+errors raise Python `RuntimeError`. Only our explicit input/media checks raise
+`InputValidationError`, which produces a nonfatal request-error frame. An
+unclassified library `ValueError` remains a fatal runtime failure.
 Restarts
 repeat startup checks and have a lifetime budget of three attempts.
 

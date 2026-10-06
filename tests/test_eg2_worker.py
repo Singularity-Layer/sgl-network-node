@@ -99,7 +99,7 @@ class WorkerPolicy(unittest.TestCase):
 
     def test_expected_input_errors_do_not_terminate_protocol(self):
         class InvalidInput:
-            def embed(self,request): raise ValueError("private invalid input")
+            def embed(self,request): raise worker.InputValidationError("private invalid input")
         for request_id in range(5):
             request={"type":"embed","protocol":worker.PROTOCOL,"request_id":request_id}
             self.assertEqual(worker.dispatch_request(InvalidInput(),request),{"type":"request_error","request_id":request_id,"code":"invalid_input"})
@@ -120,12 +120,67 @@ class WorkerPolicy(unittest.TestCase):
             with self.assertRaises(ValueError):
                 worker.validate_mp4_container(raw)
 
+    def test_library_value_error_is_fatal_not_input_frame(self):
+        class BrokenLibrary:
+            def embed(self,request): raise ValueError("unclassified library failure")
+        request={"type":"embed","protocol":worker.PROTOCOL,"request_id":1}
+        with self.assertRaises(RuntimeError):
+            worker.dispatch_request(BrokenLibrary(),request)
+
+    def test_preflight_includes_media_budget_before_processing(self):
+        for part in ({"type":"image"},{"type":"audio","duration_seconds":1},{"type":"video","duration_seconds":1}):
+            items=[{"content":[{"type":"text","text":"x"*8180},part]}]
+            with self.assertRaises(worker.InputValidationError):
+                worker.validate_text_budget(items,"unspecified")
+
+    def test_bounded_audio_metadata_stream_and_bomb(self):
+        import array
+        class DecoderError(Exception): pass
+        class FakeAudio:
+            MiniaudioError=DecoderError
+            FileFormat=SimpleNamespace(WAV='wav',FLAC='flac',MP3='mp3')
+            SampleFormat=SimpleNamespace(FLOAT32='f32')
+            def __init__(self,format='wav',declared=1,bomb=False):
+                self.info=SimpleNamespace(file_format=format,nchannels=1,sample_rate=16000,num_frames=int(declared*16000),duration=declared)
+                self.stream_calls=0; self.closed=False; self.bomb=bomb; self.chunks=0
+            def get_file_info(self,path): return self.info
+            def stream_file(self,path,**kwargs):
+                self.stream_calls+=1
+                self.kwargs=kwargs
+                def chunks():
+                    try:
+                        remaining=31*16000 if self.bomb else self.info.num_frames
+                        while remaining:
+                            amount=min(4096,remaining); remaining-=amount; self.chunks+=1
+                            yield array.array('f',[0.0])*amount
+                    finally: self.closed=True
+                return chunks()
+        for mime,format in [('audio/wav','wav'),('audio/flac','flac'),('audio/mpeg','mp3')]:
+            audio=FakeAudio(format)
+            self.assertEqual(len(worker.decode_audio_bounded('/owned/input',mime,1,audio)),16000)
+            self.assertEqual(audio.kwargs,{'output_format':'f32','nchannels':1,'sample_rate':16000,'frames_to_read':4096})
+            self.assertTrue(audio.closed)
+        audio=FakeAudio(declared=31)
+        with self.assertRaises(worker.InputValidationError): worker.decode_audio_bounded('/owned/input','audio/wav',30,audio)
+        self.assertEqual(audio.stream_calls,0)
+        audio=FakeAudio(declared=30,bomb=True)
+        with self.assertRaises(worker.InputValidationError): worker.decode_audio_bounded('/owned/input','audio/wav',30,audio)
+        self.assertLessEqual(audio.chunks,118)
+        self.assertTrue(audio.closed)
+        audio=FakeAudio(declared=1,bomb=True)
+        with self.assertRaises(worker.InputValidationError): worker.decode_audio_bounded('/owned/input','audio/wav',1,audio)
+        self.assertLessEqual(audio.chunks,4)
+        self.assertTrue(audio.closed)
+        audio=FakeAudio('flac')
+        with self.assertRaises(worker.InputValidationError): worker.decode_audio_bounded('/owned/input','audio/mpeg',1,audio)
+        self.assertEqual(audio.stream_calls,0)
+
     def test_parameters_reject_float16_and_empty_models(self):
         mx = SimpleNamespace(bfloat16='bf16',float32='fp32')
         flatten = lambda parameters: parameters
         worker.verify_parameter_dtypes([('weights',SimpleNamespace(dtype='bf16')),('norm',SimpleNamespace(dtype='fp32'))], mx, flatten)
         for values in ([], [('weights',SimpleNamespace(dtype='fp16'))]):
-            with self.assertRaises(ValueError):
+            with self.assertRaises(RuntimeError):
                 worker.verify_parameter_dtypes(values,mx,flatten)
 
 if __name__ == '__main__':
