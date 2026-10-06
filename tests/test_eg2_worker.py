@@ -175,6 +175,19 @@ class WorkerPolicy(unittest.TestCase):
         with self.assertRaises(worker.InputValidationError): worker.decode_audio_bounded('/owned/input','audio/mpeg',1,audio)
         self.assertEqual(audio.stream_calls,0)
 
+    def test_corrupt_video_decode_is_nonfatal_but_later_library_failure_is_fatal(self):
+        request={"type":"embed","protocol":worker.PROTOCOL,"request_id":1}
+        for error in (OSError,EOFError,ValueError,RuntimeError,worker.InputValidationError):
+            def decode(path,sampler): raise error("corrupt media")
+            processor=SimpleNamespace(video_processor=SimpleNamespace(_decode_video=decode,sample_frames=lambda metadata,**kw:[0]))
+            class CorruptVideo:
+                def embed(self,request): return worker.validate_video_media(processor,'/owned/corrupt.mp4',1)
+            for _ in range(5):
+                self.assertEqual(worker.dispatch_request(CorruptVideo(),request),{"type":"request_error","request_id":1,"code":"invalid_input"})
+        class BrokenProcessor:
+            def embed(self,request): raise ValueError("later processor failure")
+        with self.assertRaises(RuntimeError): worker.dispatch_request(BrokenProcessor(),request)
+
     def test_parameters_reject_float16_and_empty_models(self):
         mx = SimpleNamespace(bfloat16='bf16',float32='fp32')
         flatten = lambda parameters: parameters

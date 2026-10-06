@@ -75,6 +75,16 @@ def verify_video(processor, file, declared):
     return processor.video_processor._decode_video(str(file), verify_sample)
 
 
+def validate_video_media(processor,file,declared):
+    """Decoder failures at this boundary describe corrupt input, not model failure."""
+    try:
+        return verify_video(processor,file,declared)
+    except InputValidationError:
+        raise
+    except (OSError,EOFError,ValueError,RuntimeError):
+        raise InputValidationError("invalid video media") from None
+
+
 def verify_parameter_dtypes(parameters, mx, flatten):
     leaves = flatten(parameters)
     if not leaves or any(value.dtype not in (mx.bfloat16, mx.float32) for _, value in leaves):
@@ -304,10 +314,7 @@ class Runtime:
                     validate_mp4_container(raw)
                     declared = part["duration_seconds"]
                     check_duration(declared, declared, 32)
-                    try:
-                        verify_video(self.processor,file,declared)
-                    except (OSError,EOFError):
-                        raise InputValidationError("invalid video media") from None
+                    validate_video_media(self.processor,file,declared)
                 content.append({"type":kind,"url":waveform if kind=="audio" else str(file)})
             conversation = []
             if PREFIXES[input_type]:
