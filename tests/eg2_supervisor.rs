@@ -23,7 +23,7 @@ fn worker(body: &str) -> WorkerConfig {
 
 #[tokio::test]
 async fn validates_ready_round_trip_and_mrl() {
-    let engine = Eg2Engine::start(worker("for line in sys.stdin:\n r=json.loads(line)\n print(json.dumps({'type':'result','request_id':r['request_id'],'vectors':[[1.0/(768**0.5)]*768 for _ in r['input']], 'usage':{'text':2,'image':0,'audio':0,'video':0}}),flush=True)")).await.unwrap();
+    let engine = Eg2Engine::start(worker("for line in sys.stdin:\n r=json.loads(line)\n print(json.dumps({'type':'result','request_id':r['request_id'],'vectors':[[1.0/(768**0.5)]*768 for _ in r['input']], 'usage':{'text':2,'image':0,'audio':0,'video':0},'item_usage':[{'text':1,'image':0,'audio':0,'video':0} for _ in r['input']]}),flush=True)")).await.unwrap();
     assert!(engine.is_healthy());
     assert!(engine.capabilities().is_some());
     let batch = EmbeddingBatch::parse(&json!(["hello", "world"]), true).unwrap();
@@ -39,7 +39,7 @@ async fn validates_ready_round_trip_and_mrl() {
 
 #[tokio::test]
 async fn eof_timeout_and_wrong_id_remove_capabilities() {
-    for body in ["time.sleep(0.03); sys.exit(0)", "time.sleep(5)", "for line in sys.stdin:\n print(json.dumps({'type':'result','request_id':999,'vectors':[],'usage':{}}),flush=True)"] {
+    for body in ["time.sleep(0.03); sys.exit(0)", "time.sleep(5)", "for line in sys.stdin:\n print(json.dumps({'type':'result','request_id':999,'vectors':[[1.0/(768**0.5)]*768],'usage':{'text':1,'image':0,'audio':0,'video':0},'item_usage':[{'text':1,'image':0,'audio':0,'video':0}]}),flush=True)"] {
         let engine = Eg2Engine::start(worker(body)).await.unwrap();
         let batch = EmbeddingBatch::parse(&json!("hello"), true).unwrap();
         assert!(engine.embed(batch, sgl_node::embed_catalog::InputType::Unspecified, None).await.is_err());
@@ -126,7 +126,7 @@ async fn closed_stdout_and_oversized_frames_cannot_keep_ready() {
 
 #[tokio::test]
 async fn mixed_modalities_preserve_parts_and_native_request_dimensions() {
-    let engine=Eg2Engine::start(worker("for line in sys.stdin:\n r=json.loads(line)\n assert r['dimensions']==768 and r['input_type']=='document'\n assert [p['type'] for p in r['input'][0]['content']]==['text','image','audio','video']\n print(json.dumps({'type':'result','request_id':r['request_id'],'vectors':[[1.0/(768**0.5)]*768],'usage':{'text':2,'image':280,'audio':25,'video':140}}),flush=True)")).await.unwrap();
+    let engine=Eg2Engine::start(worker("for line in sys.stdin:\n r=json.loads(line)\n assert r['dimensions']==768 and r['input_type']=='document'\n assert [p['type'] for p in r['input'][0]['content']]==['text','image','audio','video']\n print(json.dumps({'type':'result','request_id':r['request_id'],'vectors':[[1.0/(768**0.5)]*768],'usage':{'text':2,'image':280,'audio':25,'video':140},'item_usage':[{'text':2,'image':280,'audio':25,'video':140}]}),flush=True)")).await.unwrap();
     let media = |mime: &str| json!({"encoding":"base64","mime_type":mime,"data":"aGk=","sha256":"8f434346648f6b96df89dda901c5176b10a6d83961dd3c1ac88b59b2dc327aa4"});
     let input = json!([{"content":[{"type":"text","text":"caption"},{"type":"image","media":media("image/png")},{"type":"audio","media":media("audio/wav"),"duration_seconds":1},{"type":"video","media":media("video/mp4"),"duration_seconds":1}]}]);
     let output = engine
@@ -173,7 +173,7 @@ async fn explicit_runtime_requirement_cannot_fall_through_to_chat_or_gguf() {
 
 #[tokio::test]
 async fn restarts_repeat_readiness_and_stop_after_lifetime_budget() {
-    let engine=Eg2Engine::start(worker("for line in sys.stdin:\n r=json.loads(line)\n print(json.dumps({'type':'result','request_id':r['request_id'],'vectors':[[1.0/(768**0.5)]*768],'usage':{'text':1,'image':0,'audio':0,'video':0}}),flush=True)")).await.unwrap();
+    let engine=Eg2Engine::start(worker("for line in sys.stdin:\n r=json.loads(line)\n print(json.dumps({'type':'result','request_id':r['request_id'],'vectors':[[1.0/(768**0.5)]*768],'usage':{'text':1,'image':0,'audio':0,'video':0},'item_usage':[{'text':1,'image':0,'audio':0,'video':0}]}),flush=True)")).await.unwrap();
     for _ in 0..3 {
         engine.restart().await.unwrap();
         assert!(engine.capabilities().is_some());
@@ -203,6 +203,16 @@ async fn production_factory_real_canary() {
     use sha2::{Digest, Sha256};
     let python = std::env::var("SGL_EG2_CANARY_PYTHON").expect("provisioned interpreter required");
     let model = std::env::var("SGL_EG2_CANARY_MODEL").expect("provisioned snapshot required");
+    let prefix = format!("sgl-eg2-{}-", std::process::id());
+    let owned_temp_paths = || {
+        std::fs::read_dir(std::env::temp_dir())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with(&prefix))
+            .map(|entry| entry.path())
+            .collect::<std::collections::HashSet<_>>()
+    };
+    let before = owned_temp_paths();
     let engine = Eg2Engine::production(
         std::path::Path::new(&model),
         Some(std::path::Path::new(&python)),
@@ -212,6 +222,22 @@ async fn production_factory_real_canary() {
     assert!(engine.capabilities().is_some());
     let media = |mime: &str, bytes: &[u8]| json!({"encoding":"base64","mime_type":mime,"data":base64::engine::general_purpose::STANDARD.encode(bytes),"sha256":hex::encode(Sha256::digest(bytes))});
     let input = json!(["A quiet field",{"content":[{"type":"text","text":"A quiet field"},{"type":"image","media":media("image/png",include_bytes!("../assets/embeddinggemma2/smoke/image.png"))},{"type":"audio","duration_seconds":1.0,"media":media("audio/wav",include_bytes!("../assets/embeddinggemma2/smoke/audio.wav"))},{"type":"video","duration_seconds":1.0,"media":media("video/mp4",include_bytes!("../assets/embeddinggemma2/smoke/video.mp4"))}]}]);
+    let bad_png = json!([{"content":[{"type":"image","media":media("image/png",b"not-a-png")}]}]);
+    for _ in 0..5 {
+        assert_eq!(
+            engine
+                .embed(
+                    EmbeddingBatch::parse(&bad_png, true).unwrap(),
+                    sgl_node::embed_catalog::InputType::Unspecified,
+                    None
+                )
+                .await
+                .err()
+                .unwrap(),
+            "embedding_input_invalid"
+        );
+        assert!(engine.capabilities().is_some());
+    }
     for dim in [768, 512, 256, 128] {
         let output = engine
             .embed(
@@ -235,4 +261,68 @@ async fn production_factory_real_canary() {
     }
     engine.stop();
     assert!(engine.capabilities().is_none());
+    drop(engine);
+    assert!(
+        owned_temp_paths().is_subset(&before),
+        "private worker media/runtime directories survived shutdown"
+    );
+    assert!(std::path::Path::new(&model).is_dir());
+    assert!(std::path::Path::new(&python).is_file());
+}
+
+#[tokio::test]
+async fn bad_png_request_errors_leave_worker_and_snapshot_ready() {
+    let engine=Eg2Engine::start(worker("for line in sys.stdin:\n r=json.loads(line)\n if r['input'][0]['content'][0]['type']=='image':\n  print(json.dumps({'type':'request_error','request_id':r['request_id'],'code':'invalid_input'}),flush=True)\n else:\n  print(json.dumps({'type':'result','request_id':r['request_id'],'vectors':[[1.0/(768**0.5)]*768],'usage':{'text':1,'image':0,'audio':0,'video':0},'item_usage':[{'text':1,'image':0,'audio':0,'video':0}]}),flush=True)")).await.unwrap();
+    let input = json!([{"content":[{"type":"image","media":{"encoding":"base64","mime_type":"image/png","data":"aGk=","sha256":"8f434346648f6b96df89dda901c5176b10a6d83961dd3c1ac88b59b2dc327aa4"}}]}]);
+    let models = vec!["embeddinggemma-2".into()];
+    for _ in 0..5 {
+        assert_eq!(
+            engine
+                .embed(
+                    EmbeddingBatch::parse(&input, true).unwrap(),
+                    sgl_node::embed_catalog::InputType::Unspecified,
+                    None
+                )
+                .await
+                .err()
+                .unwrap(),
+            "embedding_input_invalid"
+        );
+        let snapshot = engine.readiness_snapshot(&models);
+        assert_eq!(snapshot.available_models, models);
+        assert!(snapshot.capabilities.is_some());
+    }
+    assert!(engine
+        .embed(
+            EmbeddingBatch::parse(&json!("valid text"), true).unwrap(),
+            sgl_node::embed_catalog::InputType::Unspecified,
+            None
+        )
+        .await
+        .is_ok());
+    engine.stop();
+    let dead = engine.readiness_snapshot(&models);
+    assert!(dead.available_models.is_empty() && dead.capabilities.is_none());
+}
+
+#[tokio::test]
+async fn corrupt_request_error_frame_is_a_runtime_failure() {
+    let engine=Eg2Engine::start(worker("for line in sys.stdin:\n print(json.dumps({'type':'request_error','request_id':999,'code':'invalid_input'}),flush=True)")).await.unwrap();
+    assert_eq!(
+        engine
+            .embed(
+                EmbeddingBatch::parse(&json!("text"), true).unwrap(),
+                sgl_node::embed_catalog::InputType::Unspecified,
+                None
+            )
+            .await
+            .err()
+            .unwrap(),
+        "embedding_runtime_failed"
+    );
+    assert!(engine
+        .readiness_snapshot(&["embeddinggemma-2".into()])
+        .available_models
+        .is_empty());
+    engine.stop();
 }

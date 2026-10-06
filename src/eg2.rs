@@ -43,7 +43,7 @@ pub struct Capabilities {
     pub media_transport: Vec<String>,
 }
 
-#[derive(Default, Debug, Deserialize, Serialize)]
+#[derive(Default, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Usage {
     pub text: u32,
@@ -89,6 +89,36 @@ struct Response {
     request_id: u64,
     vectors: Vec<Vec<f32>>,
     usage: Usage,
+    item_usage: Vec<Usage>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RequestError {
+    #[serde(rename = "type")]
+    frame_type: String,
+    request_id: u64,
+    code: String,
+}
+
+enum WorkerFailure {
+    InvalidInput,
+    Fatal(String),
+}
+impl From<String> for WorkerFailure {
+    fn from(reason: String) -> Self {
+        Self::Fatal(reason)
+    }
+}
+impl From<&str> for WorkerFailure {
+    fn from(reason: &str) -> Self {
+        Self::Fatal(reason.into())
+    }
+}
+
+pub struct ReadinessSnapshot {
+    pub available_models: Vec<String>,
+    pub capabilities: Option<Capabilities>,
 }
 
 struct Job {
@@ -236,6 +266,19 @@ impl Eg2Engine {
         }
     }
 
+    pub fn readiness_snapshot(&self, models: &[String]) -> ReadinessSnapshot {
+        let capabilities = self.capabilities();
+        let available_models = if capabilities.is_some() {
+            models.to_vec()
+        } else {
+            vec![]
+        };
+        ReadinessSnapshot {
+            available_models,
+            capabilities,
+        }
+    }
+
     pub async fn embed(
         &self,
         batch: EmbeddingBatch,
@@ -243,15 +286,15 @@ impl Eg2Engine {
         dimensions: Option<u32>,
     ) -> Result<Output, String> {
         if !self.is_healthy() {
-            return Err("embedding worker unavailable".into());
+            return Err("embedding_runtime_failed".into());
         }
         let dim = dimensions.unwrap_or(768);
         if !DIMENSIONS.contains(&dim) {
-            return Err("unsupported embedding dimensions".into());
+            return Err("embedding_input_invalid".into());
         }
         // Public typed structures can be built directly: validate again at the process boundary.
-        let input = serde_json::to_value(&batch.items).map_err(|_| "invalid embedding input")?;
-        let batch = EmbeddingBatch::parse(&input, true)?;
+        let input = serde_json::to_value(&batch.items).map_err(|_| "embedding_input_invalid")?;
+        let batch = EmbeddingBatch::parse(&input, true).map_err(|_| "embedding_input_invalid")?;
         let (reply, receive) = tokio::sync::oneshot::channel();
         let job = Job {
             id: self.next_id.fetch_add(1, Ordering::Relaxed),
@@ -264,10 +307,10 @@ impl Eg2Engine {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .as_ref()
-            .ok_or("embedding worker unavailable")?
+            .ok_or("embedding_runtime_failed")?
             .try_send(job)
-            .map_err(|_| "embedding worker busy or unavailable")?;
-        receive.await.map_err(|_| "embedding worker unavailable")?
+            .map_err(|_| "embedding_runtime_failed")?;
+        receive.await.map_err(|_| "embedding_runtime_failed")?
     }
 
     pub fn stop(&self) {
@@ -420,7 +463,7 @@ fn supervise(
                 .and_then(|v| {
                     v.get("type")
                         .and_then(|t| t.as_str())
-                        .map(|t| matches!(t, "ready" | "result"))
+                        .map(|t| matches!(t, "ready" | "result" | "request_error"))
                 })
                 .unwrap_or(false);
             if !valid_frame {
@@ -476,9 +519,14 @@ fn supervise(
             &stopped,
             config.request_timeout,
         );
-        if response.is_err() {
-            healthy.store(false, Ordering::Release);
-        }
+        let response = match response {
+            Ok(output) => Ok(output),
+            Err(WorkerFailure::InvalidInput) => Err("embedding_input_invalid".into()),
+            Err(WorkerFailure::Fatal(_reason)) => {
+                healthy.store(false, Ordering::Release);
+                Err("embedding_runtime_failed".into())
+            }
+        };
         let _ = job.reply.send(response);
     }
     healthy.store(false, Ordering::Release);
@@ -547,7 +595,7 @@ fn run_job(
     frames: &mpsc::Receiver<Vec<u8>>,
     stopped: &AtomicBool,
     timeout: Duration,
-) -> Result<Output, String> {
+) -> Result<Output, WorkerFailure> {
     let input_type = match job.input_type {
         InputType::Query => "query",
         InputType::Document => "document",
@@ -586,6 +634,19 @@ fn run_job(
         stopped,
         Some(&job.reply),
     )?;
+    let value: serde_json::Value =
+        serde_json::from_slice(&frame).map_err(|_| "invalid embedding worker frame")?;
+    if value.get("type").and_then(|v| v.as_str()) == Some("request_error") {
+        let error: RequestError =
+            serde_json::from_value(value).map_err(|_| "invalid embedding request-error frame")?;
+        if error.frame_type != "request_error"
+            || error.request_id != job.id
+            || error.code != "invalid_input"
+        {
+            return Err("embedding request-error mismatch".into());
+        }
+        return Err(WorkerFailure::InvalidInput);
+    }
     let mut result: Response =
         serde_json::from_slice(&frame).map_err(|_| "invalid embedding worker output")?;
     if result.frame_type != "result"
@@ -594,24 +655,7 @@ fn run_job(
     {
         return Err("embedding worker response mismatch".into());
     }
-    let total = result.usage.total()?;
-    if total == 0 || total > 8192 * job.batch.items.len() as u32 {
-        return Err("embedding worker usage exceeds context budget".into());
-    }
-    let modalities = job.batch.modalities();
-    for (kind, tokens) in [
-        ("text", result.usage.text),
-        ("image", result.usage.image),
-        ("audio", result.usage.audio),
-        ("video", result.usage.video),
-    ] {
-        if kind != "text"
-            && ((!modalities.contains(&kind) && tokens != 0)
-                || (modalities.contains(&kind) && tokens == 0))
-        {
-            return Err("embedding worker usage modality mismatch".into());
-        }
-    }
+    validate_item_usage(&job.batch, &result.usage, &result.item_usage)?;
     for vector in &mut result.vectors {
         normalize_native(vector, job.dimensions)?;
     }
@@ -619,6 +663,56 @@ fn run_job(
         vectors: result.vectors,
         usage: result.usage,
     })
+}
+
+fn validate_item_usage(
+    batch: &EmbeddingBatch,
+    usage: &Usage,
+    rows: &[Usage],
+) -> Result<(), String> {
+    use crate::embedding_input::Part;
+    if rows.len() != batch.items.len() {
+        return Err("embedding item usage count mismatch".into());
+    }
+    let mut aggregate = Usage::default();
+    for (item, row) in batch.items.iter().zip(rows) {
+        let total = row.total()?;
+        if total == 0 || total > 8192 {
+            return Err("embedding item usage exceeds context budget".into());
+        }
+        let mut images = 0u32;
+        let mut audio = false;
+        let mut video_bound = 0u32;
+        let mut text = false;
+        for part in &item.content {
+            match part {
+                Part::Text { .. } => text = true,
+                Part::Image { .. } => images += 1,
+                Part::Audio { .. } => audio = true,
+                Part::Video {
+                    duration_seconds, ..
+                } => video_bound += duration_seconds.ceil() as u32 * 140,
+            }
+        }
+        if (images == 0) != (row.image == 0)
+            || row.image > images * 280
+            || audio != (row.audio > 0)
+            || (video_bound == 0) != (row.video == 0)
+            || row.video > video_bound
+            || (text && row.text == 0)
+        {
+            return Err("embedding item usage modality mismatch".into());
+        }
+        // Each row total <=8192 and batch <=16, so these additions cannot overflow u32.
+        aggregate.text += row.text;
+        aggregate.image += row.image;
+        aggregate.audio += row.audio;
+        aggregate.video += row.video;
+    }
+    if aggregate != *usage {
+        return Err("embedding aggregate usage mismatch".into());
+    }
+    Ok(())
 }
 
 fn normalize_native(vector: &mut Vec<f32>, dimensions: u32) -> Result<(), String> {
@@ -682,6 +776,159 @@ mod tests {
             video: 0
         }
         .total()
+        .is_err());
+    }
+}
+
+#[cfg(test)]
+mod item_usage_tests {
+    use super::*;
+    use serde_json::json;
+    fn text_batch(n: usize) -> EmbeddingBatch {
+        EmbeddingBatch::parse(&json!(vec!["text"; n]), true).unwrap()
+    }
+    #[test]
+    fn oversized_item_cannot_hide_in_valid_aggregate() {
+        let rows = [
+            Usage {
+                text: 8193,
+                ..Usage::default()
+            },
+            Usage {
+                text: 1,
+                ..Usage::default()
+            },
+        ];
+        assert!(validate_item_usage(
+            &text_batch(2),
+            &Usage {
+                text: 8194,
+                ..Usage::default()
+            },
+            &rows
+        )
+        .is_err());
+        let good = [
+            Usage {
+                text: 8192,
+                ..Usage::default()
+            },
+            Usage {
+                text: 8192,
+                ..Usage::default()
+            },
+        ];
+        assert!(validate_item_usage(
+            &text_batch(2),
+            &Usage {
+                text: 16384,
+                ..Usage::default()
+            },
+            &good
+        )
+        .is_ok());
+        assert!(validate_item_usage(
+            &text_batch(2),
+            &Usage {
+                text: 16383,
+                ..Usage::default()
+            },
+            &good
+        )
+        .is_err());
+        assert!(validate_item_usage(&text_batch(2), &Usage::default(), &[]).is_err());
+    }
+    #[test]
+    fn per_item_media_usage_is_bounded_and_cannot_shift_between_rows() {
+        let media = |mime: &str| json!({"encoding":"base64","mime_type":mime,"data":"aGk=","sha256":"8f434346648f6b96df89dda901c5176b10a6d83961dd3c1ac88b59b2dc327aa4"});
+        let input = json!([{"content":[{"type":"image","media":media("image/png")},{"type":"audio","media":media("audio/wav"),"duration_seconds":1},{"type":"video","media":media("video/mp4"),"duration_seconds":1}]},"text"]);
+        let batch = EmbeddingBatch::parse(&input, true).unwrap();
+        let valid = Usage {
+            text: 12,
+            image: 256,
+            audio: 25,
+            video: 121,
+        };
+        let text = Usage {
+            text: 10,
+            ..Usage::default()
+        };
+        let total = Usage {
+            text: 22,
+            image: 256,
+            audio: 25,
+            video: 121,
+        };
+        assert!(validate_item_usage(&batch, &total, &[valid, text]).is_ok());
+        for bad in [
+            Usage {
+                text: 12,
+                image: 281,
+                audio: 25,
+                video: 121,
+            },
+            Usage {
+                text: 12,
+                image: 256,
+                audio: 0,
+                video: 121,
+            },
+            Usage {
+                text: 12,
+                image: 256,
+                audio: 25,
+                video: 141,
+            },
+            Usage {
+                text: 12,
+                image: 0,
+                audio: 25,
+                video: 121,
+            },
+        ] {
+            assert!(validate_item_usage(
+                &batch,
+                &total,
+                &[
+                    bad,
+                    Usage {
+                        text: 10,
+                        ..Usage::default()
+                    }
+                ]
+            )
+            .is_err());
+        }
+        assert!(validate_item_usage(
+            &text_batch(1),
+            &Usage {
+                text: 1,
+                image: 1,
+                ..Usage::default()
+            },
+            &[Usage {
+                text: 1,
+                image: 1,
+                ..Usage::default()
+            }]
+        )
+        .is_err());
+        assert!(validate_item_usage(
+            &batch,
+            &total,
+            &[
+                Usage {
+                    text: 10,
+                    ..Usage::default()
+                },
+                Usage {
+                    text: 12,
+                    image: 256,
+                    audio: 25,
+                    video: 121
+                }
+            ]
+        )
         .is_err());
     }
 }

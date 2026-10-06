@@ -1213,6 +1213,13 @@ impl InferenceEngine {
         }
     }
 
+    pub fn embedding_snapshot(&self, models: &[String]) -> Option<crate::eg2::ReadinessSnapshot> {
+        match self {
+            Self::MultimodalEmbed(e) => Some(e.readiness_snapshot(models)),
+            _ => None,
+        }
+    }
+
     pub async fn embed_multimodal(
         &self,
         batch: crate::embedding_input::EmbeddingBatch,
