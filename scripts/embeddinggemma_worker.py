@@ -22,6 +22,8 @@ OFFICIAL_REVISION = "914f7f89142e33e77833254d9c9b90c3cef7303b"
 MODEL_REVISION = "1a4ffddb7905d3f63486748deabe091a01fb6201"
 RUNTIME_REVISION = "30f177f03cbcb42bc2f65496458de79f51b80c28"
 MAX_FRAME = 24 * 1024 * 1024
+MAX_AGGREGATE_TEXT_BYTES = 10 * 1024 * 1024
+TEXT_TEMPLATE_RESERVE = 12
 DIMENSIONS = (768, 512, 256, 128)
 PREFIXES = {"query": "task: search result | query: ", "document": "title: none | text: ", "unspecified": ""}
 MIME = {"image": {"image/png": ".png", "image/jpeg": ".jpg", "image/webp": ".webp"}, "audio": {"audio/wav": ".wav", "audio/flac": ".flac", "audio/mpeg": ".mp3"}, "video": {"video/mp4": ".mp4"}}
@@ -73,15 +75,91 @@ def verify_parameter_dtypes(parameters, mx, flatten):
         raise ValueError("model parameters must be BF16 or FP32")
 
 
-def processed_usage(item, active_size, image, audio, video):
-    row = {"text":int(active_size)-image-audio-video,"image":image,"audio":audio,"video":video}
-    for kind, tokens in (("image",image),("audio",audio),("video",video)):
-        if any(part["type"] == kind for part in item["content"]) and tokens <= 0:
-            raise ValueError("processor omitted requested modality")
-    image_count = sum(part["type"] == "image" for part in item["content"])
-    if min(row.values()) < 0 or image > image_count*280 or video > 32*140 or not 0 < active_size <= 8192:
+def processed_usage(item,active_size,image,audio,video):
+    row={"text":int(active_size)-image-audio-video,"image":image,"audio":audio,"video":video}
+    if active_size<=0 or min(row.values())<0:
+        raise RuntimeError("invalid processor usage")
+    for kind,tokens in (("image",image),("audio",audio),("video",video)):
+        present=any(part["type"]==kind for part in item["content"])
+        if present!=(tokens>0):
+            raise RuntimeError("processor usage modality mismatch")
+    if any(part["type"]=="text" for part in item["content"]) and row["text"]==0:
+        raise RuntimeError("processor omitted requested text")
+    image_count=sum(part["type"]=="image" for part in item["content"])
+    video_bound=sum(math.ceil(part["duration_seconds"])*140 for part in item["content"] if part["type"]=="video")
+    if image>image_count*280 or video>video_bound:
+        raise RuntimeError("processor media usage exceeds declared bound")
+    if active_size>8192:
         raise ValueError("processed sample exceeds budget")
     return row
+
+
+def validate_text_budget(items, input_type):
+    """Cheap preflight runs before media decoding, tokenization or model execution."""
+    if not isinstance(input_type,str) or input_type not in PREFIXES:
+        raise ValueError("invalid input type")
+    prefix_bytes = len(PREFIXES[input_type].encode("utf-8"))
+    aggregate = 0
+    for item in items:
+        if not isinstance(item,dict) or not isinstance(item.get("content"),list):
+            raise ValueError("invalid item")
+        text_bytes = 0
+        for part in item["content"]:
+            if not isinstance(part,dict):
+                raise ValueError("invalid part")
+            if part.get("type") == "text":
+                text = part.get("text")
+                if set(part) != {"type","text"} or not isinstance(text,str) or not text.strip():
+                    raise ValueError("invalid text")
+                text_bytes += len(text.encode("utf-8"))
+        aggregate += text_bytes
+        if aggregate > MAX_AGGREGATE_TEXT_BYTES:
+            raise ValueError("aggregate text exceeds limit")
+        if text_bytes + prefix_bytes + TEXT_TEMPLATE_RESERVE > 8192:
+            raise ValueError("text exceeds processed sample budget")
+
+
+def normalize_native_output(vectors, rows, dimensions, np):
+    """Broken model output is a runtime failure, never a client validation error."""
+    if vectors.shape != (rows,768) or not np.isfinite(vectors).all():
+        raise RuntimeError("invalid native output")
+    native_norms = np.linalg.norm(vectors,axis=1)
+    if not np.isfinite(native_norms).all() or not np.allclose(native_norms,1.0,rtol=0,atol=0.001):
+        raise RuntimeError("native output is not normalized")
+    vectors = vectors[:,:dimensions]
+    norms = np.linalg.norm(vectors,axis=1,keepdims=True)
+    if not np.isfinite(norms).all() or (norms<=0).any():
+        raise RuntimeError("invalid native norm")
+    vectors /= norms
+    return vectors
+
+
+MP4_BRANDS = {b"isom",b"iso2",b"iso3",b"iso4",b"iso5",b"iso6",b"iso7",b"iso8",b"iso9",b"mp41",b"mp42",b"avc1",b"hvc1",b"hev1",b"dash",b"M4V ",b"cmfc",b"cmfs",b"msdh",b"msix"}
+
+def validate_mp4_container(raw):
+    if len(raw)<16 or raw[4:8]!=b"ftyp":
+        raise ValueError("video MIME mismatch")
+    size = int.from_bytes(raw[:4],"big")
+    start = 8
+    if size==1:
+        if len(raw)<24: raise ValueError("invalid video container")
+        size = int.from_bytes(raw[8:16],"big")
+        start = 16
+    if size<start+8 or size>len(raw) or (size-start-8)%4:
+        raise ValueError("invalid video container")
+    brands = [raw[start:start+4]] + [raw[index:index+4] for index in range(start+8,size,4)]
+    if any(brand not in MP4_BRANDS for brand in brands):
+        raise ValueError("unsupported video container brand")
+
+
+def dispatch_request(runtime, request):
+    """Only authenticated request input failures are nonfatal; framing stays fail-closed."""
+    if not isinstance(request,dict) or request.get("type")!="embed" or request.get("protocol")!=PROTOCOL or type(request.get("request_id")) is not int or not 0<=request["request_id"]<2**64:
+        raise RuntimeError("worker request protocol mismatch")
+    try:
+        return runtime.embed(request)
+    except ValueError:
+        return {"type":"request_error","request_id":request["request_id"],"code":"invalid_input"}
 
 
 class Runtime:
@@ -122,7 +200,7 @@ class Runtime:
             for part_index, part in enumerate(item["content"]):
                 kind = part.get("type")
                 if kind == "text":
-                    if set(part) != {"type", "text"} or not isinstance(part["text"], str):
+                    if set(part) != {"type", "text"} or not isinstance(part["text"], str) or not part["text"].strip():
                         raise ValueError("invalid text")
                     content.append({"type": "text", "text": part["text"]})
                     continue
@@ -153,25 +231,33 @@ class Runtime:
                 file = Path(directory) / f"{index}-{part_index}{MIME[kind][media['mime_type']]}"
                 file.write_bytes(raw)
                 if kind == "image":
-                    with Image.open(io.BytesIO(raw)) as image:
-                        if image.width * image.height > 16_000_000 or Image.MIME.get(image.format) != media["mime_type"]:
-                            raise ValueError("image shape or MIME mismatch")
-                        image.verify()
+                    try:
+                        with Image.open(io.BytesIO(raw)) as image:
+                            if image.width*image.height>16_000_000 or Image.MIME.get(image.format)!=media["mime_type"]:
+                                raise ValueError("image shape or MIME mismatch")
+                            image.verify()
+                    except (OSError,ValueError,SyntaxError,EOFError,Image.DecompressionBombError):
+                        raise ValueError("invalid image media") from None
                 elif kind == "audio":
                     magic = {"audio/wav": raw[:4] == b"RIFF" and raw[8:12] == b"WAVE", "audio/flac": raw[:4] == b"fLaC", "audio/mpeg": raw[:3] == b"ID3" or raw[:2] in (b"\xff\xfb", b"\xff\xf3", b"\xff\xf2")}
                     if not magic[media["mime_type"]]:
                         raise ValueError("audio MIME mismatch")
-                    waveform = load_audio(str(file), sr=16000)
+                    try:
+                        waveform = load_audio(str(file),sr=16000)
+                    except (OSError,ValueError,EOFError,RuntimeError):
+                        raise ValueError("invalid audio media") from None
                     waveform = np.asarray(waveform)
                     if waveform.ndim != 1 or waveform.size > 480000 or not np.isfinite(waveform).all():
                         raise ValueError("audio shape exceeds limit")
                     check_duration(waveform.size / 16000, part["duration_seconds"], 30)
                 else:
-                    if len(raw) < 12 or raw[4:8] != b"ftyp":
-                        raise ValueError("video MIME mismatch")
+                    validate_mp4_container(raw)
                     declared = part["duration_seconds"]
                     check_duration(declared, declared, 32)
-                    verify_video(self.processor, file, declared)
+                    try:
+                        verify_video(self.processor,file,declared)
+                    except (OSError,ValueError,EOFError,RuntimeError):
+                        raise ValueError("invalid video media") from None
                 content.append({"type": kind, "url": str(file)})
             conversation = []
             if PREFIXES[input_type]:
@@ -181,7 +267,6 @@ class Runtime:
         return conversations
 
     def embed(self, request):
-        import numpy as np
         if request.get("type") != "embed" or request.get("protocol") != PROTOCOL or request.get("input_type") not in PREFIXES:
             raise ValueError("request identity mismatch")
         request_id = request.get("request_id")
@@ -190,35 +275,32 @@ class Runtime:
         items = request.get("input")
         if not isinstance(items, list) or not 1 <= len(items) <= 16 or request.get("dimensions", 768) not in DIMENSIONS:
             raise ValueError("invalid batch or dimensions")
+        validate_text_budget(items,request["input_type"])
+        import numpy as np
         with tempfile.TemporaryDirectory(prefix="sgl-eg2-") as directory:
             conversations = self._conversations(items, request["input_type"], directory)
             inputs = self.processor.apply_chat_template(conversations, tokenize=True, return_dict=True, return_tensors="mlx", images_kwargs={"max_soft_tokens":280}, videos_kwargs={"fps":1,"max_frames":32,"max_soft_tokens":140}, audio_kwargs={"sampling_rate":16000})
             ids = np.asarray(inputs["input_ids"])
             mask = np.asarray(inputs["attention_mask"]) if "attention_mask" in inputs else np.ones(ids.shape)
             usage = {"text":0,"image":0,"audio":0,"video":0}
+            item_usage = []
             for row, row_mask, item in zip(ids, mask, items):
                 active = row[row_mask.astype(bool)]
                 image = int(np.sum(active == self.processor.image_token_id))
                 audio = int(np.sum(active == self.processor.audio_token_id))
                 video = int(np.sum(active == self.processor.video_token_id))
                 row_usage = processed_usage(item,active.size,image,audio,video)
+                item_usage.append(row_usage)
                 for kind, tokens in row_usage.items():
                     usage[kind] += tokens
-            vectors = self.model(**inputs).text_embeds.astype(self.mx.float32)
-            self.mx.eval(vectors)
-            vectors = np.asarray(vectors, dtype=np.float32)
-            if vectors.shape != (len(items),768) or not np.isfinite(vectors).all():
-                raise ValueError("invalid native output")
-            native_norms = np.linalg.norm(vectors, axis=1)
-            if not np.isfinite(native_norms).all() or not np.allclose(native_norms,1.0,rtol=0,atol=0.001):
-                raise ValueError("native output is not normalized")
-            dimensions = request.get("dimensions",768)
-            vectors = vectors[:,:dimensions]
-            norms = np.linalg.norm(vectors, axis=1, keepdims=True)
-            if not np.isfinite(norms).all() or (norms <= 0).any():
-                raise ValueError("invalid native norm")
-            vectors /= norms
-            return {"type":"result","request_id":request_id,"vectors":vectors.tolist(),"usage":usage}
+            try:
+                vectors = self.model(**inputs).text_embeds.astype(self.mx.float32)
+                self.mx.eval(vectors)
+                vectors = np.asarray(vectors,dtype=np.float32)
+            except Exception:
+                raise RuntimeError("embedding model execution failed") from None
+            vectors = normalize_native_output(vectors,len(items),request.get("dimensions",768),np)
+            return {"type":"result","request_id":request_id,"vectors":vectors.tolist(),"usage":usage,"item_usage":item_usage}
 
     def ready(self):
         if self._ready is None:
@@ -264,7 +346,7 @@ def main():
                         return 0
                     if len(frame)>MAX_FRAME or not frame.endswith(b"\n"):
                         return 2
-                    result = runtime.embed(json.loads(frame))
+                    result = dispatch_request(runtime,json.loads(frame))
                     encoded = json.dumps(result, allow_nan=False)
                     if len(encoded.encode()) > 1024*1024:
                         return 2

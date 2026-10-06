@@ -39,3 +39,21 @@ fn eg2_never_resolves_to_a_gguf_pooling_spec() {
     assert!(sgl_node::embed_catalog::embed_model_spec("embeddinggemma-2").is_none());
     assert!(sgl_node::embed_catalog::embed_model_spec("bge-base-en-v1.5").is_some());
 }
+
+#[test]
+fn eg2_rejects_empty_text_parts_without_changing_gguf_legacy_input() {
+    for text in ["", " \t\n"] {
+        assert!(
+            EmbeddingBatch::parse(&json!([{"content":[{"type":"text","text":text}]}]), true)
+                .is_err()
+        );
+        assert!(EmbeddingBatch::parse(&json!(text), true).is_err());
+        assert_eq!(
+            EmbeddingBatch::parse(&json!(text), false)
+                .unwrap()
+                .legacy_text()
+                .unwrap(),
+            vec![text]
+        );
+    }
+}

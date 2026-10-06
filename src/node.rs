@@ -1395,8 +1395,8 @@ pub async fn start(
                 let signature = keybind_sig.clone();
                 let current_load = rc.load_factor();
                 Arc::new(move || {
-                    let cap = eng.embedding_capabilities();
-                    let available = if cap.is_some() { models.clone() } else { vec![] };
+                    let snapshot=eng.embedding_snapshot(&models).expect("dedicated embedding engine");
+                    let (available,cap)=(snapshot.available_models,snapshot.capabilities);
                     serde_json::json!({"type":"heartbeat", "current_load":current_load,
                         "available_models":available, "capabilities":crate::orchestrator::eg2_capability_wire(cap),
                         "encryption_public_key":encryption_public_key,
@@ -1751,6 +1751,8 @@ pub async fn start(
                         );
                     }
                     Vec::new()
+                } else if eng.mode_label() == "embedding-worker" {
+                    Vec::new() // dedicated worker readiness has no transient grace period
                 } else {
                     models.clone() // tolerate one transient blip before pulling the model
                 }
@@ -1761,7 +1763,13 @@ pub async fn start(
         // Empty-suspect (canary running, just restarted, or parked): advertise nothing so the
         // orchestrator routes elsewhere. A zombie passes /health, so this is independent of it —
         // but the health supervision above still ran, so a dead quarantined engine self-heals.
-        let advertised: Vec<String> = if empty_quarantined {
+        let embedding_snapshot = engine.as_ref().and_then(|e| e.embedding_snapshot(&models));
+        let embedding_capabilities = embedding_snapshot
+            .as_ref()
+            .and_then(|s| s.capabilities.clone());
+        let advertised: Vec<String> = if let Some(snapshot) = embedding_snapshot {
+            snapshot.available_models
+        } else if empty_quarantined {
             Vec::new()
         } else {
             health_advertised
@@ -1796,7 +1804,7 @@ pub async fn start(
                 node_engine,
                 node_tools_capable,
                 heartbeat_telemetry,
-                engine.as_ref().and_then(|e| e.embedding_capabilities()),
+                embedding_capabilities,
             )
             .await
         {

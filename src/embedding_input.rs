@@ -114,7 +114,12 @@ impl EmbeddingBatch {
             let (mut images, mut audio, mut video, mut image_bytes) = (0, 0, 0, 0usize);
             for part in &item.content {
                 let (media, allowed, cap) = match part {
-                    Part::Text { .. } => continue,
+                    Part::Text { text } => {
+                        if text.trim().is_empty() {
+                            return Err("embedding text parts must not be empty".into());
+                        }
+                        continue;
+                    }
                     Part::Image { media } => {
                         images += 1;
                         (

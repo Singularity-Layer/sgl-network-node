@@ -35,11 +35,90 @@ class WorkerPolicy(unittest.TestCase):
         with self.assertRaises(ValueError):
             worker.processed_usage(text,8193,0,0,0)
         image = {"content":[{"type":"image"}]}
-        with self.assertRaises(ValueError):
+        with self.assertRaises(RuntimeError):
             worker.processed_usage(image,12,0,0,0)
-        with self.assertRaises(ValueError):
+        with self.assertRaises(RuntimeError):
             worker.processed_usage(image,300,281,0,0)
         self.assertEqual(worker.processed_usage(image,268,256,0,0),{"text":12,"image":256,"audio":0,"video":0})
+
+    def test_processor_accounting_failures_are_fatal_but_context_limit_is_input(self):
+        text={"content":[{"type":"text"}]}
+        for active,image,audio,video in ((12,0,1,0),(12,0,0,1),(12,-1,0,0)):
+            with self.assertRaises(RuntimeError):
+                worker.processed_usage(text,active,image,audio,video)
+        with self.assertRaises(ValueError):
+            worker.processed_usage(text,8193,0,0,0)
+        video={"content":[{"type":"video","duration_seconds":1}]}
+        with self.assertRaises(RuntimeError):
+            worker.processed_usage(video,153,0,0,141)
+        audio={"content":[{"type":"audio"}]}
+        self.assertEqual(worker.processed_usage(audio,37,0,25,0),{"text":12,"image":0,"audio":25,"video":0})
+
+    def test_text_preflight_uses_utf8_prefix_and_template_bytes(self):
+        item = lambda text: [{"content":[{"type":"text","text":text}]}]
+        for input_type, prefix in worker.PREFIXES.items():
+            allowed = 8192 - 12 - len(prefix.encode("utf-8"))
+            worker.validate_text_budget(item("x"*allowed),input_type)
+            with self.assertRaises(ValueError):
+                worker.validate_text_budget(item("x"*(allowed+1)),input_type)
+        worker.validate_text_budget(item("é"*4090),"unspecified")
+        with self.assertRaises(ValueError):
+            worker.validate_text_budget(item("é"*4091),"unspecified")
+        for text in ("", " \t", "x"*1_000_000):
+            with self.assertRaises(ValueError):
+                worker.validate_text_budget(item(text),"unspecified")
+
+    def test_large_text_fails_before_processor_or_media_work(self):
+        runtime = object.__new__(worker.Runtime)
+        runtime._conversations = lambda *args: self.fail("media preprocessing called")
+        runtime.processor = SimpleNamespace(apply_chat_template=lambda *a,**kw:self.fail("tokenizer called"))
+        request = {"type":"embed","protocol":worker.PROTOCOL,"request_id":1,"input_type":"query","input":[{"content":[{"type":"text","text":"x"*1_000_000}]}]}
+        with self.assertRaises(ValueError):
+            runtime.embed(request)
+
+    def test_native_shape_finiteness_and_norm_failures_are_runtime_errors(self):
+        class Predicate:
+            def __init__(self,value): self.value=value
+            def all(self): return self.value
+            def any(self): return self.value
+        class Norm:
+            def __init__(self,value): self.value=value; self.finite=__import__('math').isfinite(value)
+            def __le__(self,value): return Predicate(self.value<=value)
+        class Vectors:
+            def __init__(self,shape=(1,768),finite=True,native_norm=1.0,truncated_norm=1.0):
+                self.shape=shape; self.finite=finite; self.native_norm=native_norm; self.truncated_norm=truncated_norm
+            def __getitem__(self,key):
+                result=Vectors((self.shape[0],key[1].stop),self.finite,self.native_norm,self.truncated_norm)
+                return result
+            def __itruediv__(self,other): return self
+        np = SimpleNamespace(isfinite=lambda value:Predicate(value.finite),allclose=lambda norm,target,**kw:abs(norm.value-target)<=kw['atol'],linalg=SimpleNamespace(norm=lambda vector,axis,keepdims=False:Norm(vector.truncated_norm if keepdims else vector.native_norm)))
+        for vectors in (Vectors(shape=(1,767)),Vectors(finite=False),Vectors(native_norm=0.5),Vectors(truncated_norm=0),Vectors(truncated_norm=float('inf'))):
+            with self.assertRaises(RuntimeError):
+                worker.normalize_native_output(vectors,1,128,np)
+        self.assertEqual(worker.normalize_native_output(Vectors(),1,128,np).shape,(1,128))
+
+    def test_expected_input_errors_do_not_terminate_protocol(self):
+        class InvalidInput:
+            def embed(self,request): raise ValueError("private invalid input")
+        for request_id in range(5):
+            request={"type":"embed","protocol":worker.PROTOCOL,"request_id":request_id}
+            self.assertEqual(worker.dispatch_request(InvalidInput(),request),{"type":"request_error","request_id":request_id,"code":"invalid_input"})
+        class BrokenRuntime:
+            def embed(self,request): raise RuntimeError("native failure")
+        with self.assertRaises(RuntimeError):
+            worker.dispatch_request(BrokenRuntime(),request)
+        with self.assertRaises(RuntimeError):
+            worker.dispatch_request(InvalidInput(),{"type":"embed","protocol":"corrupt","request_id":1})
+
+    def test_mp4_brand_whitelist_refuses_mov_heif_and_3gp(self):
+        def container(major,compatible):
+            size=16+4*len(compatible)
+            return size.to_bytes(4,'big')+b'ftyp'+major+b'\x00'*4+b''.join(compatible)
+        worker.validate_mp4_container(container(b'isom',[b'iso2',b'avc1',b'mp41']))
+        worker.validate_mp4_container((Path(__file__).resolve().parents[1]/'assets/embeddinggemma2/smoke/video.mp4').read_bytes())
+        for raw in (container(b'qt  ',[b'isom']),container(b'heic',[b'isom']),container(b'3gp6',[b'isom']),container(b'isom',[b'qt  ']),b'\x00'*4+b'ftyp'+b'isom'+b'\x00'*4):
+            with self.assertRaises(ValueError):
+                worker.validate_mp4_container(raw)
 
     def test_parameters_reject_float16_and_empty_models(self):
         mx = SimpleNamespace(bfloat16='bf16',float32='fp32')
