@@ -142,6 +142,8 @@ struct HeartbeatRequest {
 
 #[derive(Serialize)]
 struct NodeCapabilities {
+    #[serde(flatten, skip_serializing_if = "Option::is_none")]
+    embedding: Option<crate::eg2::Capabilities>,
     streaming: bool,
     // This build forwards `tools` on the STREAM path and emits tool-call deltas. A routing
     // hint only — correctness comes from the per-chunk `fmt` tag, so a stale value here can
@@ -168,6 +170,25 @@ struct NodeCapabilities {
     // avoid routing confidential traffic onto the exposed path — it has no other way to know.
     #[serde(skip_serializing_if = "Option::is_none")]
     engine: Option<String>,
+}
+
+fn eg2_capabilities(embedding: Option<crate::eg2::Capabilities>) -> NodeCapabilities {
+    let ready = embedding.is_some();
+    NodeCapabilities {
+        embedding,
+        streaming: false,
+        streaming_tools: false,
+        context_size: 8192,
+        kind: ready.then(|| "embedding".into()),
+        dim: ready.then_some(768),
+        vision: None,
+        engine: Some("embedding-worker".into()),
+    }
+}
+
+/// Both heartbeat transports use one manifest and remove it immediately on worker death.
+pub fn eg2_capability_wire(embedding: Option<crate::eg2::Capabilities>) -> serde_json::Value {
+    serde_json::to_value(eg2_capabilities(embedding)).expect("finite capability manifest")
 }
 
 #[derive(Deserialize)]
@@ -266,8 +287,8 @@ impl OrchestratorClient {
     /// Read a response body with a hard byte cap, streaming chunk-by-chunk so an
     /// unbounded/chunked (no Content-Length) hostile response can't exhaust memory.
     async fn read_body_capped(mut resp: reqwest::Response) -> Result<Vec<u8>, String> {
-        const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024; // 8 MiB
-                                                           // Reject early if the advertised length is already too large.
+        const MAX_RESPONSE_BYTES: usize = 36 * 1024 * 1024; // 24 MiB clear input plus sealed base64 overhead
+                                                            // Reject early if the advertised length is already too large.
         if let Some(len) = resp.content_length() {
             if len as usize > MAX_RESPONSE_BYTES {
                 return Err(format!("orchestrator response too large ({len} bytes)"));
@@ -421,6 +442,7 @@ impl OrchestratorClient {
         tools_capable: bool,
         // Additive routing telemetry; None (kill switch) omits the key entirely.
         telemetry: Option<crate::telemetry::HeartbeatTelemetry>,
+        embedding: Option<crate::eg2::Capabilities>,
     ) -> Result<HeartbeatResponse, String> {
         let url = format!("{}/grid/nodes/heartbeat", self.base_url);
         let token = self.get_token()?;
@@ -431,19 +453,24 @@ impl OrchestratorClient {
             encryption_public_key: encryption_public_key.map(|s| s.to_string()),
             encryption_public_key_signature: encryption_public_key_signature.map(|s| s.to_string()),
             key_version,
-            capabilities: NodeCapabilities {
-                streaming,
-                // Honest capability, passed in by the caller from the ENGINE'S OWN answer.
-                // It was briefly hardcoded false for in-process (which then could not do tool
-                // calls at all); in-process now can, and leaving that stale would starve those
-                // nodes of every tool request. It was hardcoded TRUE before that, which routed
-                // tool jobs to nodes that failed them. Neither hardcoding survives contact.
-                streaming_tools: tools_capable,
-                context_size,
-                kind: kind.map(|s| s.to_string()),
-                dim,
-                vision,
-                engine: engine.map(|s| s.to_string()),
+            capabilities: if engine == Some("embedding-worker") {
+                eg2_capabilities(embedding)
+            } else {
+                NodeCapabilities {
+                    embedding,
+                    streaming,
+                    // Honest capability, passed in by the caller from the ENGINE'S OWN answer.
+                    // It was briefly hardcoded false for in-process (which then could not do tool
+                    // calls at all); in-process now can, and leaving that stale would starve those
+                    // nodes of every tool request. It was hardcoded TRUE before that, which routed
+                    // tool jobs to nodes that failed them. Neither hardcoding survives contact.
+                    streaming_tools: tools_capable,
+                    context_size,
+                    kind: kind.map(|s| s.to_string()),
+                    dim,
+                    vision,
+                    engine: engine.map(|s| s.to_string()),
+                }
             },
             active_job_ids,
             binary_hash,
@@ -836,6 +863,7 @@ mod heartbeat_wire_tests {
             encryption_public_key_signature: None,
             key_version: None,
             capabilities: NodeCapabilities {
+                embedding: None,
                 streaming: true,
                 streaming_tools: true,
                 context_size: 4096,
@@ -893,5 +921,51 @@ mod heartbeat_wire_tests {
         let mut stripped = with.clone();
         stripped.as_object_mut().unwrap().remove("telemetry");
         assert_eq!(stripped, without);
+    }
+}
+
+#[cfg(test)]
+mod embedding_capability_tests {
+    use super::*;
+    #[test]
+    fn both_transports_use_one_manifest_and_remove_worker_capabilities_on_death() {
+        let cap = crate::eg2::Capabilities {
+            embedding_dim: 768,
+            embedding_ready: true,
+            input_envelope_encodings: vec!["base64".into()],
+            embedding_protocol: crate::eg2::PROTOCOL.into(),
+            embedding_modalities: vec![
+                "text".into(),
+                "image".into(),
+                "audio".into(),
+                "video".into(),
+            ],
+            embedding_dimensions: crate::eg2::DIMENSIONS.to_vec(),
+            embedding_runtime: "mlx-vlm".into(),
+            processor_revision: crate::eg2::MLX_VLM_REVISION.into(),
+            media_transport: vec!["inline-base64".into()],
+        };
+        assert_eq!(
+            eg2_capability_wire(Some(cap.clone())),
+            serde_json::to_value(eg2_capabilities(Some(cap))).unwrap()
+        );
+        let dead = eg2_capability_wire(None);
+        for key in [
+            "embedding_dim",
+            "embedding_ready",
+            "embedding_protocol",
+            "embedding_modalities",
+            "embedding_dimensions",
+            "embedding_runtime",
+            "processor_revision",
+            "media_transport",
+            "input_envelope_encodings",
+            "kind",
+            "dim",
+        ] {
+            assert!(dead.get(key).is_none(), "stale field {key}");
+        }
+        assert_eq!(dead["streaming"], false);
+        assert!(dead.get("vision").is_none());
     }
 }

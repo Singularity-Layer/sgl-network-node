@@ -1065,6 +1065,7 @@ pub async fn start(
     orchestrator_url: &str,
     model_path: Option<&str>,
     model_name: Option<&str>,
+    embedding_python: Option<&str>,
     systemone_sidecar_url: Option<&str>,
     mmproj_path: Option<&str>,
     image_max_tokens: Option<u32>,
@@ -1212,6 +1213,9 @@ pub async fn start(
                 rc.max_jobs,
             ),
         };
+        if crate::embed_catalog::is_multimodal_embedding_model(&name) {
+            effective_slots = 1;
+        }
         wedge_ms = wedge_timeout_ms(&model_pb);
         // llama-server divides its total `-c` across slots, so pass slots × context_size
         // to keep each slot at the operator's configured per-request context.
@@ -1225,6 +1229,7 @@ pub async fn start(
             rc.context_size
         );
         let eng_config = InferenceEngineConfig {
+            embedding_python: embedding_python.map(PathBuf::from),
             model_path: model_pb,
             model_name: name.clone(),
             port: inference_port,
@@ -1382,12 +1387,30 @@ pub async fn start(
         let st = Arc::clone(&ws_state);
         let cfg_tok = cfg.clone();
         let config_dir_buf = config_dir.to_path_buf();
+        let embedding_heartbeat: Option<Arc<dyn Fn() -> serde_json::Value + Send + Sync>> =
+            engine.as_ref().filter(|e| e.mode_label() == "embedding-worker").map(|eng| {
+                let eng = eng.clone();
+                let models = models.clone();
+                let encryption_public_key = node_enc_pubkey.clone();
+                let signature = keybind_sig.clone();
+                let current_load = rc.load_factor();
+                Arc::new(move || {
+                    let cap = eng.embedding_capabilities();
+                    let available = if cap.is_some() { models.clone() } else { vec![] };
+                    serde_json::json!({"type":"heartbeat", "current_load":current_load,
+                        "available_models":available, "capabilities":crate::orchestrator::eg2_capability_wire(cap),
+                        "encryption_public_key":encryption_public_key,
+                        "encryption_public_key_signature":signature, "key_version":key_version_opt,
+                        "max_concurrent_jobs":1})
+                }) as Arc<dyn Fn() -> serde_json::Value + Send + Sync>
+            });
         tokio::spawn(async move {
             crate::ws::run(
                 base,
                 node_id,
                 client_ws,
                 st,
+                embedding_heartbeat,
                 move |job| {
                     maybe_spawn_job(
                         job,
@@ -1773,6 +1796,7 @@ pub async fn start(
                 node_engine,
                 node_tools_capable,
                 heartbeat_telemetry,
+                engine.as_ref().and_then(|e| e.embedding_capabilities()),
             )
             .await
         {
@@ -2049,6 +2073,45 @@ async fn process_job(
                     .fail_job(&job.id, &format!("decrypt failed: {e}"))
                     .await;
                 return;
+            }
+        }
+    }
+
+    // Structured media must use the negotiated sealed base64 envelope, with protocol
+    // authenticated inside the JSON. A relay cannot downgrade it to plaintext/base58.
+    if job.job_type == "embedding"
+        && job
+            .model
+            .as_deref()
+            .map(crate::embed_catalog::is_multimodal_embedding_model)
+            .unwrap_or(false)
+    {
+        if let Some(input) = effective_job
+            .input_payload
+            .as_ref()
+            .and_then(|p| p.get("input"))
+        {
+            let parsed = crate::embedding_input::EmbeddingBatch::parse(input, true);
+            if let Ok(batch) = parsed {
+                if batch.modalities().iter().any(|m| *m != "text")
+                    && (response_pubkey.is_none()
+                        || enc_version != crate::encryption::EncVersion::V2
+                        || job
+                            .input_payload
+                            .as_ref()
+                            .and_then(|p| p.get("enc"))
+                            .and_then(|e| e.get("embedding_protocol"))
+                            .and_then(|v| v.as_str())
+                            != Some(crate::eg2::PROTOCOL))
+                {
+                    let _ = client
+                        .fail_job(
+                            &job.id,
+                            "multimodal embedding requires negotiated sealed base64 input",
+                        )
+                        .await;
+                    return;
+                }
             }
         }
     }
@@ -2533,25 +2596,23 @@ async fn execute_embedding(
             .as_ref()
             .ok_or("Job has no input payload")?;
 
-        // `input`: string | string[] (OpenAI shape). Reject anything else.
-        let inputs: Vec<String> = match payload.get("input") {
-            Some(serde_json::Value::String(s)) => vec![s.clone()],
-            Some(serde_json::Value::Array(a)) => {
-                let mut v = Vec::with_capacity(a.len());
-                for item in a {
-                    let s = item
-                        .as_str()
-                        .ok_or("'input' array must contain only strings")?;
-                    v.push(s.to_string());
-                }
-                v
-            }
-            _ => return Err("'input' must be a string or an array of strings".to_string()),
-        };
-        if inputs.is_empty() {
-            return Err("'input' must not be empty".to_string());
-        }
+        let multimodal = job
+            .model
+            .as_deref()
+            .map(crate::embed_catalog::is_multimodal_embedding_model)
+            .unwrap_or(false);
+        let inputs = crate::embedding_input::EmbeddingBatch::parse(
+            payload.get("input").ok_or("missing embedding input")?,
+            multimodal,
+        )?;
 
+        if multimodal {
+            if let Some(value) = payload.get("input_type") {
+                if !matches!(value.as_str(), Some("query" | "document" | "unspecified")) {
+                    return Err("invalid multimodal embedding input_type".into());
+                }
+            }
+        }
         let input_type = match payload.get("input_type").and_then(|v| v.as_str()) {
             Some("query") => crate::embed_catalog::InputType::Query,
             Some("document") => crate::embed_catalog::InputType::Document,
@@ -2567,7 +2628,22 @@ async fn execute_embedding(
             },
         };
 
-        let out = engine.embed(inputs, input_type, dimensions).await?;
+        if multimodal {
+            let out = engine
+                .embed_multimodal(inputs, input_type, dimensions)
+                .await?;
+            let total = out.usage.total()?;
+            return Ok(serde_json::json!({
+                "object": "list", "model": crate::eg2::MODEL_ID,
+                "data": out.vectors.iter().enumerate().map(|(i, v)| serde_json::json!({"object":"embedding", "index":i, "embedding":v})).collect::<Vec<_>>(),
+                "usage": {"prompt_tokens":total, "total_tokens":total, "breakdown":out.usage},
+                "processor_revision": crate::eg2::MLX_VLM_REVISION,
+                "embedding_protocol": crate::eg2::PROTOCOL,
+            }));
+        }
+        let out = engine
+            .embed(inputs.legacy_text()?, input_type, dimensions)
+            .await?;
 
         let data: Vec<serde_json::Value> = out
             .vectors
