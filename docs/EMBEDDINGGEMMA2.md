@@ -79,7 +79,9 @@ input errors use a bounded `request_error` frame and return the safe node reason
 failures return `embedding_runtime_failed` and remove readiness. Native output
 errors raise Python `RuntimeError`. Only our explicit input/media checks raise
 `InputValidationError`, which produces a nonfatal request-error frame. An
-unclassified library `ValueError` remains a fatal runtime failure.
+unclassified processor or model `ValueError` remains a fatal runtime failure.
+Known video-decoder errors at the explicit media-validation boundary instead
+report corrupt input and preserve readiness.
 Restarts
 repeat startup checks and have a lifetime budget of three attempts.
 

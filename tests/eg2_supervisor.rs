@@ -39,7 +39,7 @@ async fn validates_ready_round_trip_and_mrl() {
 
 #[tokio::test]
 async fn eof_timeout_and_wrong_id_remove_capabilities() {
-    for body in ["time.sleep(0.03); sys.exit(0)", "time.sleep(5)", "for line in sys.stdin:\n print(json.dumps({'type':'result','request_id':999,'vectors':[[1.0/(768**0.5)]*768],'usage':{'text':1,'image':0,'audio':0,'video':0},'item_usage':[{'text':1,'image':0,'audio':0,'video':0}]}),flush=True)"] {
+    for body in ["sys.stdin.readline(); sys.exit(0)", "time.sleep(5)", "for line in sys.stdin:\n print(json.dumps({'type':'result','request_id':999,'vectors':[[1.0/(768**0.5)]*768],'usage':{'text':1,'image':0,'audio':0,'video':0},'item_usage':[{'text':1,'image':0,'audio':0,'video':0}]}),flush=True)"] {
         let engine = Eg2Engine::start(worker(body)).await.unwrap();
         let batch = EmbeddingBatch::parse(&json!("hello"), true).unwrap();
         assert!(engine.embed(batch, sgl_node::embed_catalog::InputType::Unspecified, None).await.is_err());
@@ -110,7 +110,7 @@ async fn bounded_pipe_write_timeout_and_cancellation_reap_worker() {
 #[tokio::test]
 async fn closed_stdout_and_oversized_frames_cannot_keep_ready() {
     for source in [
-        "import os\ntime.sleep(0.03)\nos.close(1)\ntime.sleep(5)",
+        "import os\nsys.stdin.readline()\nos.close(1)\ntime.sleep(5)",
         "for line in sys.stdin:\n print('x'*(1024*1024+1),flush=True)",
     ] {
         let engine = Eg2Engine::start(worker(source)).await.unwrap();
@@ -228,6 +228,22 @@ async fn production_factory_real_canary() {
             engine
                 .embed(
                     EmbeddingBatch::parse(&bad_png, true).unwrap(),
+                    sgl_node::embed_catalog::InputType::Unspecified,
+                    None
+                )
+                .await
+                .err()
+                .unwrap(),
+            "embedding_input_invalid"
+        );
+        assert!(engine.capabilities().is_some());
+    }
+    let bad_mp4 = json!([{"content":[{"type":"video","duration_seconds":1,"media":media("video/mp4",b"\x00\x00\x00\x18ftypisom\x00\x00\x00\x00isomiso2")}]}]);
+    for _ in 0..5 {
+        assert_eq!(
+            engine
+                .embed(
+                    EmbeddingBatch::parse(&bad_mp4, true).unwrap(),
                     sgl_node::embed_catalog::InputType::Unspecified,
                     None
                 )
