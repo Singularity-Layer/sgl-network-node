@@ -1,5 +1,80 @@
-use sgl_node::inprocess::{InProcessConfig, InProcessEngine};
 use sgl_node::inference::ChatMessage;
+use sgl_node::inprocess::{InProcessConfig, InProcessEngine};
+use sgl_node::toolcall::{parse_complete, ToolFormat};
+
+fn is_structured_weather_call(content: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(content) else {
+        return false;
+    };
+    let Some(function) = value.get("function") else {
+        return false;
+    };
+    function.get("name").and_then(|value| value.as_str()) == Some("get_weather")
+        && function
+            .get("parameters")
+            .and_then(|value| value.get("city"))
+            .and_then(|value| value.as_str())
+            == Some("Paris")
+}
+
+fn tool_parser_fixture_passes() -> bool {
+    let parsed = parse_complete(
+        ToolFormat::Llama3Json,
+        r#"{"name":"get_weather","parameters":{"city":"Paris"}}"#,
+        &["get_weather".into()],
+        "windows-probe",
+    );
+    let Some(call) = parsed
+        .tool_calls
+        .as_ref()
+        .and_then(|calls| calls.as_array())
+        .and_then(|calls| calls.first())
+    else {
+        return false;
+    };
+    let Some(arguments) = call
+        .get("function")
+        .and_then(|function| function.get("arguments"))
+        .and_then(|arguments| arguments.as_str())
+    else {
+        return false;
+    };
+    call.get("function")
+        .and_then(|function| function.get("name"))
+        .and_then(|name| name.as_str())
+        == Some("get_weather")
+        && serde_json::from_str::<serde_json::Value>(arguments)
+            .ok()
+            .and_then(|value| value.get("city").cloned())
+            .and_then(|value| value.as_str().map(str::to_owned))
+            .as_deref()
+            == Some("Paris")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_structured_weather_call, tool_parser_fixture_passes};
+
+    #[test]
+    fn structured_fallback_requires_exact_function_and_argument() {
+        assert!(is_structured_weather_call(
+            r#"{"function":{"name":"get_weather","parameters":{"city":"Paris"}}}"#
+        ));
+        for rejected in [
+            "not json",
+            r#"{"function":{"name":"get_weather","parameters":{}}}"#,
+            r#"{"function":{"name":"other","parameters":{"city":"Paris"}}}"#,
+            r#"{"name":"get_weather","parameters":{"city":"Paris"}}"#,
+        ] {
+            assert!(!is_structured_weather_call(rejected));
+        }
+    }
+
+    #[test]
+    fn deterministic_tool_parser_fixture_passes() {
+        assert!(tool_parser_fixture_passes());
+    }
+}
 
 #[tokio::main]
 async fn main() {
@@ -7,23 +82,52 @@ async fn main() {
     let e = InProcessEngine::start(InProcessConfig {
         model_path: path.clone().into(),
         model_name: "llama-3.2-3b".into(),
-        n_ctx: 8192, n_gpu_layers: 999, max_slots: 1, per_slot_ctx: 8192,
-        mmproj_path: None, image_max_tokens: None,
-    }).await.expect("engine start");
+        n_ctx: 8192,
+        n_gpu_layers: 999,
+        max_slots: 1,
+        per_slot_ctx: 8192,
+        mmproj_path: None,
+        image_max_tokens: None,
+    })
+    .await
+    .expect("engine start");
     println!("tool_format detected: {:?}", e.tool_format());
     let tools = serde_json::json!([{
         "type":"function",
         "function":{"name":"get_weather","description":"Get the weather for a city",
             "parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}
     }]);
-    let msgs = vec![ChatMessage{ role:"user".into(), content:"What is the weather in Paris? Use the tool.".into() }];
-    let out = e.chat_completion(&msgs, Vec::new(), Some(tools), vec!["get_weather".into()], 80, 0.0)
-        .await.expect("completion");
+    let msgs = vec![ChatMessage {
+        role: "user".into(),
+        content: "What is the weather in Paris? Use the tool.".into(),
+    }];
+    let out = e
+        .chat_completion(
+            &msgs,
+            Vec::new(),
+            Some(tools),
+            vec!["get_weather".into()],
+            80,
+            0.0,
+        )
+        .await
+        .expect("completion");
     println!("finish_reason : {:?}", out.finish_reason);
-    println!("tool_calls    : {}", serde_json::to_string(&out.tool_calls).unwrap());
+    println!(
+        "tool_calls    : {}",
+        serde_json::to_string(&out.tool_calls).unwrap()
+    );
     println!("content       : {:?}", out.content);
     println!("content_len   : {}", out.content.len());
-    println!("tokens        : {} prompt / {} completion", out.prompt_tokens, out.completion_tokens);
+    println!(
+        "structured call: {}",
+        is_structured_weather_call(&out.content)
+    );
+    println!("parser fixture : {}", tool_parser_fixture_passes());
+    println!(
+        "tokens        : {} prompt / {} completion",
+        out.prompt_tokens, out.completion_tokens
+    );
 
     // ---- streaming ----
     println!("\n--- streaming ---");
@@ -33,25 +137,40 @@ async fn main() {
             "parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}
     }]);
     let (tx, mut rx) = tokio::sync::mpsc::channel(64);
-    let msgs2 = vec![ChatMessage{ role:"user".into(), content:"What is the weather in Paris? Use the tool.".into() }];
+    let msgs2 = vec![ChatMessage {
+        role: "user".into(),
+        content: "What is the weather in Paris? Use the tool.".into(),
+    }];
     let h = tokio::spawn(async move {
         let mut text = String::new();
         let mut calls = Vec::new();
         let mut usage = None;
         while let Some(ev) = rx.recv().await {
             match ev {
-                sgl_node::inference::StreamEvent::Delta{text:t,..} => text.push_str(&t),
-                sgl_node::inference::StreamEvent::ToolCalls{delta} => calls.push(delta),
-                sgl_node::inference::StreamEvent::Done{prompt_tokens,completion_tokens} =>
-                    usage = Some((prompt_tokens,completion_tokens)),
+                sgl_node::inference::StreamEvent::Delta { text: t, .. } => text.push_str(&t),
+                sgl_node::inference::StreamEvent::ToolCalls { delta } => calls.push(delta),
+                sgl_node::inference::StreamEvent::Done {
+                    prompt_tokens,
+                    completion_tokens,
+                } => usage = Some((prompt_tokens, completion_tokens)),
             }
         }
         (text, calls, usage)
     });
-    e.chat_completion_stream(&msgs2, Vec::new(), Some(tools2), vec!["get_weather".into()], 80, 0.0, tx)
-        .await.expect("stream");
+    e.chat_completion_stream(
+        &msgs2,
+        Vec::new(),
+        Some(tools2),
+        vec!["get_weather".into()],
+        80,
+        0.0,
+        tx,
+    )
+    .await
+    .expect("stream");
     let (text, calls, usage) = h.await.unwrap();
     println!("stream text   : {text:?}");
     println!("stream calls  : {}", serde_json::to_string(&calls).unwrap());
     println!("stream usage  : {usage:?}");
+    println!("stream matches: {}", text == out.content);
 }
