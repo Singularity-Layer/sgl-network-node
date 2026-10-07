@@ -1,8 +1,19 @@
 $ErrorActionPreference = "Stop"
 
-$url = "https://huggingface.co/bartowski/Llama-3.2-1B-Instruct-GGUF/resolve/main/Llama-3.2-1B-Instruct-Q4_K_M.gguf"
+$modelRevision = "067b946cf014b7c697f3654f621d577a3e3afd1c"
+$modelSha256 = "6f85a640a97cf2bf5b8e764087b1e83da0fdb51d7c9fab7d0fece9385611df83"
+$modelSize = 807694464
+$url = "https://huggingface.co/bartowski/Llama-3.2-1B-Instruct-GGUF/resolve/$modelRevision/Llama-3.2-1B-Instruct-Q4_K_M.gguf"
 if (-not (Test-Path "model.gguf")) {
   Invoke-WebRequest -Uri $url -OutFile model.gguf -UseBasicParsing
+}
+$actualSize = (Get-Item "model.gguf").Length
+if ($actualSize -ne $modelSize) {
+  throw "Windows probe model size mismatch: expected $modelSize, got $actualSize"
+}
+$actualSha256 = (Get-FileHash -Algorithm SHA256 "model.gguf").Hash.ToLowerInvariant()
+if ($actualSha256 -ne $modelSha256) {
+  throw "Windows probe model SHA-256 mismatch: expected $modelSha256, got $actualSha256"
 }
 
 $probe = "target/x86_64-pc-windows-msvc/release/examples/tool_probe.exe"
