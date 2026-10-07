@@ -1,10 +1,12 @@
 # Release pipeline — builds official binaries on GitHub's own runners.
 #
 # Trigger: push a version tag (v1.2.0, v1.3.0, …).
-# Output: ONE GitHub PRERELEASE with one binary + .sha256 per platform:
+# Output: ONE DRAFT GitHub release with one binary + .sha256 per platform:
 #   sgl-darwin-arm64        (macOS Apple Silicon)
 #   sgl-linux-x86_64        (Linux x86_64 — Intel TDX / AMD SEV hosts)
 #   sgl-linux-arm64         (Linux arm64)
+#   sgl-linux-x86_64-gpu    (Linux x86_64 — Vulkan)
+#   sgl-linux-arm64-gpu     (Linux arm64 — Vulkan)
 #   sgl-windows-x86_64.exe  (Windows x64 — non-confidential node)
 #
 # Why CI builds: binaries are produced from the public source on GitHub's
@@ -12,12 +14,10 @@
 # release, each new sha256 must be appended to the orchestrator's
 # ALLOWED_NODE_BINARY_HASHES (add-before-remove) or the build cannot serve.
 #
-# PRIVATE REPO, NORMAL RELEASE: assets are not anonymously downloadable while the
-# repo remains private, but `sgl update` uses GitHub's `/releases/latest` endpoint,
-# which ignores prereleases. Nothing reaches the public download endpoint
-# (cloud.x402compute.cc/downloads/node/) until the owner syncs manually. The
-# Windows binary additionally does nothing until the owner allowlists its sha256 —
-# see WINDOWS.md / RELEASING.md.
+# STAGED RELEASE: a tag creates a draft whose artifacts can be attested, tested,
+# and added to the orchestrator allowlist while v1.9.16 remains the latest release.
+# Publishing the draft is a separate owner action after the add-before-remove
+# allowlist is live. Nothing reaches cloud.x402compute.cc until a later manual sync.
 
 name: release
 
@@ -220,32 +220,74 @@ jobs:
           if-no-files-found: error
 
   release:
-    name: publish release
+    name: stage draft release
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     needs: [build, build-windows]
     runs-on: ubuntu-24.04
     steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
       - uses: actions/download-artifact@v4
         with:
           merge-multiple: true
 
-      - name: Show checksums (paste these into the allowlist)
-        run: cat ./*.sha256
+      - name: Verify canonical tag and package version
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          expected="v$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)"
+          test "$TAG" = "$expected" || {
+            echo "tag $TAG does not match Cargo package version $expected" >&2
+            exit 1
+          }
+          git fetch origin main --no-tags
+          test "$GITHUB_SHA" = "$(git rev-parse origin/main)" || {
+            echo "release tag must point at the exact origin/main commit" >&2
+            exit 1
+          }
+
+      - name: Verify complete artifact set and show allowlist hashes
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          for asset in \
+            sgl-darwin-arm64 \
+            sgl-linux-x86_64 \
+            sgl-linux-arm64 \
+            sgl-linux-x86_64-gpu \
+            sgl-linux-arm64-gpu \
+            sgl-windows-x86_64.exe
+          do
+            test -s "$asset"
+            test -s "$asset.sha256"
+            sha256sum --check "$asset.sha256"
+          done
+          cat ./*.sha256 | sort -k2 > "sgl-node-${TAG}.sha256"
+          cat "sgl-node-${TAG}.sha256"
 
       - name: Attest release artifacts
         uses: actions/attest@v4.2.2
         with:
           subject-path: sgl-*
 
-      - name: Create prerelease with assets
+      - name: Create staged draft with assets
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ github.ref_name }}
           REPO: ${{ github.repository }}
         run: |
+          if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+            echo "release $TAG already exists; refusing to replace staged artifacts" >&2
+            exit 1
+          fi
           gh release create "$TAG" \
             --repo "$REPO" \
             --title "sgl-node $TAG" \
             --generate-notes \
+            --verify-tag \
+            --draft \
             sgl-*
           # Globbed on purpose. This list used to be hardcoded, and when the Linux GPU
           # artifacts were added they BUILT green and were then silently dropped from the

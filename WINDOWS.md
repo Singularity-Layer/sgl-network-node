@@ -101,9 +101,8 @@ foreground node path works. None of them block running a node in the foreground.
 
 On a `v*` tag, `.github/workflows/release.yml` now builds Windows too (its
 `build-windows` job, MSVC + NASM) and attaches **`sgl-windows-x86_64.exe`** +
-**`sgl-windows-x86_64.exe.sha256`** to the **same GitHub prerelease** as the
-macOS/Linux binaries. The release is a **`--prerelease`** and this repo is
-**private**, so the binary is not anonymously downloadable and no Windows node can
+**`sgl-windows-x86_64.exe.sha256`** to the **same draft GitHub release** as the
+macOS/Linux binaries. The draft does not become `/releases/latest`, so no Windows node can
 serve until the owner does BOTH of these:
 
 1. **Sync** `sgl-windows-x86_64.exe` (rename to your download convention) to the
@@ -128,7 +127,8 @@ serve until the owner does BOTH of these:
      the orchestrator (`sgl-network-orchestrator` Cloudflare Worker env / secret).
      Do NOT remove old hashes until every node is on the new build.
 
-Nothing above is automated. The tag build only produces the private prerelease.
+Nothing above is automated. The tag build only produces the draft. Publish that
+same immutable draft after the add-before-remove allowlist is live.
 
 ## Fetching the build-only CI artifact
 
