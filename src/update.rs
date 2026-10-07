@@ -21,15 +21,55 @@ use std::path::PathBuf;
 const REPO: &str = "Singularity-Layer/sgl-network-node";
 const USER_AGENT: &str = concat!("sgl-node/", env!("CARGO_PKG_VERSION"));
 
+/// Can this machine actually RUN the Vulkan (GPU) build?
+///
+/// Deliberately conservative, because getting it wrong is not a slowdown - it is a node that
+/// will not start. The GPU asset hard-links libvulkan.so.1, so picking it on a host without
+/// the Vulkan runtime produces "error while loading shared libraries" and the node is dead.
+/// We therefore require BOTH the loader library and a real GPU device node, and fall back to
+/// the CPU build on any doubt. `SGL_GPU=0|1` overrides for operators who know better.
+#[cfg(target_os = "linux")]
+fn linux_gpu_capable() -> bool {
+    match std::env::var("SGL_GPU").ok().as_deref() {
+        Some("1") | Some("true") => return true,
+        Some("0") | Some("false") => return false,
+        _ => {}
+    }
+    let have_loader = [
+        "/usr/lib/x86_64-linux-gnu/libvulkan.so.1",
+        "/usr/lib/aarch64-linux-gnu/libvulkan.so.1",
+        "/usr/lib64/libvulkan.so.1",
+        "/usr/lib/libvulkan.so.1",
+    ]
+    .iter()
+    .any(|p| std::path::Path::new(p).exists());
+    // A render node (or an NVIDIA device) means there is actually something to accelerate on.
+    let have_device = std::path::Path::new("/dev/dri").exists()
+        || std::path::Path::new("/dev/nvidiactl").exists();
+    have_loader && have_device
+}
+
 /// Release asset for the running platform. Must match the names produced by
 /// .github/workflows/release.yml.
+///
+/// Linux ships TWO builds per arch: the plain asset (CPU, runs anywhere) and `-gpu` (Vulkan,
+/// needs the Vulkan runtime). We pick by detection rather than shipping one binary, because a
+/// Vulkan-linked binary cannot start at all on a CPU-only host.
 fn platform_asset() -> Result<&'static str, String> {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     return Ok("sgl-darwin-arm64");
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-    return Ok("sgl-linux-x86_64");
+    return Ok(if linux_gpu_capable() {
+        "sgl-linux-x86_64-gpu"
+    } else {
+        "sgl-linux-x86_64"
+    });
     #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
-    return Ok("sgl-linux-arm64");
+    return Ok(if linux_gpu_capable() {
+        "sgl-linux-arm64-gpu"
+    } else {
+        "sgl-linux-arm64"
+    });
     // Windows self-update is intentionally not supported: an .exe can't be renamed
     // over while it's running, and the release pipeline doesn't publish a Windows
     // asset on the allowlist yet. Update via the installer / desktop shell instead.
@@ -61,7 +101,8 @@ fn sha256_hex(bytes: &[u8]) -> String {
 }
 
 fn current_exe_hash() -> Result<(PathBuf, String), String> {
-    let exe = std::env::current_exe().map_err(|e| format!("Cannot resolve current executable: {e}"))?;
+    let exe =
+        std::env::current_exe().map_err(|e| format!("Cannot resolve current executable: {e}"))?;
     let bytes = std::fs::read(&exe).map_err(|e| format!("Cannot read current executable: {e}"))?;
     let hash = sha256_hex(&bytes);
     Ok((exe, hash))
@@ -75,7 +116,9 @@ pub async fn run(orchestrator_url: &str) -> Result<(), String> {
         // ── 1. Resolve the latest release ────────────────────────────────────
         println!("Checking latest release…");
         let rel: serde_json::Value = client
-            .get(format!("https://api.github.com/repos/{REPO}/releases/latest"))
+            .get(format!(
+                "https://api.github.com/repos/{REPO}/releases/latest"
+            ))
             .header("Accept", "application/vnd.github+json")
             .send()
             .await
@@ -99,7 +142,9 @@ pub async fn run(orchestrator_url: &str) -> Result<(), String> {
             .find(|a| a["name"].as_str() == Some(format!("{asset}.sha256").as_str()))
             .and_then(|a| a["browser_download_url"].as_str())
             .ok_or_else(|| {
-                format!("Release {tag} has no `{asset}.sha256` checksum — refusing unverified update.")
+                format!(
+                    "Release {tag} has no `{asset}.sha256` checksum — refusing unverified update."
+                )
             })?
             .to_string();
         println!("  Latest: {tag}");

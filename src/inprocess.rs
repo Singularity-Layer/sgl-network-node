@@ -28,9 +28,14 @@ use llama_cpp_2::context::LlamaContext;
 use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::params::LlamaModelParams;
+#[cfg(feature = "vision")]
+use llama_cpp_2::mtmd::MtmdEvalError;
+#[cfg(feature = "vision")]
+use llama_cpp_2::mtmd::{MtmdBitmap, MtmdContext, MtmdContextParams, MtmdInputText};
 use llama_cpp_2::model::{AddBos, LlamaModel, Special};
 use llama_cpp_2::sampling::LlamaSampler;
 use llama_cpp_2::token::LlamaToken;
+use llama_cpp_2::DecodeError;
 
 use crate::inference::{ChatMessage, StreamEvent};
 
@@ -59,6 +64,60 @@ const PREFILL_CHUNK: usize = 512;
 /// advertising. Generous so a legitimately slow prefill/token never trips it.
 const WEDGE_MS: u64 = 120_000;
 
+/// `llama_decode` return code for `GGML_STATUS_FAILED`: the backend could not run the compute
+/// graph (llama-context.cpp maps FAILED -> -3, ALLOC_FAILED -> -2, ABORTED -> 2). On Metal this
+/// is STICKY: after one failed command buffer (GPU OOM, watchdog timeout, sleep/wake) ggml-metal
+/// sets `has_error` and fails every later graph compute until the backend is recreated. This
+/// engine creates its backend once and never recreates it, so no later job on this process can
+/// succeed.
+const FATAL_BACKEND_DECODE_CODE: i32 = -3;
+
+/// True only for the backend-failed decode code. Everything else stays a per-job failure:
+/// `NoKvCacheSlot` (1) and `NTokensZero` (-1) are request/occupancy shaped, `-2` (ALLOC_FAILED)
+/// is not sticky on Metal and can be transient, and `2` (ABORTED) is an abort callback.
+fn is_fatal_backend_error(e: &DecodeError) -> bool {
+    matches!(e, DecodeError::Unknown(FATAL_BACKEND_DECODE_CODE))
+}
+
+/// Vision prefill: mtmd's eval helper returns `llama_decode`'s code unchanged on a decode
+/// failure (its own encode failures are 1), so -3 here is the same sticky backend failure.
+#[cfg(feature = "vision")]
+fn is_fatal_mtmd_error(e: &MtmdEvalError) -> bool {
+    matches!(e, MtmdEvalError::EvalFailure(FATAL_BACKEND_DECODE_CODE))
+}
+
+/// Latch the engine as permanently failed. Called BEFORE the failing job is answered, so by the
+/// time anyone observes that failure the engine already reads unhealthy. The heartbeat loop then
+/// de-advertises and relaunches the process (the only way to get a fresh backend).
+fn mark_backend_failed(backend_failed: &AtomicBool, site: &str, detail: &dyn std::fmt::Display) {
+    if !backend_failed.swap(true, Ordering::Relaxed) {
+        tracing::error!(
+            "fatal inference backend error during {site} ({detail}): the GPU backend is in a \
+             sticky error state; marking the engine unhealthy so the node stops advertising and \
+             relaunches"
+        );
+    }
+}
+
+/// Health decision, split out so it can be tested without loading a model. `backend_failed`
+/// wins over everything: a failed backend is fast, not wedged, so the progress watchdog alone
+/// would read it as healthy forever.
+fn engine_health(
+    loaded: bool,
+    backend_failed: bool,
+    busy: bool,
+    last_progress_ms: u64,
+    now: u64,
+) -> bool {
+    if !loaded || backend_failed {
+        return false;
+    }
+    if !busy {
+        return true; // idle, model loaded
+    }
+    now.saturating_sub(last_progress_ms) < WEDGE_MS
+}
+
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -71,6 +130,11 @@ pub struct GenOut {
     pub content: String,
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
+    /// OpenAI `tool_calls` parsed out of the generation, when the model made a valid call.
+    pub tool_calls: Option<serde_json::Value>,
+    /// "tool_calls" when calls were parsed, else None (callers treat None as "stop"),
+    /// matching what the server engine reports so both engines agree.
+    pub finish_reason: Option<String>,
 }
 
 pub struct InProcessConfig {
@@ -84,6 +148,12 @@ pub struct InProcessConfig {
     pub max_slots: u32,
     /// Per-request context window (the operator's configured context_size).
     pub per_slot_ctx: u32,
+    /// Vision projector (mmproj). Some(_) => this engine serves multimodal requests IN
+    /// PROCESS, so the decrypted prompt and the image never cross a socket the operator
+    /// can read. None => text only.
+    pub mmproj_path: Option<PathBuf>,
+    /// Visual token budget per image (`--image-max-tokens`). None => model default.
+    pub image_max_tokens: Option<u32>,
 }
 
 enum JobKind {
@@ -98,6 +168,15 @@ enum JobKind {
 
 struct Job {
     messages: Vec<ChatMessage>,
+    /// Raw image bytes, in the order their markers appear in the flattened text. mtmd pairs
+    /// the Nth marker with the Nth bitmap, so ORDER IS LOAD-BEARING.
+    images: Vec<Vec<u8>>,
+    /// OpenAI `tools` array, rendered into the prompt by the model's own chat template.
+    /// None for plain chat, which keeps that render byte-identical to previous releases.
+    tools: Option<serde_json::Value>,
+    /// Tool names the caller actually offered — a call naming anything else is returned as
+    /// text, never surfaced as a call an agent might execute.
+    allowed_tools: Vec<String>,
     max_tokens: i32,
     temperature: f32,
     kind: JobKind,
@@ -108,8 +187,23 @@ struct Job {
 struct Slot {
     seq_id: i32,
     sampler: LlamaSampler,
-    /// Next KV position to write for this sequence (also == tokens decoded so far).
+    /// Next KV position to write for this sequence. Under mrope (Qwen2.5-VL) an image spans
+    /// MANY KV cells but only a FEW positions, so this is NOT a measure of cache occupancy.
     n_past: i32,
+    /// Incremental tool-call scanner, present only for a STREAMING request that offered
+    /// tools. Holds text back while a call might be forming, then emits the call as one
+    /// complete delta. None for plain chat, which keeps that path byte-identical.
+    scanner: Option<crate::toolcall::ToolCallScanner>,
+    /// Tool syntax to look for in this slot's output, and the names the caller offered.
+    /// Parsing happens at FINISH, strictly after tokens are counted at sampling time — so
+    /// classifying output as call-vs-prose can never change what is billed.
+    tool_format: crate::toolcall::ToolFormat,
+    allowed_tools: Vec<String>,
+    /// KV cells actually consumed by this sequence: prompt tokens (image tokens included)
+    /// plus one per generated token. Capping on `n_past` instead underestimates usage for a
+    /// vision request and lets decoding run past the real KV capacity into overflow. Equal
+    /// to `n_past` for text, so the text path is unchanged.
+    kv_tokens: u32,
     /// The token to decode on the next step (the previously sampled, already-emitted token).
     cur_token: LlamaToken,
     max_new: i32,
@@ -134,6 +228,10 @@ pub struct InProcessEngine {
     /// joining the worker. Always `Some` for a live engine.
     job_tx: Option<Sender<Job>>,
     healthy: Arc<AtomicBool>,
+    /// Latched (never cleared) when llama.cpp reports a fatal backend error. The context and
+    /// backend live for the whole process, so only a relaunch recovers. See
+    /// `is_fatal_backend_error`.
+    backend_failed: Arc<AtomicBool>,
     /// True while the worker is inside a scheduler iteration doing native work (admit/prefill
     /// OR decode). Set BEFORE the native calls so a wedge during a slot's prefill — when no
     /// slot is "active" yet — is still covered by the watchdog. Idle (false) is always healthy.
@@ -142,6 +240,15 @@ pub struct InProcessEngine {
     last_progress_ms: Arc<AtomicU64>,
     model_name: String,
     max_slots: u32,
+    /// True when a vision projector was loaded, i.e. this engine serves images IN PROCESS.
+    /// Drives the `vision` heartbeat capability, so the orchestrator only routes image
+    /// requests to a node that can actually answer them.
+    vision: bool,
+    /// Tool syntax this model speaks, detected ONCE from the chat template at load. Drives
+    /// both the refusal (a template with no tools branch cannot express a call) and the
+    /// heartbeat capability, so the orchestrator stops routing tool jobs to a node that
+    /// would have to answer them as prose.
+    tool_format: crate::toolcall::ToolFormat,
     /// `Option` so `Drop` can `take()` + join it. Joining lets the worker fully release its
     /// llama.cpp context/model/backend BEFORE the process runs C++ static destructors at
     /// exit — otherwise ggml-metal's global device teardown asserts (rsets not empty) and
@@ -154,18 +261,36 @@ impl InProcessEngine {
     pub async fn start(cfg: InProcessConfig) -> Result<Self, String> {
         let (job_tx, job_rx) = std::sync::mpsc::channel::<Job>();
         let healthy = Arc::new(AtomicBool::new(false));
+        let backend_failed = Arc::new(AtomicBool::new(false));
         let busy = Arc::new(AtomicBool::new(false));
         let last_progress_ms = Arc::new(AtomicU64::new(0));
-        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
+        // The worker reports the tool format it detected FROM THE LOADED MODEL's template.
+        // Detecting it here would mean guessing from the model name against an empty
+        // template, which reports None for every model - and None makes the engine REFUSE
+        // every tool request. Only the worker has the template.
+        let (ready_tx, ready_rx) =
+            tokio::sync::oneshot::channel::<Result<crate::toolcall::ToolFormat, String>>();
         let model_name = cfg.model_name.clone();
         let max_slots = cfg.max_slots.max(1);
+        let vision = cfg.mmproj_path.is_some();
 
         let w_healthy = Arc::clone(&healthy);
+        let w_backend_failed = Arc::clone(&backend_failed);
         let w_busy = Arc::clone(&busy);
         let w_progress = Arc::clone(&last_progress_ms);
         let worker = std::thread::Builder::new()
             .name("sgl-inference".into())
-            .spawn(move || worker_main(cfg, job_rx, w_healthy, w_busy, w_progress, ready_tx))
+            .spawn(move || {
+                worker_main(
+                    cfg,
+                    job_rx,
+                    w_healthy,
+                    w_backend_failed,
+                    w_busy,
+                    w_progress,
+                    ready_tx,
+                )
+            })
             .map_err(|e| format!("failed to spawn inference worker: {e}"))?;
 
         // Bound the startup wait. Model load + context creation are native llama.cpp/Metal
@@ -177,13 +302,16 @@ impl InProcessEngine {
         // legitimately slow first-run Metal compile + big-model load never trips it.
         const STARTUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
         match tokio::time::timeout(STARTUP_TIMEOUT, ready_rx).await {
-            Ok(Ok(Ok(()))) => Ok(Self {
+            Ok(Ok(Ok(tool_format))) => Ok(Self {
                 job_tx: Some(job_tx),
                 healthy,
+                backend_failed,
                 busy,
                 last_progress_ms,
                 model_name,
                 max_slots,
+                vision,
+                tool_format,
                 worker: Some(worker),
             }),
             Ok(Ok(Err(e))) => Err(e),
@@ -203,10 +331,26 @@ impl InProcessEngine {
         self.max_slots
     }
 
+    /// True when this engine serves images itself (projector loaded), so the node can
+    /// advertise vision WITHOUT falling back to the plaintext-exposing server child.
+    pub fn is_vision(&self) -> bool {
+        self.vision
+    }
+
+    /// Tool syntax this engine can parse (None = the model cannot express calls at all).
+    pub fn tool_format(&self) -> crate::toolcall::ToolFormat {
+        self.tool_format
+    }
+
     /// Non-streaming completion.
     pub async fn chat_completion(
         &self,
         messages: &[ChatMessage],
+        // Decoded image bytes in marker order (empty for text requests).
+        images: Vec<Vec<u8>>,
+        // OpenAI tools array (None = plain chat) and the names it offered.
+        tools: Option<serde_json::Value>,
+        allowed_tools: Vec<String>,
         max_tokens: i32,
         temperature: f32,
     ) -> Result<GenOut, String> {
@@ -216,6 +360,9 @@ impl InProcessEngine {
             .ok_or_else(|| "inference worker is gone".to_string())?
             .send(Job {
                 messages: messages.to_vec(),
+                images,
+                tools,
+                allowed_tools,
                 max_tokens,
                 temperature,
                 kind: JobKind::NonStream(reply),
@@ -231,6 +378,11 @@ impl InProcessEngine {
     pub async fn chat_completion_stream(
         &self,
         messages: &[ChatMessage],
+        // Decoded image bytes in marker order (empty for text requests).
+        images: Vec<Vec<u8>>,
+        // OpenAI tools array (None = plain chat) and the names it offered.
+        tools: Option<serde_json::Value>,
+        allowed_tools: Vec<String>,
         max_tokens: i32,
         temperature: f32,
         tokens: tokio::sync::mpsc::Sender<StreamEvent>,
@@ -241,6 +393,9 @@ impl InProcessEngine {
             .ok_or_else(|| "inference worker is gone".to_string())?
             .send(Job {
                 messages: messages.to_vec(),
+                images,
+                tools,
+                allowed_tools,
                 max_tokens,
                 temperature,
                 kind: JobKind::Stream { tokens, done },
@@ -254,14 +409,22 @@ impl InProcessEngine {
     /// current scheduler iteration). A wedged worker (busy but no progress for WEDGE_MS —
     /// including a wedge during a job's PREFILL, before any slot is "active") reads as
     /// UNHEALTHY so the heartbeat loop de-advertises it — closing the in-process zombie.
+    /// A fatal backend error (see `is_fatal_backend_error`) also reads UNHEALTHY, permanently.
     pub fn is_healthy(&self) -> bool {
-        if !self.healthy.load(Ordering::Relaxed) {
-            return false;
-        }
-        if !self.busy.load(Ordering::Relaxed) {
-            return true; // idle, model loaded
-        }
-        now_ms().saturating_sub(self.last_progress_ms.load(Ordering::Relaxed)) < WEDGE_MS
+        engine_health(
+            self.healthy.load(Ordering::Relaxed),
+            self.backend_failed.load(Ordering::Relaxed),
+            self.busy.load(Ordering::Relaxed),
+            self.last_progress_ms.load(Ordering::Relaxed),
+            now_ms(),
+        )
+    }
+
+    /// True once llama.cpp reported a fatal backend error. Sticky for the life of the process:
+    /// the heartbeat loop uses it to relaunch under a persisted crash-loop budget instead of the
+    /// generic (in-memory) restart budget.
+    pub fn backend_failed(&self) -> bool {
+        self.backend_failed.load(Ordering::Relaxed)
     }
 }
 
@@ -274,7 +437,9 @@ impl Drop for InProcessEngine {
         // destructors at exit; skipping it lets ggml-metal's global device teardown race the
         // still-live context and abort a clean shutdown.
         drop(self.job_tx.take());
-        let Some(handle) = self.worker.take() else { return };
+        let Some(handle) = self.worker.take() else {
+            return;
+        };
 
         // Bounded join: a healthy worker exits fast, but a worker WEDGED inside a native
         // llama.cpp call can never be unblocked from Rust. Rather than hang the process on
@@ -303,9 +468,10 @@ fn worker_main(
     cfg: InProcessConfig,
     job_rx: Receiver<Job>,
     healthy: Arc<AtomicBool>,
+    backend_failed: Arc<AtomicBool>,
     busy: Arc<AtomicBool>,
     progress: Arc<AtomicU64>,
-    ready_tx: tokio::sync::oneshot::Sender<Result<(), String>>,
+    ready_tx: tokio::sync::oneshot::Sender<Result<crate::toolcall::ToolFormat, String>>,
 ) {
     let backend = match LlamaBackend::init() {
         Ok(b) => b,
@@ -320,6 +486,46 @@ fn worker_main(
         Err(e) => {
             let _ = ready_tx.send(Err(format!("model load failed: {e}")));
             return;
+        }
+    };
+
+    // Vision projector, built ONCE at startup like the inference context below. Loading it
+    // lazily would put a multi-hundred-MB load on the first paying request's latency, and a
+    // failure would surface as a mid-job error instead of a clean refusal to start.
+    #[cfg(feature = "vision")]
+    let mtmd: Option<MtmdContext> = match &cfg.mmproj_path {
+        None => None,
+        Some(path) => {
+            let params = MtmdContextParams {
+                use_gpu: true,
+                print_timings: false,
+                n_threads: 4,
+                media_marker: match std::ffi::CString::new(crate::multimodal::MEDIA_MARKER) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        let _ = ready_tx.send(Err(format!("bad media marker: {e}")));
+                        return;
+                    }
+                },
+                image_min_tokens: -1,
+                image_max_tokens: cfg.image_max_tokens.map_or(-1, |n| n as i32),
+            };
+            match MtmdContext::init_from_file(&path.to_string_lossy(), &model, &params) {
+                Ok(c) => {
+                    // An audio-only projector would tokenize images into nothing and the model
+                    // would answer about a picture it never saw. Refuse to start instead.
+                    if !c.support_vision() {
+                        let _ =
+                            ready_tx.send(Err("this mmproj does not support vision".to_string()));
+                        return;
+                    }
+                    Some(c)
+                }
+                Err(e) => {
+                    let _ = ready_tx.send(Err(format!("mmproj load failed: {e}")));
+                    return;
+                }
+            }
         }
     };
 
@@ -353,7 +559,18 @@ fn worker_main(
     let mut waiting: VecDeque<Job> = VecDeque::new();
 
     healthy.store(true, Ordering::Relaxed);
-    let _ = ready_tx.send(Ok(()));
+    // Detect the tool syntax from the model's ACTUAL chat template, now that it is loaded.
+    // This is what the engine reports as its capability, so the orchestrator stops routing
+    // tool jobs to a model that cannot express a call.
+    let tool_format = crate::toolcall::detect(
+        &model
+            .meta_val_str("tokenizer.chat_template")
+            .unwrap_or_default(),
+        &cfg.model_name,
+        false,
+    );
+    tracing::info!("Tool-call format: {:?}", tool_format);
+    let _ = ready_tx.send(Ok(tool_format));
 
     let mut active_count = 0usize;
     loop {
@@ -405,10 +622,22 @@ fn worker_main(
         // Native llama.cpp aborts/segfaults already kill the process; this covers the
         // Rust-panic case without forcing global panic=abort on the rest of the node.
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            run_iteration(&mut ctx, &mut batch, &mut slots, &mut waiting, &cfg, &progress);
+            run_iteration(
+                &mut ctx,
+                &mut batch,
+                &mut slots,
+                &mut waiting,
+                &cfg,
+                &progress,
+                &backend_failed,
+                #[cfg(feature = "vision")]
+                mtmd.as_ref(),
+            );
         }));
         if outcome.is_err() {
-            tracing::error!("inference worker panicked mid-iteration — aborting for a clean OS restart");
+            tracing::error!(
+                "inference worker panicked mid-iteration — aborting for a clean OS restart"
+            );
             std::process::abort();
         }
 
@@ -421,6 +650,7 @@ fn worker_main(
 
 /// One scheduler iteration: admit waiting jobs into free slots (prefill + first token), then
 /// advance every active slot by exactly one token in a single batched `decode`.
+#[allow(clippy::too_many_arguments)]
 fn run_iteration(
     ctx: &mut LlamaContext,
     batch: &mut LlamaBatch,
@@ -428,15 +658,23 @@ fn run_iteration(
     waiting: &mut VecDeque<Job>,
     cfg: &InProcessConfig,
     progress: &AtomicU64,
+    backend_failed: &AtomicBool,
+    #[cfg(feature = "vision")] mtmd: Option<&MtmdContext>,
 ) {
     // 1. Admit: fill free slots from the waiting queue.
     for idx in 0..slots.len() {
         if slots[idx].is_some() {
             continue;
         }
-        let Some(job) = waiting.pop_front() else { break };
+        let Some(job) = waiting.pop_front() else {
+            break;
+        };
         let seq_id = idx as i32;
-        match admit(ctx, batch, seq_id, cfg, progress, job) {
+        #[cfg(feature = "vision")]
+        let outcome = admit(ctx, batch, seq_id, cfg, progress, backend_failed, mtmd, job);
+        #[cfg(not(feature = "vision"))]
+        let outcome = admit(ctx, batch, seq_id, cfg, progress, backend_failed, job);
+        match outcome {
             AdmitOutcome::Active(slot) => slots[idx] = Some(slot),
             AdmitOutcome::Finished => { /* replied already; slot stays free */ }
         }
@@ -463,7 +701,11 @@ fn run_iteration(
 
     if let Err(e) = ctx.decode(batch) {
         // A decode failure poisons the whole in-flight batch (shared context) — fail every
-        // sequence in this step with the error and free their slots. The node stays up.
+        // sequence in this step with the error and free their slots. The node stays up,
+        // unless the backend itself failed: then latch unhealthy first so it relaunches.
+        if is_fatal_backend_error(&e) {
+            mark_backend_failed(backend_failed, "decode", &e);
+        }
         let msg = format!("decode failed: {e}");
         for &idx in &order {
             if let Some(slot) = slots[idx].take() {
@@ -481,6 +723,7 @@ fn run_iteration(
             let tok = slot.sampler.sample(&*ctx, i as i32);
             slot.sampler.accept(tok);
             slot.n_past += 1; // cur_token now occupies its position; advance the write head
+            slot.kv_tokens += 1; // and one more KV cell is consumed
             (tok, ctx.model.is_eog_token(tok))
         };
         progress.store(now, Ordering::Relaxed);
@@ -508,7 +751,7 @@ fn run_iteration(
 
             if slot.stream_dropped
                 || slot.completion_tokens as i32 >= slot.max_new
-                || slot.n_past as u32 >= cfg.per_slot_ctx
+                || slot.kv_tokens >= cfg.per_slot_ctx
             {
                 done = true;
             }
@@ -528,25 +771,113 @@ enum AdmitOutcome {
 /// Render + tokenize + prefill a new job into `seq_id`, then sample its first token. Returns
 /// an active Slot ready for the decode loop, or Finished if it completed immediately (empty
 /// prompt / error / instant EOG / max_tokens==1) — in which case the reply is already sent.
+#[allow(clippy::too_many_arguments)]
 fn admit(
     ctx: &mut LlamaContext,
     batch: &mut LlamaBatch,
     seq_id: i32,
     cfg: &InProcessConfig,
     progress: &AtomicU64,
+    backend_failed: &AtomicBool,
+    #[cfg(feature = "vision")] mtmd: Option<&MtmdContext>,
     job: Job,
 ) -> AdmitOutcome {
-    let Job { messages, max_tokens, temperature, kind } = job;
+    let Job {
+        messages,
+        images,
+        tools,
+        allowed_tools,
+        max_tokens,
+        temperature,
+        kind,
+    } = job;
     let model = ctx.model;
 
     // Defensive: clear any stale KV cells for this seq_id before reuse (positions restart
     // at 0 for every new job, so leftover state would corrupt positions + billing).
     let _ = ctx.clear_kv_cache_seq(Some(seq_id as u32), None, None);
 
-    let prompt = match render_chat_prompt(model, &messages) {
+    // Detect from the template we are ACTUALLY about to render — that template is what tells
+    // the model how to speak this request, and it already accounts for any override. Only
+    // needed when tools were offered; plain chat skips it entirely.
+    let tool_format = if tools.is_some() {
+        let tmpl = model
+            .meta_val_str("tokenizer.chat_template")
+            .unwrap_or_default();
+        crate::toolcall::detect(&tmpl, &cfg.model_name, false)
+    } else {
+        crate::toolcall::ToolFormat::None
+    };
+    let prompt = match render_chat_prompt(model, &messages, tools.as_ref()) {
         Ok(p) => p,
         Err(e) => return finish_admit_err(kind, e),
     };
+    // ── Vision: tokenize text+images together and prefill through mtmd ──────────────
+    // The whole point of this path is that the decrypted prompt AND the image stay inside
+    // this process. The server engine would hand both to a llama-server child over an
+    // unauthenticated 127.0.0.1 socket, where the operator can read them.
+    #[cfg(feature = "vision")]
+    if !images.is_empty() {
+        let Some(mtmd) = mtmd else {
+            return finish_admit_err(
+                kind,
+                "this node is not configured to serve images".to_string(),
+            );
+        };
+        let mut bitmaps = Vec::with_capacity(images.len());
+        for bytes in &images {
+            match MtmdBitmap::from_buffer(mtmd, bytes, false) {
+                Ok(b) => bitmaps.push(b),
+                Err(e) => return finish_admit_err(kind, format!("invalid image: {e}")),
+            }
+        }
+        let refs: Vec<&MtmdBitmap> = bitmaps.iter().collect();
+        // `add_special: false` because the chat template already renders BOS as text (same
+        // reason the text path tokenizes with AddBos::Never) — adding it again would shift
+        // every position and diverge from llama-server. `parse_special: true` so the
+        // template's literal <|im_start|> etc. map back to their ids.
+        let chunks = match mtmd.tokenize(
+            MtmdInputText {
+                text: prompt,
+                add_special: false,
+                parse_special: true,
+            },
+            &refs,
+        ) {
+            Ok(c) => c,
+            // Also fires when the marker count != bitmap count (e.g. a user typed the marker
+            // themselves). Fail the job rather than silently generate against a wrong prompt.
+            Err(e) => return finish_admit_err(kind, format!("multimodal tokenize failed: {e}")),
+        };
+        // BILLING: total_tokens() counts image tokens as well as text. NOT total_positions()
+        // — under mrope (Qwen2.5-VL) positions are far fewer than tokens, and billing those
+        // would underpay the operator for every image.
+        let prompt_tokens = chunks.total_tokens() as u32;
+        if prompt_tokens >= cfg.per_slot_ctx {
+            return finish_admit_err(kind, "prompt exceeds context window".to_string());
+        }
+        // eval_chunks decodes text chunks and encodes+decodes image chunks, handling
+        // non-causal attention and mrope positions internally. It returns POSITIONS, which
+        // is what the decode loop must continue from.
+        let n_past = match chunks.eval_chunks(mtmd, ctx, 0, seq_id, PREFILL_CHUNK as i32, true) {
+            Ok(p) => p,
+            Err(e) => {
+                if is_fatal_mtmd_error(&e) {
+                    mark_backend_failed(backend_failed, "multimodal prefill", &e);
+                }
+                let _ = ctx.clear_kv_cache_seq(Some(seq_id as u32), None, None);
+                return finish_admit_err(kind, format!("multimodal prefill failed: {e}"));
+            }
+        };
+        progress.store(now_ms(), Ordering::Relaxed);
+        // mtmd decoded inside eval_chunks, so the final logits are the context's LAST row
+        // (-1), not an index into our batch, which never saw the prompt.
+        return admit_after_prefill(
+            ctx, seq_id, progress, kind, tool_format, allowed_tools, prompt_tokens, n_past, -1,
+            max_tokens, temperature,
+        );
+    }
+
     let tokens = match model.str_to_token(&prompt, AddBos::Never) {
         Ok(t) => t,
         Err(e) => return finish_admit_err(kind, format!("tokenize failed: {e}")),
@@ -575,6 +906,9 @@ fn admit(
             }
         }
         if let Err(e) = ctx.decode(batch) {
+            if is_fatal_backend_error(&e) {
+                mark_backend_failed(backend_failed, "prompt prefill", &e);
+            }
             let _ = ctx.clear_kv_cache_seq(Some(seq_id as u32), None, None);
             return finish_admit_err(kind, format!("prompt decode failed: {e}"));
         }
@@ -582,6 +916,47 @@ fn admit(
     }
     progress.store(now_ms(), Ordering::Relaxed); // prefill done
 
+    // Text prefill wrote the prompt through OUR batch, so the final token's logits are the
+    // last row of that batch. (The vision path decodes inside mtmd and passes -1 instead.)
+    let logits_idx = batch.n_tokens() - 1;
+    admit_after_prefill(
+        ctx,
+        seq_id,
+        progress,
+        kind,
+        tool_format,
+        allowed_tools,
+        prompt_tokens,
+        tokens.len() as i32, // positions 0..last consumed; next write head = len
+        logits_idx,
+        max_tokens,
+        temperature,
+    )
+}
+
+/// Shared tail of admit: sample the first token and build the slot.
+///
+/// Split out so the text and vision prefills converge here instead of duplicating the
+/// EOG / max_tokens==1 / first-emit handling, which is where the billing edge cases live.
+/// `n_past` is POSITIONS (under mrope these are fewer than tokens) and `logits_idx` is where
+/// the final prompt logits landed: the last row of our batch for text, -1 (llama.cpp's
+/// "last row") for vision, whose decode happened inside mtmd.
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
+fn admit_after_prefill(
+    ctx: &mut LlamaContext,
+    seq_id: i32,
+    progress: &AtomicU64,
+    kind: JobKind,
+    tool_format: crate::toolcall::ToolFormat,
+    allowed_tools: Vec<String>,
+    prompt_tokens: u32,
+    n_past: i32,
+    logits_idx: i32,
+    max_tokens: i32,
+    temperature: f32,
+) -> AdmitOutcome {
+    let model = ctx.model;
     let mut sampler = if temperature > 0.0 {
         LlamaSampler::chain_simple([LlamaSampler::temp(temperature), LlamaSampler::dist(0)])
     } else {
@@ -590,14 +965,27 @@ fn admit(
 
     let max_new = max_tokens.max(1);
     // Sample the first generated token from the last prompt token's logits.
-    let first = sampler.sample(&*ctx, batch.n_tokens() - 1);
+    let first = sampler.sample(&*ctx, logits_idx);
     sampler.accept(first);
-    let n_past = tokens.len() as i32; // positions 0..last consumed; next write head = len
 
+    // Only a streaming request needs the incremental scanner; the non-streaming path parses
+    // the whole generation at the end instead.
+    let scanner = match (&kind, tool_format.supports_tools()) {
+        (JobKind::Stream { .. }, true) => Some(crate::toolcall::ToolCallScanner::new(
+            tool_format,
+            allowed_tools.clone(),
+            seq_id.to_string(),
+        )),
+        _ => None,
+    };
     let mut slot = Slot {
         seq_id,
         sampler,
         n_past,
+        scanner,
+        tool_format,
+        allowed_tools,
+        kv_tokens: prompt_tokens,
         cur_token: first,
         max_new,
         prompt_tokens,
@@ -649,8 +1037,30 @@ fn emit(slot: &mut Slot, piece: String) {
             return;
         }
     };
-    slot.pending.push_str(&piece);
+    // Count the token FIRST, before the scanner sees the text. Classifying output as call
+    // vs prose must never change what is billed.
     slot.batched += 1;
+
+    let Some(scanner) = slot.scanner.as_mut() else {
+        slot.pending.push_str(&piece);
+        if slot.batched >= FLUSH_EVERY {
+            flush_stream_nonblocking(slot, &tokens);
+        }
+        return;
+    };
+    for out in scanner.push(&piece) {
+        match out {
+            crate::toolcall::ScanOut::Text(t) => slot.pending.push_str(&t),
+            crate::toolcall::ScanOut::Call(delta) => {
+                // Any text that preceded the call must reach the client BEFORE it, or an
+                // agent sees the call first and the reasoning after.
+                flush_stream_nonblocking(slot, &tokens);
+                if tokens.try_send(StreamEvent::ToolCalls { delta }).is_err() {
+                    slot.stream_dropped = true;
+                }
+            }
+        }
+    }
     if slot.batched >= FLUSH_EVERY {
         flush_stream_nonblocking(slot, &tokens);
     }
@@ -662,7 +1072,10 @@ fn flush_stream_nonblocking(slot: &mut Slot, tokens: &tokio::sync::mpsc::Sender<
     if slot.pending.is_empty() {
         return;
     }
-    let ev = StreamEvent::Delta { text: slot.pending.clone(), tokens: slot.batched };
+    let ev = StreamEvent::Delta {
+        text: slot.pending.clone(),
+        tokens: slot.batched,
+    };
     match tokens.try_send(ev) {
         Ok(()) => {
             slot.pending.clear();
@@ -700,11 +1113,29 @@ fn send_terminal(tokens: &tokio::sync::mpsc::Sender<StreamEvent>, ev: StreamEven
 /// Successful terminal: flush any pending stream tail + send the final counts, or return the
 /// accumulated non-stream text. Frees the sequence's KV cells for reuse.
 fn finish_ok(ctx: &mut LlamaContext, slot: Slot) {
+    let mut slot = slot;
+    // Flush anything the scanner still holds BEFORE settling. Held text was counted at
+    // sampling time, so dropping it here would bill for output never delivered.
+    if let (Some(scanner), JobKind::Stream { tokens, .. }) = (slot.scanner.as_mut(), &slot.kind) {
+        let tokens = tokens.clone();
+        let tail: Vec<_> = scanner.finish();
+        for out in tail {
+            match out {
+                crate::toolcall::ScanOut::Text(t) => slot.pending.push_str(&t),
+                crate::toolcall::ScanOut::Call(delta) => {
+                    flush_stream_nonblocking(&mut slot, &tokens);
+                    let _ = tokens.try_send(StreamEvent::ToolCalls { delta });
+                }
+            }
+        }
+    }
     let Slot {
         seq_id,
         prompt_tokens,
         completion_tokens,
         kind,
+        tool_format,
+        allowed_tools,
         mut pending,
         batched,
         stream_dropped,
@@ -714,7 +1145,24 @@ fn finish_ok(ctx: &mut LlamaContext, slot: Slot) {
     let _ = ctx.clear_kv_cache_seq(Some(seq_id as u32), None, None);
     match kind {
         JobKind::NonStream(reply) => {
-            let _ = reply.send(Ok(GenOut { content: out, prompt_tokens, completion_tokens }));
+            // Parse AFTER generation and AFTER counting. Tokens were counted at sampling time,
+            // so deciding here whether text is a call or prose can never move what is billed.
+            // Anything that is not a valid call comes back as text - never dropped, because
+            // those tokens were already billed.
+            let parsed = crate::toolcall::parse_complete(
+                tool_format,
+                &out,
+                &allowed_tools,
+                &seq_id.to_string(),
+            );
+            let finish_reason = parsed.tool_calls.as_ref().map(|_| "tool_calls".to_string());
+            let _ = reply.send(Ok(GenOut {
+                content: parsed.text,
+                tool_calls: parsed.tool_calls,
+                finish_reason,
+                prompt_tokens,
+                completion_tokens,
+            }));
         }
         JobKind::Stream { tokens, done } => {
             if !stream_dropped {
@@ -728,11 +1176,20 @@ fn finish_ok(ctx: &mut LlamaContext, slot: Slot) {
                 } else {
                     send_terminal(
                         &tokens,
-                        StreamEvent::Delta { text: std::mem::take(&mut pending), tokens: batched },
+                        StreamEvent::Delta {
+                            text: std::mem::take(&mut pending),
+                            tokens: batched,
+                        },
                     )
                 };
                 let finished = tail_delivered
-                    && send_terminal(&tokens, StreamEvent::Done { prompt_tokens, completion_tokens });
+                    && send_terminal(
+                        &tokens,
+                        StreamEvent::Done {
+                            prompt_tokens,
+                            completion_tokens,
+                        },
+                    );
                 let _ = done.send(if finished {
                     Ok(())
                 } else {
@@ -785,15 +1242,19 @@ fn finish_admit_err(kind: JobKind, msg: String) -> AdmitOutcome {
 /// into the first user message — so if the faithful render fails and the conversation
 /// has system messages, we fold them into the first user turn and render once more.
 /// Matches llama-server behavior instead of failing every chat that sets a system prompt.
-fn render_chat_prompt(model: &LlamaModel, messages: &[ChatMessage]) -> Result<String, String> {
-    match try_render_chat_prompt(model, messages) {
+fn render_chat_prompt(
+    model: &LlamaModel,
+    messages: &[ChatMessage],
+    tools: Option<&serde_json::Value>,
+) -> Result<String, String> {
+    match try_render_chat_prompt(model, messages, tools) {
         Ok(p) => Ok(p),
         Err(first_err) => {
             if !messages.iter().any(|m| m.role == "system") {
                 return Err(first_err);
             }
             let folded = fold_system_into_first_user(messages);
-            try_render_chat_prompt(model, &folded).map_err(|_| first_err)
+            try_render_chat_prompt(model, &folded, tools).map_err(|_| first_err)
         }
     }
 }
@@ -825,12 +1286,19 @@ fn fold_system_into_first_user(messages: &[ChatMessage]) -> Vec<ChatMessage> {
         }
     }
     if !injected {
-        out.push(ChatMessage { role: "user".to_string(), content: system_text });
+        out.push(ChatMessage {
+            role: "user".to_string(),
+            content: system_text,
+        });
     }
     out
 }
 
-fn try_render_chat_prompt(model: &LlamaModel, messages: &[ChatMessage]) -> Result<String, String> {
+fn try_render_chat_prompt(
+    model: &LlamaModel,
+    messages: &[ChatMessage],
+    tools: Option<&serde_json::Value>,
+) -> Result<String, String> {
     let tmpl_str = model
         .meta_val_str("tokenizer.chat_template")
         .map_err(|e| format!("model has no chat_template metadata: {e}"))?;
@@ -847,19 +1315,98 @@ fn try_render_chat_prompt(model: &LlamaModel, messages: &[ChatMessage]) -> Resul
     env.add_function(
         "raise_exception",
         |msg: String| -> Result<minijinja::Value, minijinja::Error> {
-            Err(minijinja::Error::new(minijinja::ErrorKind::InvalidOperation, msg))
+            Err(minijinja::Error::new(
+                minijinja::ErrorKind::InvalidOperation,
+                msg,
+            ))
         },
     );
+    // Chat templates call Python string methods (.split/.startswith/.strip) in their TOOLS
+    // branches. llama.cpp's C++ minja implements those natively; Rust minijinja does not, so
+    // plain chat never noticed and the first tools render would have failed.
+    env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
     env.add_template("chat", &tmpl_str)
         .map_err(|e| format!("chat template parse failed: {e}"))?;
     let tmpl = env
         .get_template("chat")
         .map_err(|e| format!("chat template load failed: {e}"))?;
 
-    tmpl.render(minijinja::context! {
-        messages => messages,
-        add_generation_prompt => true,
-        bos_token => bos_token,
-    })
+    // `tools` is only added when present. Templates gate on `{%- if tools %}`, and an ABSENT
+    // variable is falsy — so a plain-chat render stays byte-identical to every previous
+    // release. That matters for money, not tidiness: if the rendered prompt shifted, every
+    // existing request's prompt_tokens would move and operators would be billed differently
+    // for changing nothing. Pinned by a test.
+    match tools {
+        Some(t) => tmpl.render(minijinja::context! {
+            messages => messages,
+            tools => t,
+            add_generation_prompt => true,
+            bos_token => bos_token,
+        }),
+        None => tmpl.render(minijinja::context! {
+            messages => messages,
+            add_generation_prompt => true,
+            bos_token => bos_token,
+        }),
+    }
     .map_err(|e| format!("chat template render failed: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_backend_failed_decode_is_fatal() {
+        // -3 = GGML_STATUS_FAILED, the sticky Metal state seen live on node 4344157b.
+        assert!(is_fatal_backend_error(&DecodeError::Unknown(-3)));
+        // Request/occupancy shaped or transient: these stay per-job failures.
+        assert!(!is_fatal_backend_error(&DecodeError::NoKvCacheSlot)); // 1
+        assert!(!is_fatal_backend_error(&DecodeError::NTokensZero)); // -1
+        assert!(!is_fatal_backend_error(&DecodeError::Unknown(-2))); // ALLOC_FAILED
+        assert!(!is_fatal_backend_error(&DecodeError::Unknown(2))); // ABORTED
+        assert!(!is_fatal_backend_error(&DecodeError::Unknown(-4)));
+    }
+
+    #[test]
+    fn fatal_decode_error_text_is_unchanged() {
+        // The job still fails with exactly this text; the orchestrator's failure_reason and any
+        // log greps depend on it.
+        assert_eq!(
+            format!("decode failed: {}", DecodeError::Unknown(-3)),
+            "decode failed: Decode Error -3: unknown"
+        );
+    }
+
+    #[cfg(feature = "vision")]
+    #[test]
+    fn only_backend_failed_mtmd_eval_is_fatal() {
+        assert!(is_fatal_mtmd_error(&MtmdEvalError::EvalFailure(-3)));
+        assert!(!is_fatal_mtmd_error(&MtmdEvalError::EvalFailure(1))); // encode failure
+        assert!(!is_fatal_mtmd_error(&MtmdEvalError::EvalFailure(-2)));
+        assert!(!is_fatal_mtmd_error(&MtmdEvalError::EvalFailure(-1)));
+    }
+
+    #[test]
+    fn mark_backend_failed_latches() {
+        let flag = AtomicBool::new(false);
+        mark_backend_failed(&flag, "decode", &DecodeError::Unknown(-3));
+        assert!(flag.load(Ordering::Relaxed));
+        mark_backend_failed(&flag, "prompt prefill", &DecodeError::Unknown(-3));
+        assert!(flag.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn backend_failed_is_unhealthy_even_when_idle() {
+        let now = 1_000_000;
+        // Existing behaviour unchanged.
+        assert!(engine_health(true, false, false, 0, now)); // idle
+        assert!(engine_health(true, false, true, now - 1_000, now)); // busy, progressing
+        assert!(!engine_health(true, false, true, now - WEDGE_MS, now)); // wedged
+        assert!(!engine_health(false, false, false, 0, now)); // not loaded
+
+        // A failed backend is unhealthy whether idle or busy-and-progressing.
+        assert!(!engine_health(true, true, false, 0, now));
+        assert!(!engine_health(true, true, true, now, now));
+    }
 }

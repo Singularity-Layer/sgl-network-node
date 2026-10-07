@@ -1,15 +1,23 @@
 # Release pipeline — builds official binaries on GitHub's own runners.
 #
 # Trigger: push a version tag (v1.2.0, v1.3.0, …).
-# Output: a GitHub Release with one binary + .sha256 per platform:
-#   sgl-darwin-arm64   (macOS Apple Silicon)
-#   sgl-linux-x86_64   (Linux x86_64 — Intel TDX / AMD SEV hosts)
-#   sgl-linux-arm64    (Linux arm64)
+# Output: ONE DRAFT GitHub release with one binary + .sha256 per platform:
+#   sgl-darwin-arm64        (macOS Apple Silicon)
+#   sgl-linux-x86_64        (Linux x86_64 — Intel TDX / AMD SEV hosts)
+#   sgl-linux-arm64         (Linux arm64)
+#   sgl-linux-x86_64-gpu    (Linux x86_64 — Vulkan)
+#   sgl-linux-arm64-gpu     (Linux arm64 — Vulkan)
+#   sgl-windows-x86_64.exe  (Windows x64 — non-confidential node)
 #
 # Why CI builds: binaries are produced from the public source on GitHub's
 # infrastructure, not a developer laptop — a verifiable supply chain. After a
 # release, each new sha256 must be appended to the orchestrator's
 # ALLOWED_NODE_BINARY_HASHES (add-before-remove) or the build cannot serve.
+#
+# STAGED RELEASE: a tag creates a draft whose artifacts can be attested, tested,
+# and added to the orchestrator allowlist while v1.9.16 remains the latest release.
+# Publishing the draft is a separate owner action after the add-before-remove
+# allowlist is live. Nothing reaches cloud.x402compute.cc until a later manual sync.
 
 name: release
 
@@ -17,14 +25,23 @@ on:
   push:
     tags:
       - "v*"
+  # Manual trigger so a build can be PROVEN before it is released. Without this the only
+  # way to test a toolchain change (e.g. compiling llama.cpp in-process for a new platform)
+  # was to tag, which is why operators saw a run of releases in a single day.
+  workflow_dispatch:
 
 permissions:
+  attestations: write
   contents: write
+  id-token: write
 
 jobs:
   build:
     name: build (${{ matrix.asset }})
     strategy:
+      # A Linux build hiccup must NOT cancel the macOS binary. macOS is every live grid node,
+      # and Linux is newly compiling llama.cpp in-process here, so it is the likeliest to break.
+      fail-fast: false
       matrix:
         include:
           # macOS = every live grid node. Build with in-process inference (v1.5.0)
@@ -33,19 +50,38 @@ jobs:
           - os: macos-14
             target: aarch64-apple-darwin
             asset: sgl-darwin-arm64
-            features: "inprocess,metal"
-          # Linux = future confidential TDX/SEV tier (#109), no live nodes yet.
-          # Kept as plain server-engine builds for now to keep the release green —
-          # a cmake/llama.cpp build hiccup here would block the macOS binary too.
-          # Add `inprocess` here when the Linux tier actually ships.
+            features: "inprocess,metal,vision"
+          # Linux ships the in-process engine COMPILED IN but NOT as the default (see the
+          # engine selection in node.rs). Compiling in CI does not prove runtime behaviour on
+          # real hardware, and flipping the default blind would move every Linux node onto an
+          # untested inference path at once. Operators opt in with SGL_ENGINE=inprocess; the
+          # default flips once it is validated on a real Linux node.
+          # TWO Linux artifacts per arch, because one binary cannot serve both. Linking the
+          # Vulkan backend hard-links libvulkan.so.1, and the binary then will not START on a
+          # host without the Vulkan runtime ("error while loading shared libraries") - so a
+          # single GPU build would fix GPU nodes by bricking every CPU-only node. Verified in
+          # a bare container. The installer picks by detecting a GPU, the same way setup.rs
+          # already chooses llama-server variants via engine.variant.
           - os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             asset: sgl-linux-x86_64
-            features: ""
+            features: "inprocess,vision"
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             asset: sgl-linux-arm64
-            features: ""
+            features: "inprocess,vision"
+          # GPU builds. `vulkan` matches what llama-server already uses on Linux, so a GPU
+          # node keeps the acceleration it has today. Needs libvulkan-dev + glslc +
+          # spirv-headers to BUILD (see the step below); needs a Vulkan runtime to RUN, which
+          # is exactly why these are separate assets.
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            asset: sgl-linux-x86_64-gpu
+            features: "inprocess,vision,vulkan"
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            asset: sgl-linux-arm64-gpu
+            features: "inprocess,vision,vulkan"
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -54,6 +90,13 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+
+      # Only the *-gpu Linux assets need these; cmake's FindVulkan wants glslc specifically
+      # (glslang-tools ships glslangValidator, which it rejects), and ggml-vulkan then wants
+      # SPIRV-Headers.
+      - name: Vulkan build deps
+        if: endsWith(matrix.asset, '-gpu')
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq libvulkan-dev glslc glslang-tools spirv-headers spirv-tools
 
       - name: Build
         run: |
@@ -82,28 +125,182 @@ jobs:
             ${{ matrix.asset }}.sha256
           if-no-files-found: error
 
+  # Windows is a separate job (MSVC toolchain + NASM for `ring`; PowerShell
+  # checksum). Mirrors windows.yml's build so the Windows node binary rides the
+  # same release. Non-confidential (no TEE/App Attest), which matches the product
+  # framing — see WINDOWS.md.
+  build-windows:
+    name: build (sgl-windows-x86_64)
+    runs-on: windows-latest
+    # Byte-identical target profile to windows.yml. The PR probe must validate the
+    # same CPU/runtime baseline this release job stages.
+    env:
+      RUSTFLAGS: -C target-feature=+crt-static
+      CMAKE_MSVC_RUNTIME_LIBRARY: MultiThreaded
+      CMAKE_POLICY_DEFAULT_CMP0091: NEW
+      CFLAGS: /MT
+      CXXFLAGS: /MT
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (MSVC)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      # `ring` (via rustls → reqwest rustls-tls + tokio-tungstenite) assembles its
+      # crypto with NASM on the MSVC target. Pin it so the build can't go red if
+      # the runner image ever drops nasm.
+      - name: Install NASM (for ring's assembly)
+        uses: ilammy/setup-nasm@v1
+
+      - name: Cargo cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}-crtmt-v1
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Build (release, MSVC)
+        # Static CRT: link the MSVC C runtime into the binary so sgl.exe has zero DLL
+        # dependencies. Without this, clean Windows installs (no VC++ Redistributable)
+        # die at launch with "VCRUNTIME140.dll was not found".
+        #
+        #
+        # IN-PROCESS ON WINDOWS (proven in windows.yml before landing here).
+        #
+        # The blocker was a C-runtime mismatch, not a Windows limitation: Rust links /MT via
+        # crt-static above, while llama.cpp's CMake half built /MD -> LNK2038 on
+        # llama-sampler.obj. LLAMA_STATIC_CRT cannot fix it: cmake-rs's static_crt() only
+        # feeds its internal cc configs and injects CMAKE_C_FLAGS, never
+        # CMAKE_MSVC_RUNTIME_LIBRARY - and under policy CMP0091 (NEW) the runtime comes from
+        # that PROPERTY, so a textual /MT in flags loses.
+        #
+        # llama-cpp-sys-2's build.rs forwards any CMAKE_* env var as a -D define, so setting
+        # the property here reaches CMake with no patch or fork. CFLAGS/CXXFLAGS stay because
+        # the mtmd/clip/siglip sources are compiled by the `cc` crate, which never sees it.
+        run: cargo build --release --target x86_64-pc-windows-msvc --features inprocess,vision
+
+      # "It links" is not "it runs". Twice on Linux a green build produced a binary that
+      # would not START on a clean host (libgomp.so.1, then libvulkan.so.1) because the
+      # loader fails before main(). This is the Windows equivalent - do not remove it.
+      - name: Assert zero non-OS DLL imports
+        shell: pwsh
+        run: |
+          $bin = "target/x86_64-pc-windows-msvc/release/sgl.exe"
+          $dumpbin = (Get-ChildItem -Recurse -Filter dumpbin.exe `
+            "C:\Program Files\Microsoft Visual Studio" -ErrorAction SilentlyContinue |
+            Select-Object -First 1).FullName
+          if (-not $dumpbin) { Write-Host "dumpbin not found - skipping"; exit 0 }
+          $out = & $dumpbin /DEPENDENTS $bin
+          Write-Host $out
+          $bad = $out | Select-String -Pattern 'VCRUNTIME|MSVCP|api-ms-win-crt|ucrtbase|vcomp'
+          if ($bad) { throw "sgl.exe imports a non-OS runtime DLL - it will not start on a clean Windows box: $bad" }
+          Write-Host "OK: no VC++ runtime imports"
+
+      # The staged release must pass the same real runtime proof as pull requests,
+      # under the exact job-level target profile used for sgl.exe above.
+      - name: Build the engine probe
+        run: cargo build --release --target x86_64-pc-windows-msvc --features inprocess,vision --example tool_probe
+
+      - name: Run real inference through the in-process engine
+        shell: pwsh
+        run: ./.github/scripts/run-windows-inference-probe.ps1
+
+      - name: Package + checksum
+        shell: pwsh
+        run: |
+          $bin = "target/x86_64-pc-windows-msvc/release/sgl.exe"
+          if (-not (Test-Path $bin)) { throw "sgl.exe was not produced at $bin" }
+          Copy-Item $bin "sgl-windows-x86_64.exe"
+          $hash = (Get-FileHash -Algorithm SHA256 "sgl-windows-x86_64.exe").Hash.ToLower()
+          "$hash  sgl-windows-x86_64.exe" | Out-File -Encoding ascii "sgl-windows-x86_64.exe.sha256"
+          Get-Content "sgl-windows-x86_64.exe.sha256"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sgl-windows-x86_64
+          path: |
+            sgl-windows-x86_64.exe
+            sgl-windows-x86_64.exe.sha256
+          if-no-files-found: error
+
   release:
-    name: publish release
-    needs: build
+    name: stage draft release
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: [build, build-windows]
     runs-on: ubuntu-24.04
     steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
       - uses: actions/download-artifact@v4
         with:
           merge-multiple: true
 
-      - name: Show checksums (paste these into the allowlist)
-        run: cat ./*.sha256
+      - name: Verify canonical tag and package version
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          expected="v$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)"
+          test "$TAG" = "$expected" || {
+            echo "tag $TAG does not match Cargo package version $expected" >&2
+            exit 1
+          }
+          git fetch origin main --no-tags
+          test "$GITHUB_SHA" = "$(git rev-parse origin/main)" || {
+            echo "release tag must point at the exact origin/main commit" >&2
+            exit 1
+          }
 
-      - name: Create release with assets
+      - name: Verify complete artifact set and show allowlist hashes
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          for asset in \
+            sgl-darwin-arm64 \
+            sgl-linux-x86_64 \
+            sgl-linux-arm64 \
+            sgl-linux-x86_64-gpu \
+            sgl-linux-arm64-gpu \
+            sgl-windows-x86_64.exe
+          do
+            test -s "$asset"
+            test -s "$asset.sha256"
+            sha256sum --check "$asset.sha256"
+          done
+          cat ./*.sha256 | sort -k2 > "sgl-node-${TAG}.sha256"
+          cat "sgl-node-${TAG}.sha256"
+
+      - name: Attest release artifacts
+        uses: actions/attest@v4.2.2
+        with:
+          subject-path: sgl-*
+
+      - name: Create staged draft with assets
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ github.ref_name }}
           REPO: ${{ github.repository }}
         run: |
+          if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+            echo "release $TAG already exists; refusing to replace staged artifacts" >&2
+            exit 1
+          fi
           gh release create "$TAG" \
             --repo "$REPO" \
             --title "sgl-node $TAG" \
             --generate-notes \
-            sgl-darwin-arm64 sgl-darwin-arm64.sha256 \
-            sgl-linux-x86_64 sgl-linux-x86_64.sha256 \
-            sgl-linux-arm64 sgl-linux-arm64.sha256
+            --verify-tag \
+            --draft \
+            sgl-*
+          # Globbed on purpose. This list used to be hardcoded, and when the Linux GPU
+          # artifacts were added they BUILT green and were then silently dropped from the
+          # release - so `sgl update` on a GPU host would have 404'd. A new matrix entry must
+          # never again need a second edit here to actually ship.

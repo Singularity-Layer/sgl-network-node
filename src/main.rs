@@ -1,15 +1,25 @@
 mod config;
 mod crypto;
+mod eg2;
+#[cfg(feature = "inprocess")]
+mod embed;
+mod embed_catalog;
+mod embedding_input;
 mod encryption;
 mod inference;
 #[cfg(feature = "inprocess")]
 mod inprocess;
+mod multimodal;
 mod node;
 mod orchestrator;
 mod runtime_hardening;
 mod service;
+mod setup;
+mod stream_relay;
 mod streamseal;
 mod tee;
+mod telemetry;
+mod toolcall;
 mod update;
 mod ws;
 
@@ -43,9 +53,11 @@ enum Commands {
         #[arg(long)]
         wallet: String,
 
-        /// TEE type on this machine
-        #[arg(long, default_value = "apple_se")]
-        tee_type: String,
+        /// TEE type on this machine. Detected from the hardware when omitted —
+        /// do NOT default this to apple_se, which made every Windows node claim
+        /// an Apple secure enclave.
+        #[arg(long)]
+        tee_type: Option<String>,
 
         /// Available models (comma-separated)
         #[arg(long)]
@@ -54,9 +66,11 @@ enum Commands {
 
     /// Log in via browser and register this node (recommended)
     Login {
-        /// TEE type on this machine
-        #[arg(long, default_value = "apple_se")]
-        tee_type: String,
+        /// TEE type on this machine. Detected from the hardware when omitted —
+        /// do NOT default this to apple_se, which made every Windows node claim
+        /// an Apple secure enclave.
+        #[arg(long)]
+        tee_type: Option<String>,
 
         /// Available models (comma-separated)
         #[arg(long)]
@@ -82,6 +96,25 @@ enum Commands {
         #[arg(long)]
         model_name: Option<String>,
 
+        /// App-owned EmbeddingGemma 2 Python interpreter, separate from chat runtimes.
+        #[arg(long)]
+        embedding_python: Option<String>,
+
+        /// System One sidecar base URL (for Laya/Jev-compatible typed decision models).
+        /// When set without --model-path, the node advertises --model-name or convaiinnovations/laya.
+        #[arg(long)]
+        systemone_sidecar_url: Option<String>,
+
+        /// Vision (multimodal) models only: path to the mmproj (vision projector) GGUF.
+        /// When set, llama-server accepts image inputs. The app/provisioner downloads +
+        /// hash-verifies it alongside the model (same discipline as --model-path).
+        #[arg(long)]
+        mmproj_path: Option<String>,
+
+        /// Vision only: cap the tokens a single image may cost (llama-server --image-max-tokens).
+        #[arg(long)]
+        image_max_tokens: Option<u32>,
+
         /// Port for local llama-server (default: 8081)
         #[arg(long, default_value = "8081")]
         inference_port: u16,
@@ -100,12 +133,17 @@ enum Commands {
         #[arg(long)]
         gpu_layers: Option<u32>,
 
+        /// Auto-fit GPU layers to available VRAM (llama.cpp sizes the offload; omits -ngl).
+        /// Overrides --gpu-layers. The universal replacement for per-model VRAM tuning.
+        #[arg(long)]
+        gpu_layers_auto: bool,
+
         /// Context window size in tokens
         #[arg(long, default_value = "4096", value_parser = clap::value_parser!(u32).range(512..=131072))]
         context_size: u32,
 
-        /// Max concurrent jobs this node will accept
-        #[arg(long, default_value = "1")]
+        /// Max concurrent jobs this node will accept (0 = auto, 1 = strictly one job)
+        #[arg(long, default_value = "0")]
         max_jobs: u32,
 
         /// Prompt batch size for processing
@@ -134,6 +172,17 @@ enum Commands {
     /// match the published checksum AND be on the grid's approved-binary
     /// allowlist before it replaces this binary.
     Update,
+
+    /// Install the llama.cpp inference backend (llama-server) for this node.
+    /// Downloads a pinned, sha256-verified build into the per-user bin dir.
+    /// Required on Windows before serving; on Linux/macOS the deploy usually
+    /// installs it, but this works there too. Defaults to the Vulkan build
+    /// (runs on any GPU); use --cpu for a CPU-only machine.
+    Setup {
+        /// Install the CPU-only build instead of the GPU (Vulkan) build.
+        #[arg(long)]
+        cpu: bool,
+    },
 
     /// Go off-grid (maintenance): stop receiving jobs without being penalized.
     /// Use for planned downtime. Tamper slashing is unaffected.
@@ -200,6 +249,22 @@ enum ServiceAction {
         #[arg(long)]
         model_name: Option<String>,
 
+        /// App-owned EmbeddingGemma 2 Python interpreter, separate from chat runtimes.
+        #[arg(long)]
+        embedding_python: Option<String>,
+
+        /// System One sidecar base URL (for Laya/Jev-compatible typed decision models).
+        #[arg(long)]
+        systemone_sidecar_url: Option<String>,
+
+        /// Vision (multimodal) models only: path to the mmproj (vision projector) GGUF.
+        #[arg(long)]
+        mmproj_path: Option<String>,
+
+        /// Vision only: cap the tokens a single image may cost (--image-max-tokens).
+        #[arg(long)]
+        image_max_tokens: Option<u32>,
+
         /// Percentage of system resources to dedicate (1-100)
         #[arg(long, default_value = "50", value_parser = clap::value_parser!(u8).range(1..=100))]
         resource_percent: u8,
@@ -208,8 +273,8 @@ enum ServiceAction {
         #[arg(long, default_value = "8081")]
         inference_port: u16,
 
-        /// Max concurrent jobs this node will accept
-        #[arg(long, default_value = "1")]
+        /// Max concurrent jobs this node will accept (0 = auto, 1 = strictly one job)
+        #[arg(long, default_value = "0")]
         max_jobs: u32,
 
         /// Context window size in tokens (bigger handles longer conversations but
@@ -263,6 +328,9 @@ async fn main() {
             let models_vec: Vec<String> = models
                 .map(|m| m.split(',').map(|s| s.trim().to_string()).collect())
                 .unwrap_or_default();
+            // Omitted -> detect. See tee::detect_tee_type.
+            let tee_type = tee_type
+                .unwrap_or_else(|| tee::detect_tee_type(tee::detect().secure_enclave_available));
 
             if let Err(e) = node::init(
                 &config_dir,
@@ -277,7 +345,15 @@ async fn main() {
                 std::process::exit(1);
             }
         }
-        Commands::Login { tee_type, models, code, wallet } => {
+        Commands::Login {
+            tee_type,
+            models,
+            code,
+            wallet,
+        } => {
+            // Omitted -> detect. See tee::detect_tee_type.
+            let tee_type = tee_type
+                .unwrap_or_else(|| tee::detect_tee_type(tee::detect().secure_enclave_available));
             let models_vec: Vec<String> = models
                 .map(|m| m.split(',').map(|s| s.trim().to_string()).collect())
                 .unwrap_or_default();
@@ -285,7 +361,15 @@ async fn main() {
             let result = match (code, wallet) {
                 // Headless: provision code from the deploy pipeline, no browser.
                 (Some(c), Some(w)) => {
-                    node::login_headless(&config_dir, &cli.orchestrator_url, &tee_type, &models_vec, &c, &w).await
+                    node::login_headless(
+                        &config_dir,
+                        &cli.orchestrator_url,
+                        &tee_type,
+                        &models_vec,
+                        &c,
+                        &w,
+                    )
+                    .await
                 }
                 (Some(_), None) | (None, Some(_)) => {
                     Err("Headless login needs BOTH --code and --wallet.".to_string())
@@ -302,16 +386,28 @@ async fn main() {
         Commands::Start {
             model_path,
             model_name,
+            embedding_python,
+            systemone_sidecar_url,
+            mmproj_path,
+            image_max_tokens,
             inference_port,
             resource_percent,
             threads,
             gpu_layers,
+            gpu_layers_auto,
             context_size,
             max_jobs,
             batch_size,
             heartbeat_interval,
             enable_streaming,
         } => {
+            // --gpu-layers-auto → sentinel (u32::MAX) so the inference engine lets llama.cpp
+            // auto-fit the GPU offload to the card's VRAM (see inference::GPU_LAYERS_AUTO).
+            let gpu_layers = if gpu_layers_auto {
+                Some(u32::MAX)
+            } else {
+                gpu_layers
+            };
             let rc = node::ResourceConfig::from_args(
                 resource_percent,
                 threads,
@@ -322,11 +418,20 @@ async fn main() {
                 heartbeat_interval,
                 enable_streaming,
             );
+            let systemone_sidecar_url = systemone_sidecar_url.or_else(|| {
+                std::env::var("SGL_SYSTEMONE_SIDECAR_URL")
+                    .ok()
+                    .filter(|s| !s.trim().is_empty())
+            });
             if let Err(e) = node::start(
                 &config_dir,
                 &cli.orchestrator_url,
                 model_path.as_deref(),
                 model_name.as_deref(),
+                embedding_python.as_deref(),
+                systemone_sidecar_url.as_deref(),
+                mmproj_path.as_deref(),
+                image_max_tokens,
                 inference_port,
                 &rc,
             )
@@ -351,16 +456,18 @@ async fn main() {
             println!("config dir:    {}", config_dir.display());
             println!("orchestrator:  {}", cli.orchestrator_url);
             println!();
-            println!(
-                "To serve on the grid this sha256 must be on the orchestrator's"
-            );
-            println!(
-                "approved-build allowlist (published with each official release)."
-            );
+            println!("To serve on the grid this sha256 must be on the orchestrator's");
+            println!("approved-build allowlist (published with each official release).");
         }
         Commands::Update => {
             if let Err(e) = update::run(&cli.orchestrator_url).await {
                 tracing::error!("Update failed: {e}");
+                std::process::exit(1);
+            }
+        }
+        Commands::Setup { cpu } => {
+            if let Err(e) = setup::run(cpu).await {
+                tracing::error!("Setup failed: {e}");
                 std::process::exit(1);
             }
         }
@@ -379,8 +486,16 @@ async fn main() {
         Commands::Price { action } => {
             let result = match action {
                 PriceAction::Show => node::show_prices(&config_dir, &cli.orchestrator_url).await,
-                PriceAction::Set { model, input, output } => node::set_price(&config_dir, &cli.orchestrator_url, &model, input, output).await,
-                PriceAction::Reset { model } => node::reset_price(&config_dir, &cli.orchestrator_url, &model).await,
+                PriceAction::Set {
+                    model,
+                    input,
+                    output,
+                } => {
+                    node::set_price(&config_dir, &cli.orchestrator_url, &model, input, output).await
+                }
+                PriceAction::Reset { model } => {
+                    node::reset_price(&config_dir, &cli.orchestrator_url, &model).await
+                }
             };
             if let Err(e) = result {
                 tracing::error!("Price command failed: {e}");
@@ -402,6 +517,10 @@ async fn main() {
                 ServiceAction::Install {
                     model_path,
                     model_name,
+                    embedding_python,
+                    systemone_sidecar_url,
+                    mmproj_path,
+                    image_max_tokens,
                     resource_percent,
                     inference_port,
                     max_jobs,
@@ -413,6 +532,14 @@ async fn main() {
                     let opts = service::ServiceStartOptions {
                         model_path,
                         model_name,
+                        embedding_python,
+                        systemone_sidecar_url: systemone_sidecar_url.or_else(|| {
+                            std::env::var("SGL_SYSTEMONE_SIDECAR_URL")
+                                .ok()
+                                .filter(|s| !s.trim().is_empty())
+                        }),
+                        mmproj_path,
+                        image_max_tokens,
                         orchestrator_url: cli.orchestrator_url.clone(),
                         resource_percent,
                         inference_port,

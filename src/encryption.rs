@@ -97,7 +97,21 @@ pub fn unseal_input(
         .get("ciphertext")
         .and_then(|v| v.as_str())
         .ok_or("enc.ciphertext missing")?;
-    if ciphertext_b58.len() > MAX_SEALED_B58_LEN {
+    let multimodal = enc.get("embedding_protocol").is_some();
+    if multimodal
+        && (enc.get("embedding_protocol").and_then(|v| v.as_str()) != Some(crate::eg2::PROTOCOL)
+            || enc.get("encoding").and_then(|v| v.as_str()) != Some("base64")
+            || enc.get("payload_encoding").and_then(|v| v.as_str()) != Some("utf-8")
+            || enc.get("algorithm").and_then(|v| v.as_str()) != Some(ALGO_V2))
+    {
+        return Err("invalid multimodal input envelope".into());
+    }
+    let encoded_cap = if multimodal {
+        32 * 1024 * 1024 + 256
+    } else {
+        MAX_SEALED_B58_LEN
+    };
+    if ciphertext_b58.len() > encoded_cap {
         return Err("sealed ciphertext exceeds maximum size".to_string());
     }
     let ephemeral_b58 = enc
@@ -109,9 +123,30 @@ pub fn unseal_input(
         .and_then(|v| v.as_str())
         .ok_or("enc.client_response_pubkey missing")?;
 
-    let ciphertext = bs58::decode(ciphertext_b58)
-        .into_vec()
-        .map_err(|e| format!("bad ciphertext base58: {e}"))?;
+    // Encoding negotiation (mirrors the fail-closed algorithm negotiation below):
+    // `encoding: "base64"` = linear-time base64 for large payloads; ABSENT = legacy
+    // base58; anything else is rejected rather than guessed. Pubkeys stay base58
+    // always (32 bytes — base58 is fine there and they feed the AAD strings verbatim).
+    // Match on the raw value so a PRESENT-but-non-string `encoding` (null, 123, {})
+    // is rejected too — only a truly ABSENT field means legacy base58 (Codex caveat:
+    // `.and_then(as_str)` would have silently treated `encoding: null` as absent).
+    let ciphertext = match enc.get("encoding") {
+        Some(v) => match v.as_str() {
+            Some("base64") => {
+                use base64::Engine as _;
+                base64::engine::general_purpose::STANDARD
+                    .decode(ciphertext_b58)
+                    .map_err(|e| format!("bad ciphertext base64: {e}"))?
+            }
+            _ => return Err(format!("unsupported enc.encoding: {v}")),
+        },
+        None => bs58::decode(ciphertext_b58)
+            .into_vec()
+            .map_err(|e| format!("bad ciphertext base58: {e}"))?,
+    };
+    if multimodal && ciphertext.len() > crate::embedding_input::MAX_ENCODED_BODY + 40 {
+        return Err("multimodal ciphertext exceeds decoded limit".into());
+    }
     let ephemeral = bs58_to_32(ephemeral_b58)?;
     let response_pub = bs58_to_32(response_b58)?;
 
@@ -136,6 +171,11 @@ pub fn unseal_input(
     let inner: serde_json::Value = serde_json::from_slice(&plaintext)
         .map_err(|e| format!("decrypted payload is not valid JSON: {e}"))?;
 
+    if multimodal
+        && inner.get("embedding_protocol").and_then(|v| v.as_str()) != Some(crate::eg2::PROTOCOL)
+    {
+        return Err("sealed multimodal protocol mismatch".into());
+    }
     Ok((inner, Some(response_pub), version))
 }
 
@@ -334,7 +374,13 @@ impl StreamSealer {
         OsRng.fill_bytes(&mut nonce_bytes);
         let nonce = XNonce::from_slice(&nonce_bytes);
 
-        let aad = aad_stream(&self.resp_b58, &self.eph_pub_b58, &self.req_nonce_b58, seq, is_final);
+        let aad = aad_stream(
+            &self.resp_b58,
+            &self.eph_pub_b58,
+            &self.req_nonce_b58,
+            seq,
+            is_final,
+        );
         let cipher = XChaCha20Poly1305::new_from_slice(&self.out_key)
             .map_err(|e| format!("Cipher init failed: {e}"))?;
         let ciphertext = cipher

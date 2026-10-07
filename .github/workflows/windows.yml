@@ -7,25 +7,18 @@
 #
 # Triggers:
 #   - pull_request / workflow_dispatch → BUILD ONLY (compile + upload sgl.exe).
-#   - push tag v*                       → build + checksum (publishing releases
-#                                         stays owned by release.yml; this job
-#                                         just uploads the Windows artifact so a
-#                                         tagged build has an sgl.exe to grab).
+#   (No `v*` tag trigger: release.yml's build-windows job builds + publishes the
+#    Windows binary onto the release, so a tag doesn't double-build here.)
 #
-# Deliberately BUILD-ONLY: we compile + package, we do NOT run the node (a real
-# Windows box is an owner follow-up). The `inprocess` feature is NOT enabled on
-# Windows yet (it vendors + builds llama.cpp via cmake; Windows nodes use the
-# child-process `--engine=server` path with llama-server.exe). Windows nodes are
-# non-confidential (no TEE/App Attest), which matches the product framing.
+# Deliberately RELEASE-INERT: we compile, run an in-process model probe, and package,
+# but do not publish or register a node. Windows nodes are non-confidential (no
+# TEE/App Attest), which matches the product framing.
 
 name: windows
 
 on:
   workflow_dispatch:
   pull_request:
-  push:
-    tags:
-      - "v*"
 
 permissions:
   contents: read
@@ -34,6 +27,14 @@ jobs:
   build:
     name: build (sgl-windows-x86_64)
     runs-on: windows-latest
+    # One target profile for the shipped binary AND every runtime probe. Keep this
+    # block byte-identical to release.yml; tests/release_workflows.rs enforces it.
+    env:
+      RUSTFLAGS: -C target-feature=+crt-static
+      CMAKE_MSVC_RUNTIME_LIBRARY: MultiThreaded
+      CMAKE_POLICY_DEFAULT_CMP0091: NEW
+      CFLAGS: /MT
+      CXXFLAGS: /MT
     steps:
       - uses: actions/checkout@v4
 
@@ -56,12 +57,34 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          # Suffix bumped deliberately. llama-cpp-sys-2 sets .always_configure(false), and
+          # cmake-rs SKIPS configure entirely when CMakeCache.txt exists — so a target/ dir
+          # cached from a /MD configure silently ignores a new runtime define and the change
+          # looks like it did nothing. Bump this whenever the CMake flags change.
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}-crtmt-v1
           restore-keys: |
+            ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}-crtmt-
             ${{ runner.os }}-cargo-
 
       - name: Build (release, MSVC)
-        run: cargo build --release --target x86_64-pc-windows-msvc
+        # Static CRT: link the MSVC C runtime into the binary so sgl.exe has zero DLL
+        # dependencies. Without this, clean Windows installs (no VC++ Redistributable)
+        # die at launch with "VCRUNTIME140.dll was not found".
+        #
+        # IN-PROCESS ON WINDOWS. The blocker was a C-runtime mismatch, not Windows: Rust
+        # links /MT (above) while llama.cpp's CMake half built /MD, giving
+        #   LNK2038: 'MT_StaticRelease' doesn't match 'MD_DynamicRelease' in llama-sampler.obj
+        #
+        # LLAMA_STATIC_CRT does NOT fix it. cmake-rs's static_crt() only feeds its internal
+        # cc configs and injects CMAKE_C_FLAGS; it never sets CMAKE_MSVC_RUNTIME_LIBRARY. And
+        # under policy CMP0091 (NEW — llama.cpp requires cmake >= 3.14...3.28) the runtime is
+        # chosen by that PROPERTY, not by flags, so a textual /MT in CMAKE_C_FLAGS loses.
+        #
+        # llama-cpp-sys-2's build.rs forwards any CMAKE_* env var as a -D define, so setting
+        # the property here reaches CMake without patching or forking the crate.
+        # CFLAGS/CXXFLAGS still matter: the mtmd/clip/siglip sources are compiled by the `cc`
+        # crate, which never sees the CMake property.
+        run: cargo build --release --target x86_64-pc-windows-msvc --features inprocess,vision
 
       - name: Checksum
         shell: pwsh
@@ -73,6 +96,60 @@ jobs:
           Get-Content "sgl-windows-x86_64.exe.sha256"
           Copy-Item $bin "sgl-windows-x86_64.exe"
 
+      # "It links" is not "it runs". Twice on Linux a build went green and the binary then
+      # would not START on a clean host (libgomp.so.1, then libvulkan.so.1) because the
+      # loader fails before main(). These two gates are the Windows equivalent.
+      - name: Assert zero non-OS DLL imports
+        shell: pwsh
+        run: |
+          $dumpbin = (Get-ChildItem -Recurse -Filter dumpbin.exe `
+            "C:\Program Files\Microsoft Visual Studio" -ErrorAction SilentlyContinue |
+            Select-Object -First 1).FullName
+          if (-not $dumpbin) { Write-Host "dumpbin not found - skipping"; exit 0 }
+          $out = & $dumpbin /DEPENDENTS sgl-windows-x86_64.exe
+          Write-Host $out
+          $bad = $out | Select-String -Pattern 'VCRUNTIME|MSVCP|api-ms-win-crt|ucrtbase|vcomp'
+          if ($bad) { throw "sgl.exe imports a non-OS runtime DLL - it will not start on a clean Windows box: $bad" }
+          Write-Host "OK: no VC++ runtime imports"
+
+      - name: Run on a clean Windows image (no VC++ redistributable)
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          # Server Core has the OS UCRT but NOT the VC++ redistributable - the clean-box
+          # profile an operator actually has. A /MD binary dies here with 0xC0000135.
+          docker run --rm -v "${PWD}:C:\w" mcr.microsoft.com/windows/servercore:ltsc2025 `
+            C:\w\sgl-windows-x86_64.exe --version
+
+      # PROVE THE ENGINE WORKS, not just that the binary starts. A build can link cleanly,
+      # pass the DLL gate, run --version, and still be unable to load a model or produce a
+      # tool call.
+      #
+      # This gate deliberately does NOT assert an exact completion-token count across
+      # platforms. An earlier version did, and it was wrong: greedy decoding is not
+      # bit-identical across ISAs. The x86-64 MSVC baseline is SSE2 with NO fused
+      # multiply-add, so every multiply-add rounds twice, while the arm64 builds use NEON
+      # with fused FMA that rounds once. On a near-tied logit the argmax legitimately flips,
+      # and Windows produced prose where arm64 produced a tool call - on ONE prompt, while
+      # matching arm64 token-for-token on another. That is model behaviour, not a bug.
+      # (The prompt also embeds today's date via the chat template, so "the same prompt" is
+      # not even byte-stable across days or timezones.)
+      #
+      # Billing correctness is "billed == produced", which holds regardless. Identical counts
+      # across platforms was never the invariant, and claiming it was an overreach.
+      #
+      # What IS deterministic, and what we therefore assert: on ONE machine with ONE binary
+      # at temperature 0, the streaming and non-streaming paths share a decode loop and must
+      # agree exactly. Plus the behaviour that actually matters - a real tool call comes back.
+      - name: Build the engine probe
+        # Uses the job-level baseline flags above. A probe built with stronger CPU
+        # features does not validate the binary we upload or stage for release.
+        run: cargo build --release --target x86_64-pc-windows-msvc --features inprocess,vision --example tool_probe
+
+      - name: Run real inference through the in-process engine
+        shell: pwsh
+        run: ./.github/scripts/run-windows-inference-probe.ps1
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
@@ -80,4 +157,35 @@ jobs:
           path: |
             sgl-windows-x86_64.exe
             sgl-windows-x86_64.exe.sha256
+          if-no-files-found: error
+
+      # The MSVC runtime trio (officially redistributable) — hosted on our R2 and dropped
+      # by `sgl setup` NEXT TO llama-server.exe, so upstream llama.cpp builds run on clean
+      # Windows installs without the VC++ Redistributable (beta testers hit
+      # "VCRUNTIME140.dll was not found" otherwise). Packaged from the runner's VS redist.
+      - name: Package MSVC runtime DLLs (vccrt-x64.zip)
+        shell: pwsh
+        run: |
+          # System32 carries the same (newest-installed) redistributable DLLs and exists on
+          # every runner image — unlike the VS Redist folder layout, which moves around.
+          $src = Join-Path $env:SystemRoot "System32"
+          New-Item -ItemType Directory -Path vccrt-x64 | Out-Null
+          foreach ($d in "msvcp140.dll","vcruntime140.dll","vcruntime140_1.dll") {
+            $p = Join-Path $src $d
+            if (-not (Test-Path $p)) { throw "$d not found in System32" }
+            Copy-Item $p vccrt-x64
+            Write-Host "$d $((Get-Item $p).VersionInfo.ProductVersion)"
+          }
+          Compress-Archive -Path "vccrt-x64\*" -DestinationPath "vccrt-x64.zip"
+          $hash = (Get-FileHash -Algorithm SHA256 "vccrt-x64.zip").Hash.ToLower()
+          "$hash  vccrt-x64.zip" | Out-File -Encoding ascii "vccrt-x64.zip.sha256"
+          Get-Content "vccrt-x64.zip.sha256"
+
+      - name: Upload CRT artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vccrt-x64
+          path: |
+            vccrt-x64.zip
+            vccrt-x64.zip.sha256
           if-no-files-found: error

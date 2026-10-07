@@ -22,6 +22,13 @@ const SERVICE_LABEL: &str = "cc.x402compute.sglnode";
 pub struct ServiceStartOptions {
     pub model_path: Option<String>,
     pub model_name: Option<String>,
+    pub embedding_python: Option<String>,
+    pub systemone_sidecar_url: Option<String>,
+    /// Vision (multimodal) models: path to the mmproj GGUF, baked into the service so the
+    /// background node serves images across restarts. None for text/embedding models.
+    pub mmproj_path: Option<String>,
+    /// Vision only: per-image token cap (--image-max-tokens).
+    pub image_max_tokens: Option<u32>,
     pub orchestrator_url: String,
     pub resource_percent: u8,
     pub inference_port: u16,
@@ -48,6 +55,22 @@ impl ServiceStartOptions {
         if let Some(mn) = &self.model_name {
             args.push("--model-name".into());
             args.push(mn.clone());
+        }
+        if let Some(python) = &self.embedding_python {
+            args.push("--embedding-python".into());
+            args.push(python.clone());
+        }
+        if let Some(url) = &self.systemone_sidecar_url {
+            args.push("--systemone-sidecar-url".into());
+            args.push(url.clone());
+        }
+        if let Some(mm) = &self.mmproj_path {
+            args.push("--mmproj-path".into());
+            args.push(mm.clone());
+        }
+        if let Some(n) = self.image_max_tokens {
+            args.push("--image-max-tokens".into());
+            args.push(n.to_string());
         }
         args.push("--orchestrator-url".into());
         args.push(self.orchestrator_url.clone());
@@ -96,13 +119,15 @@ pub fn install(opts: &ServiceStartOptions) -> Result<(), String> {
     {
         install_linux(opts)
     }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(target_os = "windows")]
+    {
+        install_windows(opts)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
         let _ = opts;
         Err(
-            "Windows service install is not wired up yet. Run the node in the foreground with \
-             `sgl start ...` (the Singularity Node desktop app supervises it), or register it \
-             yourself with `sc.exe create`. Native Windows-service support is a follow-up."
+            "No service installer for this platform. Run `sgl start ...` in the foreground."
                 .to_string(),
         )
     }
@@ -117,11 +142,13 @@ pub fn uninstall() -> Result<(), String> {
     {
         uninstall_linux()
     }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(target_os = "windows")]
     {
-        Err("Windows service uninstall is not wired up yet (no service is installed). \
-             If you created one manually, remove it with `sc.exe delete`."
-            .to_string())
+        uninstall_windows()
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
+        Err("No service installer for this platform (nothing to uninstall).".to_string())
     }
 }
 
@@ -134,11 +161,185 @@ pub fn status() -> Result<(), String> {
     {
         status_linux()
     }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(target_os = "windows")]
     {
-        Err("Windows service status is not available yet — the node runs in the foreground on \
-             Windows (`sgl start ...`). Native Windows-service support is a follow-up."
-            .to_string())
+        status_windows()
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
+        Err("No service installer for this platform.".to_string())
+    }
+}
+
+// ─── Windows (Task Scheduler) ───────────────────────────────────────────────
+// The launchd-parity story on Windows: a per-user Scheduled Task (no admin) that
+//   * starts the node at logon                      (≈ LaunchAgent RunAtLoad)
+//   * restarts it if it crashes                     (≈ launchd KeepAlive)
+//   * keeps running after the desktop app closes    (independent process)
+//   * runs hidden via the S4U logon type            (no console window)
+// S4U ("service for user") runs without a stored password and non-interactively.
+// If task registration under S4U is denied (some locked-down machines), we fall
+// back to an Interactive-logon task — same lifecycle, may briefly show a window
+// at logon. All PowerShell is passed as ONE argv element (no cmd shell parsing).
+
+/// PowerShell single-quoted literal: escape embedded quotes by doubling them.
+#[cfg(target_os = "windows")]
+fn ps_squote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "''"))
+}
+
+#[cfg(target_os = "windows")]
+fn run_powershell(script: &str) -> Result<String, String> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let out = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", script])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .map_err(|e| format!("Failed to run PowerShell: {e}"))?;
+    let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+    if out.status.success() {
+        Ok(stdout)
+    } else {
+        // NEVER return an empty error. PowerShell can exit non-zero with both streams
+        // empty, and this used to surface to operators as the literal dead end
+        // "Couldn't install the background task:" — the most common Windows failure in
+        // our reports, with nothing after the colon to act on or even diagnose.
+        // Always carry the exit code, and both streams when present.
+        let code = out
+            .status
+            .code()
+            .map(|c| c.to_string())
+            .unwrap_or_else(|| "unknown".into());
+        let detail = match (stderr.is_empty(), stdout.is_empty()) {
+            (false, false) => format!("{stderr} | {stdout}"),
+            (false, true) => stderr,
+            (true, false) => stdout,
+            (true, true) => "PowerShell produced no output".to_string(),
+        };
+        Err(format!("powershell exit {code}: {detail}"))
+    }
+}
+
+/// Quote ONE token for a Windows command line (CreateProcess rules): always wrap
+/// in double quotes, escape embedded `"` as `\"`. Our tokens are file paths and
+/// flag values — no trailing-backslash-before-quote cases (paths end in `.gguf`).
+#[cfg(target_os = "windows")]
+fn win_quote(token: &str) -> String {
+    format!("\"{}\"", token.replace('"', "\\\""))
+}
+
+#[cfg(target_os = "windows")]
+fn install_windows(opts: &ServiceStartOptions) -> Result<(), String> {
+    let exe = current_exe()?;
+    // Quote EVERY token (not just spaced ones) with CreateProcess escaping.
+    let arg_string = opts
+        .start_args()
+        .iter()
+        .map(|a| win_quote(a))
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    // Interactive-fallback action: S4U runs windowless by design, but when Windows
+    // refuses S4U (seen live on a tester's Win10) the Interactive task showed a
+    // PERSISTENT sgl console. Wrap that path in a hidden PowerShell launcher that
+    // waits for the node and propagates its exit code — restart-on-failure still
+    // works, no window (PS itself is spawned hidden by -WindowStyle Hidden).
+    // Tokens are PS-single-quoted: PowerShell rejoins its post--Command argv with
+    // spaces and re-parses, so single-quote grouping survives CreateProcess splitting.
+    let ps_tokens = opts
+        .start_args()
+        .iter()
+        .map(|a| format!("'{}'", a.replace('\'', "''")))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let hidden_fallback_arg = format!(
+        "-NoProfile -WindowStyle Hidden -Command & '{}' {}; exit $LASTEXITCODE",
+        exe.replace('\'', "''"),
+        ps_tokens
+    );
+
+    // Reinstall-safety: stop the old task instance and tree-kill any running node
+    // BEFORE registering, so `MultipleInstances IgnoreNew` can't leave a stale node
+    // serving the OLD model/args after Start-ScheduledTask.
+    let _ = run_powershell(&format!(
+        "Stop-ScheduledTask -TaskName {label} -ErrorAction SilentlyContinue",
+        label = ps_squote(SERVICE_LABEL),
+    ));
+    kill_node_trees();
+
+    // $ErrorActionPreference='Stop' makes non-terminating cmdlet errors fatal so a
+    // failed Register/Start can't exit 0 and report a phantom success.
+    let script = format!(
+        "$ErrorActionPreference = 'Stop'; \
+         $u = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name; \
+         $a = New-ScheduledTaskAction -Execute {exe} -Argument {args}; \
+         $t = New-ScheduledTaskTrigger -AtLogOn -User $u; \
+         $s = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries \
+              -Hidden -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 10 \
+              -RestartInterval (New-TimeSpan -Minutes 1) -MultipleInstances IgnoreNew -StartWhenAvailable; \
+         try {{ \
+           $p = New-ScheduledTaskPrincipal -UserId $u -LogonType S4U -RunLevel Limited; \
+           Register-ScheduledTask -TaskName {label} -Action $a -Trigger $t -Settings $s -Principal $p -Force -ErrorAction Stop | Out-Null; \
+           Start-ScheduledTask -TaskName {label} -ErrorAction Stop \
+         }} catch {{ \
+           $fa = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument {fbarg}; \
+           $p = New-ScheduledTaskPrincipal -UserId $u -LogonType Interactive -RunLevel Limited; \
+           Register-ScheduledTask -TaskName {label} -Action $fa -Trigger $t -Settings $s -Principal $p -Force -ErrorAction Stop | Out-Null; \
+           Start-ScheduledTask -TaskName {label} -ErrorAction Stop \
+         }}",
+        exe = ps_squote(&exe),
+        args = ps_squote(&arg_string),
+        fbarg = ps_squote(&hidden_fallback_arg),
+        label = ps_squote(SERVICE_LABEL),
+    );
+    run_powershell(&script).map_err(|e| format!("Couldn't install the background task: {e}"))?;
+    println!("Background task installed and started (Task Scheduler: {SERVICE_LABEL}).");
+    println!("The node keeps serving after the app closes and restarts at logon.");
+    Ok(())
+}
+
+/// Tree-kill every running `sgl start` node (command-line matched, so login/setup/
+/// update invocations are never touched). taskkill /T takes the llama-server.exe
+/// child down with the node — Stop-ScheduledTask alone can orphan it.
+#[cfg(target_os = "windows")]
+fn kill_node_trees() {
+    let _ = run_powershell(
+        "Get-CimInstance Win32_Process -Filter \"Name='sgl.exe'\" | \
+         Where-Object { $_.CommandLine -match '(\\s|\")start(\\s|\"|$)' } | \
+         ForEach-Object { & taskkill /T /F /PID $_.ProcessId 2>$null } | Out-Null",
+    );
+}
+
+#[cfg(target_os = "windows")]
+fn uninstall_windows() -> Result<(), String> {
+    let script = format!(
+        "Stop-ScheduledTask -TaskName {label} -ErrorAction SilentlyContinue; \
+         Unregister-ScheduledTask -TaskName {label} -Confirm:$false -ErrorAction SilentlyContinue",
+        label = ps_squote(SERVICE_LABEL),
+    );
+    let _ = run_powershell(&script);
+    kill_node_trees();
+    println!("Background task removed (and any running node stopped).");
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn status_windows() -> Result<(), String> {
+    let script = format!(
+        "(Get-ScheduledTask -TaskName {label} -ErrorAction Stop).State",
+        label = ps_squote(SERVICE_LABEL),
+    );
+    match run_powershell(&script) {
+        Ok(state) => {
+            println!("Background task: {state}");
+            Ok(())
+        }
+        Err(_) => {
+            println!("Background task: not installed");
+            Ok(())
+        }
     }
 }
 
@@ -197,12 +398,32 @@ fn write_sandbox_profile() -> Result<String, String> {
 "#,
         home = home_str,
     );
-    std::fs::write(&profile, body)
-        .map_err(|e| format!("Failed to write sandbox profile: {e}"))?;
+    std::fs::write(&profile, body).map_err(|e| format!("Failed to write sandbox profile: {e}"))?;
     profile
         .to_str()
         .map(|s| s.to_string())
         .ok_or_else(|| "sandbox profile path not UTF-8".to_string())
+}
+
+/// `launchctl bootout` is ASYNCHRONOUS: it returns before the agent — and its
+/// heavyweight `llama-server` child holding several GB of model in RAM — has
+/// actually exited and been released from the domain. Bootstrapping the same
+/// `Label` while the old instance is still draining makes launchd fail with
+/// "Bootstrap failed: 5: Input/output error" (seen live when lowering the
+/// context window forces a service reinstall). So: bootout, then poll the domain
+/// until the label is gone (or a timeout), before the caller bootstraps.
+#[cfg(target_os = "macos")]
+fn bootout_and_wait(target: &str) {
+    let _ = run("launchctl", &["bootout", target]);
+    // `launchctl print <target>` succeeds while the service is still loaded and
+    // fails once launchd has released it. Poll ~12s; the node normally drains in
+    // 1–3s, so this returns early in the common case.
+    for _ in 0..60 {
+        if run("launchctl", &["print", target]).is_err() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -215,10 +436,7 @@ fn install_macos(opts: &ServiceStartOptions) -> Result<(), String> {
     // caffeinate -i blocks idle sleep so the node stays on the grid; if the
     // node exits, launchd (KeepAlive) restarts the whole thing. When --sandbox
     // is set, the node (and its llama-server child) run under a Seatbelt profile.
-    let mut program_args: Vec<String> = vec![
-        "/usr/bin/caffeinate".to_string(),
-        "-i".to_string(),
-    ];
+    let mut program_args: Vec<String> = vec!["/usr/bin/caffeinate".to_string(), "-i".to_string()];
     if opts.sandbox {
         let profile = write_sandbox_profile()?;
         program_args.push("/usr/bin/sandbox-exec".to_string());
@@ -283,10 +501,34 @@ fn install_macos(opts: &ServiceStartOptions) -> Result<(), String> {
     let target = format!("{domain}/{SERVICE_LABEL}");
     let plist_str = plist.to_str().ok_or("plist path not UTF-8")?;
 
-    // Reload cleanly: bootout (ignore failure if not loaded) then bootstrap.
-    let _ = run("launchctl", &["bootout", &target]);
-    run("launchctl", &["bootstrap", &domain, plist_str])
-        .map_err(|e| format!("launchctl bootstrap failed: {e}"))?;
+    // Reload cleanly. bootout is async and the old node's llama-server child can
+    // take a few seconds to die, so wait for the label to drain, then bootstrap —
+    // and retry the whole dance if launchd still reports the label busy
+    // ("Bootstrap failed: 5: Input/output error").
+    bootout_and_wait(&target);
+    let mut bootstrap_err = String::new();
+    let mut bootstrapped = false;
+    for attempt in 0..5u64 {
+        match run("launchctl", &["bootstrap", &domain, plist_str]) {
+            Ok(_) => {
+                bootstrapped = true;
+                break;
+            }
+            Err(e) => {
+                bootstrap_err = e;
+                // The previous instance is still draining — force another teardown,
+                // back off, and retry.
+                bootout_and_wait(&target);
+                std::thread::sleep(std::time::Duration::from_millis(300 * (attempt + 1)));
+            }
+        }
+    }
+    if !bootstrapped {
+        return Err(format!(
+            "launchctl bootstrap failed after retries: {bootstrap_err} \
+             (the previous node may still be shutting down — wait a few seconds and try again)"
+        ));
+    }
     let _ = run("launchctl", &["enable", &target]);
     let _ = run("launchctl", &["kickstart", "-k", &target]);
 
@@ -379,13 +621,14 @@ fn install_linux(opts: &ServiceStartOptions) -> Result<(), String> {
         .collect::<Vec<_>>()
         .join(" ");
 
-    // Re-expose the operator's chosen model read-only (ProtectHome=true would
-    // otherwise hide it if it lives under $HOME). "-" tolerates a missing path.
-    let model_ro = opts
-        .model_path
-        .as_ref()
-        .map(|m| format!("ReadOnlyPaths=-{m}\n"))
-        .unwrap_or_default();
+    // Re-expose the operator's chosen model (and, for vision models, its mmproj) read-only —
+    // ProtectHome=true would otherwise hide them if they live under $HOME, so llama-server
+    // couldn't open the projector on a service restart. "-" tolerates a missing path.
+    let model_ro = [opts.model_path.as_ref(), opts.mmproj_path.as_ref()]
+        .into_iter()
+        .flatten()
+        .map(|p| format!("ReadOnlyPaths=-{p}\n"))
+        .collect::<String>();
 
     let unit_body = format!(
         r#"[Unit]
@@ -525,4 +768,40 @@ fn run(cmd: &str, args: &[&str]) -> Result<String, String> {
         return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
     }
     Ok(String::from_utf8_lossy(&out.stdout).to_string())
+}
+
+#[cfg(test)]
+mod embedding_service_tests {
+    use super::*;
+    #[test]
+    fn dedicated_python_is_persisted_without_changing_legacy_service_args() {
+        let mut opts = ServiceStartOptions {
+            model_path: Some("/owned/eg2/snapshot".into()),
+            model_name: Some("embeddinggemma-2".into()),
+            embedding_python: None,
+            systemone_sidecar_url: None,
+            mmproj_path: None,
+            image_max_tokens: None,
+            orchestrator_url: "https://grid.x402compute.cc".into(),
+            resource_percent: 50,
+            inference_port: 8081,
+            max_jobs: 1,
+            context_size: 8192,
+            heartbeat_interval: 5,
+            enable_streaming: false,
+            sandbox: false,
+        };
+        let legacy = opts.start_args();
+        assert!(!legacy.iter().any(|a| a == "--embedding-python"));
+        opts.embedding_python = Some("/owned/eg2/runtime/bin/python".into());
+        let candidate = opts.start_args();
+        let at = candidate
+            .iter()
+            .position(|a| a == "--embedding-python")
+            .unwrap();
+        assert_eq!(candidate[at + 1], "/owned/eg2/runtime/bin/python");
+        let mut stripped = candidate;
+        stripped.drain(at..at + 2);
+        assert_eq!(stripped, legacy);
+    }
 }

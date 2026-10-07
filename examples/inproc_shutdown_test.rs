@@ -15,7 +15,10 @@ use sgl_node::inference::{ChatMessage, StreamEvent};
 use sgl_node::inprocess::{InProcessConfig, InProcessEngine};
 
 fn user(content: &str) -> Vec<ChatMessage> {
-    vec![ChatMessage { role: "user".into(), content: content.into() }]
+    vec![ChatMessage {
+        role: "user".into(),
+        content: content.into(),
+    }]
 }
 
 async fn start(path: &str, max_slots: u32) -> InProcessEngine {
@@ -26,6 +29,8 @@ async fn start(path: &str, max_slots: u32) -> InProcessEngine {
         n_gpu_layers: 999,
         max_slots,
         per_slot_ctx: 2048,
+        mmproj_path: None,
+        image_max_tokens: None,
     })
     .await
     .expect("engine start")
@@ -33,7 +38,9 @@ async fn start(path: &str, max_slots: u32) -> InProcessEngine {
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() {
-    let path = std::env::args().nth(1).expect("usage: inproc_shutdown_test <model.gguf>");
+    let path = std::env::args()
+        .nth(1)
+        .expect("usage: inproc_shutdown_test <model.gguf>");
 
     // ---- A. slow stream consumer must not stall other slots -----------------------------
     {
@@ -43,23 +50,44 @@ async fn main() {
         let stuck = {
             let e = &engine;
             async move {
-                e.chat_completion_stream(&user("Write 200 words about rivers."), 200, 0.0, stuck_tx).await
+                e.chat_completion_stream(&user("Write 200 words about rivers."), Vec::new(), None, Vec::new(), 200, 0.0, stuck_tx)
+                    .await
             }
         };
         // Meanwhile, normal requests that MUST finish promptly despite the stalled consumer.
         let others = async {
             let e = &engine;
             let t = Instant::now();
-            for p in ["2+2? number only", "capital of Japan? one word", "opposite of up?"] {
-                let o = e.chat_completion(&user(p), 24, 0.0).await.expect("other req");
-                println!("   other OK ct={} {:?}", o.completion_tokens, o.content.trim());
+            for p in [
+                "2+2? number only",
+                "capital of Japan? one word",
+                "opposite of up?",
+            ] {
+                let o = e
+                    .chat_completion(&user(p), Vec::new(), None, Vec::new(), 24, 0.0)
+                    .await
+                    .expect("other req");
+                println!(
+                    "   other OK ct={} {:?}",
+                    o.completion_tokens,
+                    o.content.trim()
+                );
             }
             t.elapsed()
         };
         let (stuck_res, others_wall) = tokio::join!(stuck, others);
-        println!("[A] stalled-consumer stream returned: {:?}", stuck_res.map(|_| "Ok"));
-        println!("[A] other requests wall time while consumer stalled: {:?}", others_wall);
-        assert!(others_wall < Duration::from_secs(60), "other slots were stalled by the slow consumer");
+        println!(
+            "[A] stalled-consumer stream returned: {:?}",
+            stuck_res.map(|_| "Ok")
+        );
+        println!(
+            "[A] other requests wall time while consumer stalled: {:?}",
+            others_wall
+        );
+        assert!(
+            others_wall < Duration::from_secs(60),
+            "other slots were stalled by the slow consumer"
+        );
         // `_stuck_rx_held` kept alive until here so the channel stays Full, not Closed.
         drop(_stuck_rx_held);
         println!("[A] PASS — slow consumer did not stall other slots\n");
@@ -73,7 +101,7 @@ async fn main() {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamEvent>(8);
         let _ = tokio::time::timeout(
             Duration::from_millis(500),
-            engine.chat_completion_stream(&user("Write 300 words about mountains."), 300, 0.0, tx),
+            engine.chat_completion_stream(&user("Write 300 words about mountains."), Vec::new(), None, Vec::new(), 300, 0.0, tx),
         )
         .await; // times out: request still running inside the worker
         let _ = rx.try_recv(); // proves streaming had begun
@@ -82,7 +110,10 @@ async fn main() {
         drop(engine); // must return promptly (bounded Drop) despite in-flight work
         let drop_ms = t.elapsed();
         println!("[B] engine Drop with in-flight work took {:?}", drop_ms);
-        assert!(drop_ms < Duration::from_secs(20), "Drop hung beyond the bounded window");
+        assert!(
+            drop_ms < Duration::from_secs(20),
+            "Drop hung beyond the bounded window"
+        );
         println!("[B] PASS — bounded shutdown\n");
     }
 

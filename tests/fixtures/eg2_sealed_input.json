@@ -1,0 +1,48 @@
+{
+  "node_ed25519_seed_hex": "4242424242424242424242424242424242424242424242424242424242424242",
+  "node_x25519_secret_hex": "3d05e9880c86ab93697e2886a82eda7f6eee4cf239517b5c7358a02e3dfc5bdb",
+  "node_x25519_public_key": "A2MEKT8hNfpfNCrf9QyQesHWxnfxgS3TuL5DcX6jBwxT",
+  "ephemeral_secret_hex": "1717171717171717171717171717171717171717171717171717171717171717",
+  "response_secret_hex": "2929292929292929292929292929292929292929292929292929292929292929",
+  "nonce_hex": "000102030405060708090a0b0c0d0e0f1011121314151617",
+  "payload": {
+    "enc": {
+      "ciphertext": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYX2aJOmBIIR7D7Rja8aj0jQYFwt7BnkYXh9nMe8PzYGv9PwEdWeE5PBCBsDI2O1edwUSVLvqliUJoLLh2knod8khoZQ1B9cFsuZNF3cY81Zp5Cq98f2oHuQ/yfAHMjI772ujXUNLEZmAtdDk6Qy5uXD9cE5p/fxajv/DEzZ80A7rgXu7qnV1lR3iaIa08ekaeSFoi01JR/320iHPVOJ3NqFALYhyb1sTX1g+Fe8SsJbsVTN6N4A3aOLTCohDelu7t3nm4XYgdpXs2CHNGjbbrf2QFnGH1AwFFIy7GcAlr2DgjKRTroToY59Eh/HcqkDNIJ2tfF4mell5eLkaiBfbFRY8EBZkhZKCcqWNrqDs/oRXEJTn44uPuut8zoGkwWoHwR627xBU+9e/NT0GRVnKhCw3CgGyDkiyY+0P9UgHqV4BkUfed6LAQ7nwUTcmcUpb8FEphgWYhhCVr0GxN8R29bgvPk9M4ts2ifg9eysaXY7wohkczxRCeSmA7y9N3LkUKotM1G",
+      "client_ephemeral_pubkey": "HEjoMXSd2rugWtF6z9JJSVYtDpap1NSVTCPomwphb1ix",
+      "client_response_pubkey": "2c5JpY9MiViXGrGN6aBLZLtiuzX9mhVmaToxSPra2bHd",
+      "algorithm": "x25519-xchacha20poly1305-hkdf-v2",
+      "encoding": "base64",
+      "payload_encoding": "utf-8",
+      "embedding_protocol": "embedding-multimodal-v1"
+    }
+  },
+  "expected_plaintext": {
+    "input": [
+      {
+        "content": [
+          {
+            "type": "text",
+            "text": "find café 🐈"
+          },
+          {
+            "type": "image",
+            "media": {
+              "encoding": "base64",
+              "mime_type": "image/png",
+              "data": "YQ==",
+              "sha256": "ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb"
+            }
+          },
+          {
+            "type": "text",
+            "text": "ordered tail"
+          }
+        ]
+      },
+      "second batch input"
+    ],
+    "input_type": "query",
+    "dimensions": 128,
+    "embedding_protocol": "embedding-multimodal-v1"
+  }
+}

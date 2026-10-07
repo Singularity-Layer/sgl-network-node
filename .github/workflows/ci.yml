@@ -1,0 +1,47 @@
+name: CI
+
+# The release workflows only ever ran `cargo build`, so the test suite and every
+# lint could fail without anyone noticing. This gate runs on every push and PR.
+# Mirrors ./scripts/release-check.sh — keep the two in sync.
+#
+# Feature note: do NOT use --all-features here. `metal` is macOS-only and
+# `inprocess` builds llama.cpp through cmake (slow, and needs a toolchain).
+# Default features cover the orchestrator/billing/setup logic this gate protects.
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: clippy · test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Advisory until the one-time `cargo fmt --all` lands (the repo predates any
+      # formatting pass). Flip to a hard failure in the same commit as that format.
+      - name: cargo fmt --check (advisory)
+        continue-on-error: true
+        run: cargo fmt --all -- --check
+
+      # Advisory for now: 9 pre-existing lints, all cosmetic (unneeded return, dead
+      # code, too-many-arguments). Tracked in docs/audit/FINDINGS.md. Once they are
+      # cleared, drop continue-on-error and add `-- -D warnings` so lints block.
+      - name: cargo clippy (advisory)
+        continue-on-error: true
+        run: cargo clippy --all-targets
+
+      # The hard gate. This is what was missing: tests existed but never ran in CI.
+      - name: cargo test
+        run: cargo test

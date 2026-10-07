@@ -3,6 +3,20 @@
 //! can drive them directly (e.g. examples/inproc_batch_test.rs). The binary keeps its own
 //! `mod` declarations and does not depend on this lib.
 
+pub mod eg2;
+pub mod embedding_input;
+
+#[cfg(feature = "inprocess")]
+pub mod embed;
+pub mod embed_catalog;
+// Exposed for examples/seal_b64_check.rs (cross-language sealed-encoding proof).
+pub mod encryption;
 pub mod inference;
+// Engine installer — inference.rs drives the crash-loop auto-swap through it.
 #[cfg(feature = "inprocess")]
 pub mod inprocess;
+pub mod multimodal;
+pub mod setup;
+// inference.rs labels its backend through it (heartbeat telemetry).
+pub mod telemetry;
+pub mod toolcall;

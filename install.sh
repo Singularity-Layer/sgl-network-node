@@ -45,16 +45,36 @@ check_platform() {
             TOTAL_GB=$((TOTAL_MEM / 1073741824))
             ;;
         Linux)
+            # Linux ships TWO builds per arch. The `-gpu` one links the Vulkan backend and is
+            # much faster where there is a GPU - but it CANNOT START without the Vulkan
+            # runtime, so we only choose it when both the loader and a real device are
+            # present, and fall back to the CPU build on any doubt. SGL_GPU=1/0 overrides.
+            GPU_SUFFIX=""
+            if [ "${SGL_GPU:-}" = "1" ]; then
+                GPU_SUFFIX="-gpu"
+            elif [ "${SGL_GPU:-}" != "0" ]; then
+                if { [ -e /usr/lib/x86_64-linux-gnu/libvulkan.so.1 ] \
+                     || [ -e /usr/lib/aarch64-linux-gnu/libvulkan.so.1 ] \
+                     || [ -e /usr/lib64/libvulkan.so.1 ] \
+                     || [ -e /usr/lib/libvulkan.so.1 ]; } \
+                   && { [ -d /dev/dri ] || [ -e /dev/nvidiactl ]; }; then
+                    GPU_SUFFIX="-gpu"
+                fi
+            fi
             case "$ARCH" in
-                x86_64|amd64) ASSET_NAME="sgl-linux-x86_64" ;;
-                arm64|aarch64) ASSET_NAME="sgl-linux-arm64" ;;
+                x86_64|amd64) ASSET_NAME="sgl-linux-x86_64${GPU_SUFFIX}" ;;
+                arm64|aarch64) ASSET_NAME="sgl-linux-arm64${GPU_SUFFIX}" ;;
                 *)
                     echo "Error: unsupported Linux architecture: ${ARCH}."
                     echo "Build from source: cargo build --release"
                     exit 1
                     ;;
             esac
-            echo "  Platform: Linux ${ARCH} ✓ (Intel TDX / AMD SEV hosts supported)"
+            if [ -n "$GPU_SUFFIX" ]; then
+                echo "  Platform: Linux ${ARCH} ✓ (GPU build — Vulkan detected)"
+            else
+                echo "  Platform: Linux ${ARCH} ✓ (CPU build; set SGL_GPU=1 to force the GPU build)"
+            fi
             TOTAL_KB=$(grep MemTotal /proc/meminfo 2>/dev/null | awk '{print $2}' || echo "0")
             TOTAL_GB=$((TOTAL_KB / 1048576))
             ;;
