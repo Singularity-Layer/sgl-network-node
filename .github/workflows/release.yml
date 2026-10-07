@@ -217,9 +217,7 @@ jobs:
           $bin = "target/x86_64-pc-windows-msvc/release/sgl.exe"
           if (-not (Test-Path $bin)) { throw "sgl.exe was not produced at $bin" }
           Copy-Item $bin "sgl-windows-x86_64.exe"
-          $hash = (Get-FileHash -Algorithm SHA256 "sgl-windows-x86_64.exe").Hash.ToLower()
-          "$hash  sgl-windows-x86_64.exe" | Out-File -Encoding ascii "sgl-windows-x86_64.exe.sha256"
-          Get-Content "sgl-windows-x86_64.exe.sha256"
+          ./.github/scripts/write-sha256.ps1 -Path "sgl-windows-x86_64.exe" -Output "sgl-windows-x86_64.exe.sha256" -RecordedName "sgl-windows-x86_64.exe"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
