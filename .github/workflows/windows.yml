@@ -180,7 +180,7 @@ jobs:
           #    same binary, same backend, temperature 0, so they are deterministic and MUST
           #    agree. A mismatch here is a genuine bug in one of the two paths.
           $ns = [regex]::Match($out, 'tokens\s+:\s+(\d+) prompt / (\d+) completion')
-          $st = [regex]::Match($out, 'stream usage\s+:\s+Some\((\d+), (\d+)\)')
+          $st = [regex]::Match($out, 'stream usage\s+:\s+Some\(\((\d+), (\d+)\)\)')
           if (-not $ns.Success -or -not $st.Success) { throw "could not read token counts from the probe" }
           if ($ns.Groups[1].Value -ne $st.Groups[1].Value) {
             throw "PROMPT TOKENS DIFFER between paths on one machine: $($ns.Groups[1].Value) vs $($st.Groups[1].Value) - the two paths render different prompts"
