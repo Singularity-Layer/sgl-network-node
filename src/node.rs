@@ -3200,44 +3200,12 @@ async fn process_inference_stream(
         }
     };
 
-    // Per-request nonce chosen by the client (inside the sealed prompt) — bound
-    // into every chunk's AAD so a stream can't be spliced into another request.
-    //
-    // REQUIRED, never defaulted. This used to fall back to "" when the field was
-    // absent, which looks harmless and is not: an empty nonce is a known
-    // constant, so every chunk's AAD becomes predictable and the forgery
-    // protection this nonce exists to provide silently disappears. Nothing
-    // anywhere reported it — the stream just worked, weakly.
-    //
-    // Not hypothetical: a first-party client shipped exactly that bug, sending
-    // the field as `stream_nonce` while this reads `nonce`. It was caught in
-    // review, not by any system. Fail closed so the next one is caught here.
-    let req_nonce = match job
-        .input_payload
-        .as_ref()
-        .and_then(|p| p.get("nonce"))
-        .and_then(|v| v.as_str())
-        .map(str::trim)
-        .filter(|n| !n.is_empty())
-    {
-        Some(n) => n,
-        None => {
-            let _ = client
-                .fail_job(
-                    &job.id,
-                    "sealed stream request missing required nonce (must be a non-empty \
-                     string inside the sealed payload)",
-                )
-                .await;
-            return (Failed, None);
-        }
-    };
-    let sealer = match crate::encryption::StreamSealer::new(resp_pub, req_nonce) {
+    // Per-request nonce + stream sealer. The nonce is required and never defaulted;
+    // see crate::streamseal for why an empty nonce removes forgery protection.
+    let sealer = match crate::streamseal::init(job.input_payload.as_ref(), resp_pub) {
         Ok(s) => s,
-        Err(e) => {
-            let _ = client
-                .fail_job(&job.id, &format!("stream seal init failed: {e}"))
-                .await;
+        Err(reason) => {
+            let _ = client.fail_job(&job.id, &reason).await;
             return (Failed, None);
         }
     };

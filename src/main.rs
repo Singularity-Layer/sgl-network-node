@@ -15,6 +15,7 @@ mod runtime_hardening;
 mod service;
 mod setup;
 mod stream_relay;
+mod streamseal;
 mod tee;
 mod telemetry;
 mod update;
