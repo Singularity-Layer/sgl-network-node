@@ -2,21 +2,6 @@ use sgl_node::inference::ChatMessage;
 use sgl_node::inprocess::{InProcessConfig, InProcessEngine};
 use sgl_node::toolcall::{parse_complete, ToolFormat};
 
-fn is_structured_weather_call(content: &str) -> bool {
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(content) else {
-        return false;
-    };
-    let Some(function) = value.get("function") else {
-        return false;
-    };
-    function.get("name").and_then(|value| value.as_str()) == Some("get_weather")
-        && function
-            .get("parameters")
-            .and_then(|value| value.get("city"))
-            .and_then(|value| value.as_str())
-            == Some("Paris")
-}
-
 fn tool_parser_fixture_passes() -> bool {
     let parsed = parse_complete(
         ToolFormat::Llama3Json,
@@ -53,22 +38,7 @@ fn tool_parser_fixture_passes() -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_structured_weather_call, tool_parser_fixture_passes};
-
-    #[test]
-    fn structured_fallback_requires_exact_function_and_argument() {
-        assert!(is_structured_weather_call(
-            r#"{"function":{"name":"get_weather","parameters":{"city":"Paris"}}}"#
-        ));
-        for rejected in [
-            "not json",
-            r#"{"function":{"name":"get_weather","parameters":{}}}"#,
-            r#"{"function":{"name":"other","parameters":{"city":"Paris"}}}"#,
-            r#"{"name":"get_weather","parameters":{"city":"Paris"}}"#,
-        ] {
-            assert!(!is_structured_weather_call(rejected));
-        }
-    }
+    use super::tool_parser_fixture_passes;
 
     #[test]
     fn deterministic_tool_parser_fixture_passes() {
@@ -119,10 +89,6 @@ async fn main() {
     );
     println!("content       : {:?}", out.content);
     println!("content_len   : {}", out.content.len());
-    println!(
-        "structured call: {}",
-        is_structured_weather_call(&out.content)
-    );
     println!("parser fixture : {}", tool_parser_fixture_passes());
     println!(
         "tokens        : {} prompt / {} completion",
