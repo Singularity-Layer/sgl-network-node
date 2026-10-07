@@ -10,11 +10,9 @@
 #   (No `v*` tag trigger: release.yml's build-windows job builds + publishes the
 #    Windows binary onto the release, so a tag doesn't double-build here.)
 #
-# Deliberately BUILD-ONLY: we compile + package, we do NOT run the node (a real
-# Windows box is an owner follow-up). The `inprocess` feature is NOT enabled on
-# Windows yet (it vendors + builds llama.cpp via cmake; Windows nodes use the
-# child-process `--engine=server` path with llama-server.exe). Windows nodes are
-# non-confidential (no TEE/App Attest), which matches the product framing.
+# Deliberately RELEASE-INERT: we compile, run an in-process model probe, and package,
+# but do not publish or register a node. Windows nodes are non-confidential (no
+# TEE/App Attest), which matches the product framing.
 
 name: windows
 
@@ -29,6 +27,14 @@ jobs:
   build:
     name: build (sgl-windows-x86_64)
     runs-on: windows-latest
+    # One target profile for the shipped binary AND every runtime probe. Keep this
+    # block byte-identical to release.yml; tests/release_workflows.rs enforces it.
+    env:
+      RUSTFLAGS: -C target-feature=+crt-static
+      CMAKE_MSVC_RUNTIME_LIBRARY: MultiThreaded
+      CMAKE_POLICY_DEFAULT_CMP0091: NEW
+      CFLAGS: /MT
+      CXXFLAGS: /MT
     steps:
       - uses: actions/checkout@v4
 
@@ -78,12 +84,6 @@ jobs:
         # the property here reaches CMake without patching or forking the crate.
         # CFLAGS/CXXFLAGS still matter: the mtmd/clip/siglip sources are compiled by the `cc`
         # crate, which never sees the CMake property.
-        env:
-          RUSTFLAGS: -C target-feature=+crt-static
-          CMAKE_MSVC_RUNTIME_LIBRARY: MultiThreaded
-          CMAKE_POLICY_DEFAULT_CMP0091: NEW
-          CFLAGS: /MT
-          CXXFLAGS: /MT
         run: cargo build --release --target x86_64-pc-windows-msvc --features inprocess,vision
 
       - name: Checksum
@@ -142,62 +142,13 @@ jobs:
       # at temperature 0, the streaming and non-streaming paths share a decode loop and must
       # agree exactly. Plus the behaviour that actually matters - a real tool call comes back.
       - name: Build the engine probe
-        # EXPERIMENT: +avx2,+fma. llama-cpp-sys-2 derives ggml's kernels from
-        # CARGO_CFG_TARGET_FEATURE when GGML_NATIVE is OFF, and the plain x86_64-msvc baseline
-        # is SSE2 - no FMA at all, so every multiply-add rounds twice. The arm64 builds use
-        # NEON with FUSED multiply-add (one rounding). That is the widest numerical gap in the
-        # whole matrix, and this build is producing degenerate output (echoing the tool schema
-        # instead of calling the tool) where arm64 calls it correctly. AVX2+FMA has been in
-        # essentially every x86 CPU since 2013.
-        env:
-          RUSTFLAGS: -C target-feature=+crt-static,+avx2,+fma
-          CMAKE_MSVC_RUNTIME_LIBRARY: MultiThreaded
-          CMAKE_POLICY_DEFAULT_CMP0091: NEW
-          CFLAGS: /MT /arch:AVX2
-          CXXFLAGS: /MT /arch:AVX2
+        # Uses the job-level baseline flags above. A probe built with stronger CPU
+        # features does not validate the binary we upload or stage for release.
         run: cargo build --release --target x86_64-pc-windows-msvc --features inprocess,vision --example tool_probe
 
       - name: Run real inference through the in-process engine
         shell: pwsh
-        run: |
-          $url = "https://huggingface.co/bartowski/Llama-3.2-1B-Instruct-GGUF/resolve/main/Llama-3.2-1B-Instruct-Q4_K_M.gguf"
-          Invoke-WebRequest -Uri $url -OutFile model.gguf -UseBasicParsing
-          $probe = "target/x86_64-pc-windows-msvc/release/examples/tool_probe.exe"
-          if (-not (Test-Path $probe)) { throw "probe not built at $probe" }
-          $out = & $probe model.gguf 2>&1 | Out-String
-          Write-Host $out
-
-          # 1. The engine loaded and knows what syntax this model speaks.
-          if ($out -notmatch 'tool_format detected: Llama3Json') { throw "tool format not detected on Windows" }
-
-          # 2. The production tool parser handles a deterministic Llama JSON fixture.
-          # Tool generation by a 1B quantized model legitimately varies by ISA/kernel and is
-          # not a stable CI oracle. The real inference below still must complete and match
-          # streaming byte-for-byte; parser correctness is proven independently here.
-          if ($out -notmatch 'parser fixture : true') { throw "deterministic tool parser fixture failed" }
-
-          # 3. SAME-MACHINE PARITY - the real invariant. Both paths now use the same prompt,
-          #    same binary, same backend, temperature 0, so they are deterministic and MUST
-          #    agree. A mismatch here is a genuine bug in one of the two paths.
-          $ns = [regex]::Match($out, 'tokens\s+:\s+(\d+) prompt / (\d+) completion')
-          $st = [regex]::Match($out, 'stream usage\s+:\s+Some\(\((\d+), (\d+)\)\)')
-          if (-not $ns.Success -or -not $st.Success) { throw "could not read token counts from the probe" }
-          if ($ns.Groups[1].Value -ne $st.Groups[1].Value) {
-            throw "PROMPT TOKENS DIFFER between paths on one machine: $($ns.Groups[1].Value) vs $($st.Groups[1].Value) - the two paths render different prompts"
-          }
-          if ($ns.Groups[2].Value -ne $st.Groups[2].Value) {
-            throw "COMPLETION TOKENS DIFFER between paths on one machine: $($ns.Groups[2].Value) vs $($st.Groups[2].Value)"
-          }
-          if ($out -notmatch 'stream matches: true') {
-            throw "streaming and non-streaming inference produced different content"
-          }
-          $content = [regex]::Match($out, 'content_len\s+:\s+(\d+)')
-          if (-not $content.Success -or [int]$content.Groups[1].Value -lt 1) {
-            throw "real Windows inference produced no content"
-          }
-          $nsc = [int]$ns.Groups[2].Value
-          if ($nsc -lt 1 -or $nsc -ge 80) { throw "completion tokens $nsc hit the cap - real inference did not finish" }
-          Write-Host "OK: Windows real inference matches across both paths ($($ns.Groups[1].Value)/$nsc tokens); deterministic tool parser fixture passed"
+        run: ./.github/scripts/run-windows-inference-probe.ps1
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4

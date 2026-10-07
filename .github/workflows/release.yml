@@ -132,6 +132,14 @@ jobs:
   build-windows:
     name: build (sgl-windows-x86_64)
     runs-on: windows-latest
+    # Byte-identical target profile to windows.yml. The PR probe must validate the
+    # same CPU/runtime baseline this release job stages.
+    env:
+      RUSTFLAGS: -C target-feature=+crt-static
+      CMAKE_MSVC_RUNTIME_LIBRARY: MultiThreaded
+      CMAKE_POLICY_DEFAULT_CMP0091: NEW
+      CFLAGS: /MT
+      CXXFLAGS: /MT
     steps:
       - uses: actions/checkout@v4
 
@@ -175,12 +183,6 @@ jobs:
         # llama-cpp-sys-2's build.rs forwards any CMAKE_* env var as a -D define, so setting
         # the property here reaches CMake with no patch or fork. CFLAGS/CXXFLAGS stay because
         # the mtmd/clip/siglip sources are compiled by the `cc` crate, which never sees it.
-        env:
-          RUSTFLAGS: -C target-feature=+crt-static
-          CMAKE_MSVC_RUNTIME_LIBRARY: MultiThreaded
-          CMAKE_POLICY_DEFAULT_CMP0091: NEW
-          CFLAGS: /MT
-          CXXFLAGS: /MT
         run: cargo build --release --target x86_64-pc-windows-msvc --features inprocess,vision
 
       # "It links" is not "it runs". Twice on Linux a green build produced a binary that
@@ -199,6 +201,15 @@ jobs:
           $bad = $out | Select-String -Pattern 'VCRUNTIME|MSVCP|api-ms-win-crt|ucrtbase|vcomp'
           if ($bad) { throw "sgl.exe imports a non-OS runtime DLL - it will not start on a clean Windows box: $bad" }
           Write-Host "OK: no VC++ runtime imports"
+
+      # The staged release must pass the same real runtime proof as pull requests,
+      # under the exact job-level target profile used for sgl.exe above.
+      - name: Build the engine probe
+        run: cargo build --release --target x86_64-pc-windows-msvc --features inprocess,vision --example tool_probe
+
+      - name: Run real inference through the in-process engine
+        shell: pwsh
+        run: ./.github/scripts/run-windows-inference-probe.ps1
 
       - name: Package + checksum
         shell: pwsh
