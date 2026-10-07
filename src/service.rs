@@ -22,6 +22,7 @@ const SERVICE_LABEL: &str = "cc.x402compute.sglnode";
 pub struct ServiceStartOptions {
     pub model_path: Option<String>,
     pub model_name: Option<String>,
+    pub embedding_python: Option<String>,
     pub systemone_sidecar_url: Option<String>,
     /// Vision (multimodal) models: path to the mmproj GGUF, baked into the service so the
     /// background node serves images across restarts. None for text/embedding models.
@@ -54,6 +55,10 @@ impl ServiceStartOptions {
         if let Some(mn) = &self.model_name {
             args.push("--model-name".into());
             args.push(mn.clone());
+        }
+        if let Some(python) = &self.embedding_python {
+            args.push("--embedding-python".into());
+            args.push(python.clone());
         }
         if let Some(url) = &self.systemone_sidecar_url {
             args.push("--systemone-sidecar-url".into());
@@ -763,4 +768,40 @@ fn run(cmd: &str, args: &[&str]) -> Result<String, String> {
         return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
     }
     Ok(String::from_utf8_lossy(&out.stdout).to_string())
+}
+
+#[cfg(test)]
+mod embedding_service_tests {
+    use super::*;
+    #[test]
+    fn dedicated_python_is_persisted_without_changing_legacy_service_args() {
+        let mut opts = ServiceStartOptions {
+            model_path: Some("/owned/eg2/snapshot".into()),
+            model_name: Some("embeddinggemma-2".into()),
+            embedding_python: None,
+            systemone_sidecar_url: None,
+            mmproj_path: None,
+            image_max_tokens: None,
+            orchestrator_url: "https://grid.x402compute.cc".into(),
+            resource_percent: 50,
+            inference_port: 8081,
+            max_jobs: 1,
+            context_size: 8192,
+            heartbeat_interval: 5,
+            enable_streaming: false,
+            sandbox: false,
+        };
+        let legacy = opts.start_args();
+        assert!(!legacy.iter().any(|a| a == "--embedding-python"));
+        opts.embedding_python = Some("/owned/eg2/runtime/bin/python".into());
+        let candidate = opts.start_args();
+        let at = candidate
+            .iter()
+            .position(|a| a == "--embedding-python")
+            .unwrap();
+        assert_eq!(candidate[at + 1], "/owned/eg2/runtime/bin/python");
+        let mut stripped = candidate;
+        stripped.drain(at..at + 2);
+        assert_eq!(stripped, legacy);
+    }
 }

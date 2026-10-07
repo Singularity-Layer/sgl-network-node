@@ -27,6 +27,8 @@ fn retryable_inference_transport_error(err: &reqwest::Error) -> bool {
 
 #[derive(Clone)]
 pub struct InferenceEngineConfig {
+    /// Dedicated embedding venv interpreter; never shared with chat/System One.
+    pub embedding_python: Option<PathBuf>,
     pub model_path: PathBuf,
     pub model_name: String,
     pub port: u16,
@@ -370,6 +372,9 @@ impl ServerEngine {
     }
 
     pub async fn start(&self) -> Result<(), String> {
+        if crate::embed_catalog::is_multimodal_embedding_model(&self.config.model_name) {
+            return Err("EmbeddingGemma 2 cannot run in llama.cpp".into());
+        }
         // Non-reentrant: kill any existing child first so a second start() (or a manual
         // call) can never orphan a running llama-server. No-op on the initial start.
         self.stop();
@@ -991,6 +996,7 @@ impl EngineMode {
 /// the in-process `llama-cpp-2` engine. Public API matches what node.rs / ws.rs already
 /// call, so the rest of the node is engine-agnostic.
 pub enum InferenceEngine {
+    MultimodalEmbed(crate::eg2::Eg2Engine),
     Server(ServerEngine),
     #[cfg(feature = "inprocess")]
     InProcess(crate::inprocess::InProcessEngine),
@@ -1016,6 +1022,7 @@ impl InferenceEngine {
     /// (node.rs), so a node can be `inprocess` for text and `server` for vision.
     pub fn mode_label(&self) -> &'static str {
         match self {
+            InferenceEngine::MultimodalEmbed(_) => "embedding-worker",
             InferenceEngine::Server(_) => "server",
             #[cfg(feature = "inprocess")]
             InferenceEngine::InProcess(_) => "inprocess",
@@ -1028,6 +1035,7 @@ impl InferenceEngine {
     #[cfg_attr(not(feature = "inprocess"), allow(unused_variables))]
     pub fn accelerator_hint(&self, gpu_layers: u32) -> &'static str {
         match self {
+            InferenceEngine::MultimodalEmbed(_) => "metal",
             InferenceEngine::Server(e) => *e.accelerator.lock().unwrap_or_else(|p| p.into_inner()),
             #[cfg(feature = "inprocess")]
             _ => crate::telemetry::inprocess_accelerator(gpu_layers),
@@ -1036,6 +1044,15 @@ impl InferenceEngine {
 
     /// Build + start the chosen engine.
     pub async fn create(config: InferenceEngineConfig, mode: EngineMode) -> Result<Self, String> {
+        // Must precede either llama.cpp engine and the GGUF embedding catalog lookup.
+        if crate::embed_catalog::is_multimodal_embedding_model(&config.model_name) {
+            return crate::eg2::Eg2Engine::production(
+                &config.model_path,
+                config.embedding_python.as_deref(),
+            )
+            .await
+            .map(InferenceEngine::MultimodalEmbed);
+        }
         // Embedding models get the dedicated pooling engine regardless of `--engine` (they can't
         // run through the chat path). Only available on an `inprocess` build.
         #[cfg(feature = "inprocess")]
@@ -1104,6 +1121,7 @@ impl InferenceEngine {
 
     pub async fn is_healthy(&self) -> bool {
         match self {
+            InferenceEngine::MultimodalEmbed(e) => e.is_healthy(),
             InferenceEngine::Server(e) => e.is_healthy().await,
             #[cfg(feature = "inprocess")]
             InferenceEngine::InProcess(e) => e.is_healthy(),
@@ -1117,6 +1135,7 @@ impl InferenceEngine {
     /// restarted by the generic /health path, and the embedding engine does not classify errors.
     pub fn backend_failed(&self) -> bool {
         match self {
+            InferenceEngine::MultimodalEmbed(_) => false,
             InferenceEngine::Server(_) => false,
             #[cfg(feature = "inprocess")]
             InferenceEngine::InProcess(e) => e.backend_failed(),
@@ -1128,6 +1147,7 @@ impl InferenceEngine {
     /// True iff this engine serves embeddings (routes `/v1/embeddings` jobs) rather than chat.
     pub fn is_embedding(&self) -> bool {
         match self {
+            InferenceEngine::MultimodalEmbed(_) => true,
             // Server engine in --embedding mode (the non-`inprocess`/Windows path).
             InferenceEngine::Server(e) => e.is_embedding(),
             #[cfg(feature = "inprocess")]
@@ -1143,6 +1163,7 @@ impl InferenceEngine {
     /// child over a socket the operator can read.
     pub fn is_vision(&self) -> bool {
         match self {
+            InferenceEngine::MultimodalEmbed(_) => false,
             InferenceEngine::Server(e) => e.is_vision(),
             #[cfg(all(feature = "inprocess", feature = "vision"))]
             InferenceEngine::InProcess(e) => e.is_vision(),
@@ -1161,6 +1182,7 @@ impl InferenceEngine {
     /// orchestrator stops routing tool jobs here rather than having them refused on arrival.
     pub fn supports_tools(&self) -> bool {
         match self {
+            InferenceEngine::MultimodalEmbed(_) => false,
             InferenceEngine::Server(e) => !e.is_embedding(),
             #[cfg(all(feature = "inprocess", feature = "vision"))]
             InferenceEngine::InProcess(e) => e.tool_format().supports_tools(),
@@ -1175,6 +1197,7 @@ impl InferenceEngine {
     /// orchestrator so it can meter + surface `dim` per model.
     pub fn embedding_dim(&self) -> Option<u32> {
         match self {
+            InferenceEngine::MultimodalEmbed(e) => e.capabilities().map(|c| c.embedding_dim),
             InferenceEngine::Server(e) => e.embedding_dim(),
             #[cfg(feature = "inprocess")]
             InferenceEngine::Embed(e) => Some(e.dim()),
@@ -1183,8 +1206,35 @@ impl InferenceEngine {
         }
     }
 
+    pub fn embedding_capabilities(&self) -> Option<crate::eg2::Capabilities> {
+        match self {
+            Self::MultimodalEmbed(e) => e.capabilities(),
+            _ => None,
+        }
+    }
+
+    pub fn embedding_snapshot(&self, models: &[String]) -> Option<crate::eg2::ReadinessSnapshot> {
+        match self {
+            Self::MultimodalEmbed(e) => Some(e.readiness_snapshot(models)),
+            _ => None,
+        }
+    }
+
+    pub async fn embed_multimodal(
+        &self,
+        batch: crate::embedding_input::EmbeddingBatch,
+        input_type: crate::embed_catalog::InputType,
+        dimensions: Option<u32>,
+    ) -> Result<crate::eg2::Output, String> {
+        match self {
+            Self::MultimodalEmbed(e) => e.embed(batch, input_type, dimensions).await,
+            _ => Err("structured media requires an EmbeddingGemma 2 worker".into()),
+        }
+    }
+
     pub fn stop(&self) {
         match self {
+            InferenceEngine::MultimodalEmbed(e) => e.stop(),
             InferenceEngine::Server(e) => e.stop(),
             #[cfg(feature = "inprocess")]
             InferenceEngine::InProcess(_) => { /* worker stops when the engine is dropped */ }
@@ -1202,6 +1252,9 @@ impl InferenceEngine {
         dimensions: Option<u32>,
     ) -> Result<crate::embed_catalog::EmbedOut, String> {
         match self {
+            InferenceEngine::MultimodalEmbed(_) => {
+                Err("use typed multimodal embedding dispatch".into())
+            }
             InferenceEngine::Server(e) => e.embed(inputs, input_type, dimensions).await,
             #[cfg(feature = "inprocess")]
             InferenceEngine::Embed(e) => e.embed(inputs, input_type, dimensions).await,
@@ -1212,6 +1265,7 @@ impl InferenceEngine {
 
     pub async fn restart(&self) -> Result<(), String> {
         match self {
+            InferenceEngine::MultimodalEmbed(e) => e.restart().await,
             InferenceEngine::Server(e) => e.restart().await,
             // In-process: there is no child process to restart — the engine IS this process,
             // and a wedged native llama.cpp call can never be recovered from Rust. The node
@@ -1245,6 +1299,7 @@ impl InferenceEngine {
     /// (abort) as `restart()` — the canary + cooldown in the heartbeat loop gate it.
     pub async fn restart_empty(&self) -> Result<(), String> {
         match self {
+            InferenceEngine::MultimodalEmbed(_) => self.restart().await,
             InferenceEngine::Server(e) => e.restart_no_swap().await,
             #[cfg(feature = "inprocess")]
             InferenceEngine::InProcess(_) => self.restart().await,
@@ -1262,6 +1317,9 @@ impl InferenceEngine {
         tool_choice: Option<serde_json::Value>,
     ) -> Result<InferenceResult, String> {
         match self {
+            InferenceEngine::MultimodalEmbed(_) => {
+                Err("this node serves embeddings, not chat completions".into())
+            }
             InferenceEngine::Server(e) => {
                 e.chat_completion(messages, temperature, max_tokens, tools, tool_choice)
                     .await
@@ -1277,13 +1335,18 @@ impl InferenceEngine {
                 // back out of the reply. Previously they were silently dropped here, so an
                 // agent got prose and it looked like the model failing rather than the engine.
                 if tools.is_some() && !e.tool_format().supports_tools() {
-                    return Err(
-                        "this model's chat template cannot express tool calls".to_string()
-                    );
+                    return Err("this model's chat template cannot express tool calls".to_string());
                 }
                 let allowed = crate::toolcall::allowed_names(tools.as_ref());
                 let out = e
-                    .chat_completion(&msgs, images, tools, allowed, max_tokens, temperature as f32)
+                    .chat_completion(
+                        &msgs,
+                        images,
+                        tools,
+                        allowed,
+                        max_tokens,
+                        temperature as f32,
+                    )
                     .await?;
                 Ok(InferenceResult {
                     content: out.content,
@@ -1313,6 +1376,9 @@ impl InferenceEngine {
         tx: tokio::sync::mpsc::Sender<StreamEvent>,
     ) -> Result<(), String> {
         match self {
+            InferenceEngine::MultimodalEmbed(_) => {
+                Err("this node serves embeddings, not chat completions".into())
+            }
             InferenceEngine::Server(e) => {
                 e.chat_completion_stream(messages, tools, tool_choice, temperature, max_tokens, tx)
                     .await
@@ -1324,9 +1390,7 @@ impl InferenceEngine {
                 // be refused is a model whose template cannot express a call at all — answering
                 // as prose is the bug this whole path exists to kill.
                 if tools.is_some() && !e.tool_format().supports_tools() {
-                    return Err(
-                        "this model's chat template cannot express tool calls".to_string()
-                    );
+                    return Err("this model's chat template cannot express tool calls".to_string());
                 }
                 let (typed, images) = crate::multimodal::flatten(&messages)?;
                 let allowed = crate::toolcall::allowed_names(tools.as_ref());

@@ -1,14 +1,15 @@
 mod config;
 mod crypto;
+mod eg2;
 #[cfg(feature = "inprocess")]
 mod embed;
 mod embed_catalog;
+mod embedding_input;
 mod encryption;
 mod inference;
 #[cfg(feature = "inprocess")]
 mod inprocess;
 mod multimodal;
-mod toolcall;
 mod node;
 mod orchestrator;
 mod runtime_hardening;
@@ -17,6 +18,7 @@ mod setup;
 mod stream_relay;
 mod tee;
 mod telemetry;
+mod toolcall;
 mod update;
 mod ws;
 
@@ -92,6 +94,10 @@ enum Commands {
         /// Model name to advertise (e.g. "llama-3.2-3b")
         #[arg(long)]
         model_name: Option<String>,
+
+        /// App-owned EmbeddingGemma 2 Python interpreter, separate from chat runtimes.
+        #[arg(long)]
+        embedding_python: Option<String>,
 
         /// System One sidecar base URL (for Laya/Jev-compatible typed decision models).
         /// When set without --model-path, the node advertises --model-name or convaiinnovations/laya.
@@ -242,6 +248,10 @@ enum ServiceAction {
         #[arg(long)]
         model_name: Option<String>,
 
+        /// App-owned EmbeddingGemma 2 Python interpreter, separate from chat runtimes.
+        #[arg(long)]
+        embedding_python: Option<String>,
+
         /// System One sidecar base URL (for Laya/Jev-compatible typed decision models).
         #[arg(long)]
         systemone_sidecar_url: Option<String>,
@@ -375,6 +385,7 @@ async fn main() {
         Commands::Start {
             model_path,
             model_name,
+            embedding_python,
             systemone_sidecar_url,
             mmproj_path,
             image_max_tokens,
@@ -416,6 +427,7 @@ async fn main() {
                 &cli.orchestrator_url,
                 model_path.as_deref(),
                 model_name.as_deref(),
+                embedding_python.as_deref(),
                 systemone_sidecar_url.as_deref(),
                 mmproj_path.as_deref(),
                 image_max_tokens,
@@ -504,6 +516,7 @@ async fn main() {
                 ServiceAction::Install {
                     model_path,
                     model_name,
+                    embedding_python,
                     systemone_sidecar_url,
                     mmproj_path,
                     image_max_tokens,
@@ -518,6 +531,7 @@ async fn main() {
                     let opts = service::ServiceStartOptions {
                         model_path,
                         model_name,
+                        embedding_python,
                         systemone_sidecar_url: systemone_sidecar_url.or_else(|| {
                             std::env::var("SGL_SYSTEMONE_SIDECAR_URL")
                                 .ok()
