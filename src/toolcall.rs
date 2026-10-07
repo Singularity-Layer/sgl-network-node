@@ -150,7 +150,7 @@ pub fn parse_complete(
 
     ParsedOutput {
         text,
-        tool_calls: (!calls.is_empty()).then(|| serde_json::Value::Array(calls)),
+        tool_calls: (!calls.is_empty()).then_some(serde_json::Value::Array(calls)),
     }
 }
 
