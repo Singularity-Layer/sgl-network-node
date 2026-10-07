@@ -81,3 +81,28 @@ fn windows_probe_model_is_immutable_and_verified_before_native_load() {
         "model hash must be checked before native loading"
     );
 }
+
+#[test]
+fn windows_checksums_are_posix_verifiable() {
+    let windows = workflow("windows.yml");
+    let release = workflow("release.yml");
+    let helper = repository_file(".github/scripts/write-sha256.ps1");
+
+    assert_eq!(
+        windows
+            .matches("./.github/scripts/write-sha256.ps1")
+            .count(),
+        2
+    );
+    assert_eq!(
+        release
+            .matches("./.github/scripts/write-sha256.ps1")
+            .count(),
+        1
+    );
+    assert!(!windows.contains("Out-File -Encoding ascii"));
+    assert!(!release.contains("Out-File -Encoding ascii"));
+    assert!(helper.contains("[System.IO.File]::WriteAllText"));
+    assert!(helper.contains("$RecordedName`n"));
+    assert!(!helper.contains("Out-File"));
+}

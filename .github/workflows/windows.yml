@@ -91,9 +91,7 @@ jobs:
         run: |
           $bin = "target/x86_64-pc-windows-msvc/release/sgl.exe"
           if (-not (Test-Path $bin)) { throw "sgl.exe was not produced at $bin" }
-          $hash = (Get-FileHash -Algorithm SHA256 $bin).Hash.ToLower()
-          "$hash  sgl-windows-x86_64.exe" | Out-File -Encoding ascii "sgl-windows-x86_64.exe.sha256"
-          Get-Content "sgl-windows-x86_64.exe.sha256"
+          ./.github/scripts/write-sha256.ps1 -Path $bin -Output "sgl-windows-x86_64.exe.sha256" -RecordedName "sgl-windows-x86_64.exe"
           Copy-Item $bin "sgl-windows-x86_64.exe"
 
       # "It links" is not "it runs". Twice on Linux a build went green and the binary then
@@ -177,9 +175,7 @@ jobs:
             Write-Host "$d $((Get-Item $p).VersionInfo.ProductVersion)"
           }
           Compress-Archive -Path "vccrt-x64\*" -DestinationPath "vccrt-x64.zip"
-          $hash = (Get-FileHash -Algorithm SHA256 "vccrt-x64.zip").Hash.ToLower()
-          "$hash  vccrt-x64.zip" | Out-File -Encoding ascii "vccrt-x64.zip.sha256"
-          Get-Content "vccrt-x64.zip.sha256"
+          ./.github/scripts/write-sha256.ps1 -Path "vccrt-x64.zip" -Output "vccrt-x64.zip.sha256" -RecordedName "vccrt-x64.zip"
 
       - name: Upload CRT artifact
         uses: actions/upload-artifact@v4
