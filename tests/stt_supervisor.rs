@@ -5,6 +5,30 @@ use sgl_node::stt::{
 };
 use std::time::Duration;
 
+fn wav_pcm(wav: &[u8]) -> Result<&[u8], &'static str> {
+    if wav.len() < 12 || &wav[..4] != b"RIFF" || &wav[8..12] != b"WAVE" {
+        return Err("invalid WAV container");
+    }
+    let mut offset = 12usize;
+    while offset.checked_add(8).is_some_and(|end| end <= wav.len()) {
+        let size = u32::from_le_bytes(
+            wav[offset + 4..offset + 8]
+                .try_into()
+                .map_err(|_| "invalid WAV chunk")?,
+        ) as usize;
+        let start = offset + 8;
+        let end = start.checked_add(size).ok_or("WAV chunk overflow")?;
+        if end > wav.len() {
+            return Err("truncated WAV chunk");
+        }
+        if &wav[offset..offset + 4] == b"data" {
+            return Ok(&wav[start..end]);
+        }
+        offset = end.checked_add(size % 2).ok_or("WAV chunk overflow")?;
+    }
+    Err("WAV data chunk missing")
+}
+
 fn worker(body: &str) -> WorkerConfig {
     let ready = json!({
         "type":"ready","protocol":PROTOCOL,"runtime":RUNTIME,
@@ -219,7 +243,7 @@ async fn production_worker_real_canary() {
     assert_eq!(caps.architecture, "aarch64");
     // Packaged approved public JFK fixture, pinned and attributed by the release manifest.
     let wav = std::fs::read(std::path::Path::new(&smoke).join("audio.wav")).expect("smoke fixture");
-    let pcm = &wav[44..];
+    let pcm = wav_pcm(&wav).expect("smoke fixture PCM data chunk");
     let value = canonical_audio(pcm);
     let request = AudioRequest::parse(&value).unwrap();
     let out = engine
@@ -243,6 +267,20 @@ async fn production_worker_real_canary() {
     assert!(silent.duration_seconds > 0.0 && silent.duration_seconds <= 2.0);
     assert!(engine.is_healthy());
     engine.stop();
+}
+
+#[test]
+fn wav_parser_uses_the_data_chunk_instead_of_a_fixed_header_offset() {
+    let mut wav = b"RIFF".to_vec();
+    wav.extend_from_slice(&30u32.to_le_bytes());
+    wav.extend_from_slice(b"WAVE");
+    wav.extend_from_slice(b"JUNK");
+    wav.extend_from_slice(&2u32.to_le_bytes());
+    wav.extend_from_slice(&[9, 9]);
+    wav.extend_from_slice(b"data");
+    wav.extend_from_slice(&4u32.to_le_bytes());
+    wav.extend_from_slice(&[1, 2, 3, 4]);
+    assert_eq!(wav_pcm(&wav).unwrap(), &[1, 2, 3, 4]);
 }
 
 #[tokio::test]
