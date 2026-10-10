@@ -17,7 +17,7 @@
 # ALLOWED_NODE_BINARY_HASHES (add-before-remove) or the build cannot serve.
 #
 # STAGED RELEASE: a tag creates a draft whose artifacts can be attested, tested,
-# and added to the orchestrator allowlist while v1.9.16 remains the latest release.
+# and added to the orchestrator allowlist while the current published release remains latest.
 # Publishing the draft is a separate owner action after the add-before-remove
 # allowlist is live. Nothing reaches cloud.x402compute.cc until a later manual sync.
 

@@ -57,25 +57,34 @@ serve traffic. On every release:
   serving.
 - The historical v1.9.16 hashes are preserved in
   `docs/releases/v1.9.16.sha256`. Preserve every currently accepted production
-  hash, including v1.9.17, while v1.10.0 rolls out. The Whisper archive/runtime
+  hash, including v1.9.17 and the canary-only v1.10.0 hashes, while v1.10.1
+  rolls out. The Whisper archive/runtime
   hash is a separate STT artifact pin; do not add it to the node executable allowlist.
+
+`v1.10.0` was never published: its private encrypted STT canary exposed a
+signature-domain mismatch before promotion. Keep that draft unpublished and
+stage the corrected source as the distinct `v1.10.1` candidate. Remove the
+canary-only v1.10.0 executable hashes only after v1.10.1 is live, verified, and
+no v1.10.0 canary node remains online.
 
 For a staged candidate:
 
 ```sh
-gh release download v1.10.0 --repo Singularity-Layer/sgl-network-node --dir /tmp/sgl-v1.10.0
-cd /tmp/sgl-v1.10.0
-sha256sum --check sgl-node-v1.10.0.sha256
-for asset in sgl-darwin-arm64 sgl-linux-* sgl-windows-x86_64.exe whisper-stt-macos-arm64-v1.10.0.tar.gz; do
+gh release download v1.10.1 --repo Singularity-Layer/sgl-network-node --dir /tmp/sgl-v1.10.1
+cd /tmp/sgl-v1.10.1
+sha256sum --check sgl-node-v1.10.1.sha256
+for asset in sgl-darwin-arm64 sgl-linux-* sgl-windows-x86_64.exe whisper-stt-macos-arm64-v1.10.1.tar.gz; do
   gh attestation verify "$asset" --repo Singularity-Layer/sgl-network-node
 done
 ```
 
 After the orchestrator preserves the prior accepted hashes, adds all six
-v1.10.0 node hashes, and the candidate canaries pass, promote the same immutable draft:
+v1.10.1 node hashes, and the candidate canaries pass, apply the prepared release
+note and promote the same immutable draft:
 
 ```sh
-gh release edit v1.10.0 --repo Singularity-Layer/sgl-network-node --draft=false --latest
+gh release edit v1.10.1 --repo Singularity-Layer/sgl-network-node \
+  --notes-file docs/releases/v1.10.1.md --draft=false --latest
 ```
 
 Do not delete and recreate a draft to promote it. That would make the reviewed
