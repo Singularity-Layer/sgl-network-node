@@ -70,7 +70,7 @@ sgl start --model-name whisper-1 \
 # Optional dedicated stdlib interpreter: --stt-python /owned/stt/bin/python3
 ```
 
-The versioned `whisper-stt-macos-arm64-v1.10.0.tar.gz` release asset includes
+The versioned `whisper-stt-macos-arm64-v1.10.1.tar.gz` release asset includes
 `whisper-cli`, the unchanged approved runtime manifest, runtime MIT license,
 public upstream smoke `audio.wav`, `smoke.json`, and attribution. Verify its
 GitHub attestation and checksum before extraction. CI packages the reviewed

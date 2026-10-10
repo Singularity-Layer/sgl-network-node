@@ -71,16 +71,16 @@ class WhisperReleaseTests(unittest.TestCase):
     def test_package_roundtrip_and_deterministic_checksum(self):
         with tempfile.TemporaryDirectory() as temp:
             output = Path(temp)
-            release.package("v1.10.0", output)
-            archive = output / "whisper-stt-macos-arm64-v1.10.0.tar.gz"
+            release.package("v1.10.1", output)
+            archive = output / "whisper-stt-macos-arm64-v1.10.1.tar.gz"
             first = archive.read_bytes()
             checksum = archive.with_name(archive.name + ".sha256").read_text()
             self.assertEqual(checksum, f"{hashlib.sha256(first).hexdigest()}  {archive.name}\n")
-            release.package("v1.10.0", output)
+            release.package("v1.10.1", output)
             self.assertEqual(first, archive.read_bytes())
-            release.verify_archive(archive, "v1.10.0")
+            release.verify_archive(archive, "v1.10.1")
             with self.assertRaisesRegex(ValueError, "prefix"):
-                release.verify_archive(archive, "v1.10.1")
+                release.verify_archive(archive, "v1.10.0")
 
     def test_archive_rejects_missing_extra_duplicate_symlink_and_wrong_mode(self):
         for change in ("missing", "extra", "duplicate", "symlink", "mode"):
@@ -95,7 +95,7 @@ class WhisperReleaseTests(unittest.TestCase):
                     if change == "duplicate":
                         names.append("whisper-cli")
                     for name in names:
-                        entry = tarfile.TarInfo(f"whisper-stt-macos-arm64-v1.10.0/{name}")
+                        entry = tarfile.TarInfo(f"whisper-stt-macos-arm64-v1.10.1/{name}")
                         data = self.files.get(name, b"unexpected")
                         entry.size = len(data)
                         entry.mode = 0o755 if name == "whisper-cli" else 0o644
@@ -107,7 +107,7 @@ class WhisperReleaseTests(unittest.TestCase):
                             entry.mode = 0o644
                         archive.addfile(entry, io.BytesIO(data) if entry.isfile() else None)
                 with self.assertRaises(ValueError):
-                    release.verify_archive(path, "v1.10.0")
+                    release.verify_archive(path, "v1.10.1")
 
 
 if __name__ == "__main__":
