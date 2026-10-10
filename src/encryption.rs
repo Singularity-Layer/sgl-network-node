@@ -7,6 +7,16 @@ use rand::RngCore;
 use sha2::{Digest, Sha256};
 use x25519_dalek::{EphemeralSecret, PublicKey, StaticSecret};
 
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TranscriptionEnvelope {
+    ciphertext: String,
+    client_ephemeral_pubkey: String,
+    client_response_pubkey: String,
+    algorithm: String,
+    encoding: String,
+}
+
 /// Hard cap on a sealed prompt blob (base58 chars) from an untrusted orchestrator,
 /// so a malicious/huge payload can't force an unbounded base58-decode + allocation
 /// before we ever look at it. 8 MiB of base58 is far more than any real prompt.
@@ -106,8 +116,28 @@ pub fn unseal_input(
     {
         return Err("invalid multimodal input envelope".into());
     }
+    // Transcription audio uses the same sealed v2 envelope discipline: base64, utf-8,
+    // v2 only, with the protocol authenticated inside the envelope.
+    let transcription = payload.get("transcription_reservation").is_some();
+    if transcription {
+        let parsed: TranscriptionEnvelope = serde_json::from_value(enc.clone())
+            .map_err(|_| "invalid transcription input envelope")?;
+        if parsed.algorithm != ALGO_V2 || parsed.encoding != "base64" {
+            return Err("invalid transcription input envelope".into());
+        }
+        // Parsing above rejects unknown fields and proves these exact values exist. The
+        // generic decrypt path below reads the same object and keeps one crypto implementation.
+        let _ = (
+            parsed.ciphertext,
+            parsed.client_ephemeral_pubkey,
+            parsed.client_response_pubkey,
+        );
+    }
     let encoded_cap = if multimodal {
         32 * 1024 * 1024 + 256
+    } else if transcription {
+        // 60 s PCM (1,920,000 bytes) plus canonical JSON and AEAD overhead.
+        8 * 1024 * 1024 + 4096
     } else {
         MAX_SEALED_B58_LEN
     };
@@ -147,6 +177,9 @@ pub fn unseal_input(
     if multimodal && ciphertext.len() > crate::embedding_input::MAX_ENCODED_BODY + 40 {
         return Err("multimodal ciphertext exceeds decoded limit".into());
     }
+    if transcription && ciphertext.len() > crate::stt::MAX_INPUT_FRAME {
+        return Err("transcription ciphertext exceeds decoded limit".into());
+    }
     let ephemeral = bs58_to_32(ephemeral_b58)?;
     let response_pub = bs58_to_32(response_b58)?;
 
@@ -175,6 +208,10 @@ pub fn unseal_input(
         && inner.get("embedding_protocol").and_then(|v| v.as_str()) != Some(crate::eg2::PROTOCOL)
     {
         return Err("sealed multimodal protocol mismatch".into());
+    }
+    if transcription && inner.get("protocol").and_then(|v| v.as_str()) != Some(crate::stt::PROTOCOL)
+    {
+        return Err("sealed transcription protocol mismatch".into());
     }
     Ok((inner, Some(response_pub), version))
 }
@@ -515,5 +552,58 @@ mod tests {
             )
             .unwrap();
         assert_eq!(pt, msg);
+    }
+    #[test]
+    fn transcription_v2_seal_rejects_downgrades_and_response_key_swap() {
+        use base64::Engine;
+        let node_seed = [0x42; 32];
+        let node = EncryptionKeypair::from_ed25519_seed(&node_seed);
+        let ephemeral = StaticSecret::from([0x13; 32]);
+        let ephemeral_pub = PublicKey::from(&ephemeral);
+        let response_pub = PublicKey::from(&StaticSecret::from([0x19; 32]));
+        let eph_b58 = bs58::encode(ephemeral_pub.as_bytes()).into_string();
+        let resp_b58 = bs58::encode(response_pub.as_bytes()).into_string();
+        let shared = ephemeral.diffie_hellman(&node.public);
+        let key = hkdf_key(shared.as_bytes(), HKDF_INFO_INPUT);
+        let cipher = XChaCha20Poly1305::new_from_slice(&key).unwrap();
+        let inner = serde_json::json!({
+            "protocol": crate::stt::PROTOCOL, "request_id":"00000000-0000-4000-8000-000000000001",
+            "model":crate::stt::MODEL_ID,"model_revision":crate::stt::MODEL_REVISION,
+            "model_sha256":crate::stt::MODEL_SHA256,"language":"auto",
+            "audio":{"format":"pcm_s16le","sample_rate":16000,"channels":1,"bits_per_sample":16,"sample_count":1,"data":"AAA="}
+        });
+        let aad = aad_input(&node.public_key_bs58(), &eph_b58, &resp_b58);
+        let nonce = [0x27; 24];
+        let encrypted = cipher
+            .encrypt(
+                XNonce::from_slice(&nonce),
+                Payload {
+                    msg: inner.to_string().as_bytes(),
+                    aad: &aad,
+                },
+            )
+            .unwrap();
+        let mut blob = nonce.to_vec();
+        blob.extend(encrypted);
+        let payload = serde_json::json!({
+            "enc":{"ciphertext":base64::engine::general_purpose::STANDARD.encode(blob),"algorithm":ALGO_V2,"encoding":"base64", "client_ephemeral_pubkey":eph_b58,"client_response_pubkey":resp_b58},
+            "transcription_reservation":{}
+        });
+        let (opened, _, version) = unseal_input(&payload, &node_seed).unwrap();
+        assert_eq!(version, EncVersion::V2);
+        assert_eq!(opened, inner);
+        for (field, value) in [
+            ("encoding", serde_json::json!("base58")),
+            ("algorithm", serde_json::json!(ALGO_V1)),
+            (
+                "client_response_pubkey",
+                serde_json::json!("11111111111111111111111111111111"),
+            ),
+            ("extra", serde_json::json!(true)),
+        ] {
+            let mut changed = payload.clone();
+            changed["enc"][field] = value;
+            assert!(unseal_input(&changed, &node_seed).is_err(), "{field}");
+        }
     }
 }

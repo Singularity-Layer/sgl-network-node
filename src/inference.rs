@@ -29,6 +29,14 @@ fn retryable_inference_transport_error(err: &reqwest::Error) -> bool {
 pub struct InferenceEngineConfig {
     /// Dedicated embedding venv interpreter; never shared with chat/System One.
     pub embedding_python: Option<PathBuf>,
+    /// whisper.cpp binary for the transcription worker; never shared with chat runtimes.
+    pub stt_whisper: Option<PathBuf>,
+    /// Required SHA-256 of the operator-provided whisper-cli artifact.
+    pub stt_whisper_sha256: Option<String>,
+    /// Optional dedicated interpreter for the transcription worker (stdlib only).
+    pub stt_python: Option<PathBuf>,
+    /// Explicit release-integrator-approved known-audio fixture directory.
+    pub stt_smoke_dir: Option<PathBuf>,
     pub model_path: PathBuf,
     pub model_name: String,
     pub port: u16,
@@ -374,6 +382,9 @@ impl ServerEngine {
     pub async fn start(&self) -> Result<(), String> {
         if crate::embed_catalog::is_multimodal_embedding_model(&self.config.model_name) {
             return Err("EmbeddingGemma 2 cannot run in llama.cpp".into());
+        }
+        if crate::stt::MODEL_ID.eq_ignore_ascii_case(&self.config.model_name) {
+            return Err("whisper transcription cannot run in llama.cpp".into());
         }
         // Non-reentrant: kill any existing child first so a second start() (or a manual
         // call) can never orphan a running llama-server. No-op on the initial start.
@@ -997,6 +1008,7 @@ impl EngineMode {
 /// call, so the rest of the node is engine-agnostic.
 pub enum InferenceEngine {
     MultimodalEmbed(crate::eg2::Eg2Engine),
+    Stt(Box<crate::stt::SttEngine>),
     Server(ServerEngine),
     #[cfg(feature = "inprocess")]
     InProcess(crate::inprocess::InProcessEngine),
@@ -1023,6 +1035,7 @@ impl InferenceEngine {
     pub fn mode_label(&self) -> &'static str {
         match self {
             InferenceEngine::MultimodalEmbed(_) => "embedding-worker",
+            InferenceEngine::Stt(_) => "stt-worker",
             InferenceEngine::Server(_) => "server",
             #[cfg(feature = "inprocess")]
             InferenceEngine::InProcess(_) => "inprocess",
@@ -1036,6 +1049,7 @@ impl InferenceEngine {
     pub fn accelerator_hint(&self, gpu_layers: u32) -> &'static str {
         match self {
             InferenceEngine::MultimodalEmbed(_) => "metal",
+            InferenceEngine::Stt(_) => "unknown",
             InferenceEngine::Server(e) => *e.accelerator.lock().unwrap_or_else(|p| p.into_inner()),
             #[cfg(feature = "inprocess")]
             _ => crate::telemetry::inprocess_accelerator(gpu_layers),
@@ -1052,6 +1066,24 @@ impl InferenceEngine {
             )
             .await
             .map(InferenceEngine::MultimodalEmbed);
+        }
+        // Transcription gets its own supervised worker before any llama.cpp path.
+        if crate::stt::MODEL_ID.eq_ignore_ascii_case(&config.model_name) {
+            let whisper = config.stt_whisper.as_deref().ok_or(
+                "whisper transcription requires --stt-whisper for its pinned runtime binary",
+            )?;
+            let whisper_sha256 = config.stt_whisper_sha256.as_deref().ok_or(
+                "whisper transcription requires --stt-whisper-sha256 for its pinned runtime binary",
+            )?;
+            return crate::stt::SttEngine::production(
+                &config.model_path,
+                whisper,
+                whisper_sha256,
+                config.stt_smoke_dir.as_deref().ok_or("whisper transcription requires --stt-smoke-dir for an approved known-audio fixture")?,
+                config.stt_python.as_deref(),
+            )
+            .await
+            .map(|engine| InferenceEngine::Stt(Box::new(engine)));
         }
         // Embedding models get the dedicated pooling engine regardless of `--engine` (they can't
         // run through the chat path). Only available on an `inprocess` build.
@@ -1122,6 +1154,7 @@ impl InferenceEngine {
     pub async fn is_healthy(&self) -> bool {
         match self {
             InferenceEngine::MultimodalEmbed(e) => e.is_healthy(),
+            InferenceEngine::Stt(e) => e.is_healthy(),
             InferenceEngine::Server(e) => e.is_healthy().await,
             #[cfg(feature = "inprocess")]
             InferenceEngine::InProcess(e) => e.is_healthy(),
@@ -1136,6 +1169,7 @@ impl InferenceEngine {
     pub fn backend_failed(&self) -> bool {
         match self {
             InferenceEngine::MultimodalEmbed(_) => false,
+            InferenceEngine::Stt(_) => false,
             InferenceEngine::Server(_) => false,
             #[cfg(feature = "inprocess")]
             InferenceEngine::InProcess(e) => e.backend_failed(),
@@ -1148,6 +1182,7 @@ impl InferenceEngine {
     pub fn is_embedding(&self) -> bool {
         match self {
             InferenceEngine::MultimodalEmbed(_) => true,
+            InferenceEngine::Stt(_) => false,
             // Server engine in --embedding mode (the non-`inprocess`/Windows path).
             InferenceEngine::Server(e) => e.is_embedding(),
             #[cfg(feature = "inprocess")]
@@ -1164,6 +1199,7 @@ impl InferenceEngine {
     pub fn is_vision(&self) -> bool {
         match self {
             InferenceEngine::MultimodalEmbed(_) => false,
+            InferenceEngine::Stt(_) => false,
             InferenceEngine::Server(e) => e.is_vision(),
             #[cfg(all(feature = "inprocess", feature = "vision"))]
             InferenceEngine::InProcess(e) => e.is_vision(),
@@ -1183,6 +1219,7 @@ impl InferenceEngine {
     pub fn supports_tools(&self) -> bool {
         match self {
             InferenceEngine::MultimodalEmbed(_) => false,
+            InferenceEngine::Stt(_) => false,
             InferenceEngine::Server(e) => !e.is_embedding(),
             #[cfg(all(feature = "inprocess", feature = "vision"))]
             InferenceEngine::InProcess(e) => e.tool_format().supports_tools(),
@@ -1198,6 +1235,7 @@ impl InferenceEngine {
     pub fn embedding_dim(&self) -> Option<u32> {
         match self {
             InferenceEngine::MultimodalEmbed(e) => e.capabilities().map(|c| c.embedding_dim),
+            InferenceEngine::Stt(_) => None,
             InferenceEngine::Server(e) => e.embedding_dim(),
             #[cfg(feature = "inprocess")]
             InferenceEngine::Embed(e) => Some(e.dim()),
@@ -1220,6 +1258,30 @@ impl InferenceEngine {
         }
     }
 
+    pub fn stt_capabilities(&self) -> Option<crate::stt::Capabilities> {
+        match self {
+            Self::Stt(e) => e.capabilities(),
+            _ => None,
+        }
+    }
+
+    pub fn stt_snapshot(&self, models: &[String]) -> Option<crate::stt::ReadinessSnapshot> {
+        match self {
+            Self::Stt(e) => Some(e.readiness_snapshot(models)),
+            _ => None,
+        }
+    }
+
+    pub async fn transcribe(
+        &self,
+        audio: crate::stt::AudioRequest,
+    ) -> Result<crate::stt::TranscriptionOutput, String> {
+        match self {
+            Self::Stt(e) => e.transcribe(audio).await,
+            _ => Err("transcription requires a whisper worker node".into()),
+        }
+    }
+
     pub async fn embed_multimodal(
         &self,
         batch: crate::embedding_input::EmbeddingBatch,
@@ -1235,6 +1297,7 @@ impl InferenceEngine {
     pub fn stop(&self) {
         match self {
             InferenceEngine::MultimodalEmbed(e) => e.stop(),
+            InferenceEngine::Stt(e) => e.stop(),
             InferenceEngine::Server(e) => e.stop(),
             #[cfg(feature = "inprocess")]
             InferenceEngine::InProcess(_) => { /* worker stops when the engine is dropped */ }
@@ -1255,6 +1318,7 @@ impl InferenceEngine {
             InferenceEngine::MultimodalEmbed(_) => {
                 Err("use typed multimodal embedding dispatch".into())
             }
+            InferenceEngine::Stt(_) => Err("this node is a transcription node".into()),
             InferenceEngine::Server(e) => e.embed(inputs, input_type, dimensions).await,
             #[cfg(feature = "inprocess")]
             InferenceEngine::Embed(e) => e.embed(inputs, input_type, dimensions).await,
@@ -1266,6 +1330,7 @@ impl InferenceEngine {
     pub async fn restart(&self) -> Result<(), String> {
         match self {
             InferenceEngine::MultimodalEmbed(e) => e.restart().await,
+            InferenceEngine::Stt(e) => e.restart().await,
             InferenceEngine::Server(e) => e.restart().await,
             // In-process: there is no child process to restart — the engine IS this process,
             // and a wedged native llama.cpp call can never be recovered from Rust. The node
@@ -1300,6 +1365,7 @@ impl InferenceEngine {
     pub async fn restart_empty(&self) -> Result<(), String> {
         match self {
             InferenceEngine::MultimodalEmbed(_) => self.restart().await,
+            InferenceEngine::Stt(_) => self.restart().await,
             InferenceEngine::Server(e) => e.restart_no_swap().await,
             #[cfg(feature = "inprocess")]
             InferenceEngine::InProcess(_) => self.restart().await,
@@ -1319,6 +1385,9 @@ impl InferenceEngine {
         match self {
             InferenceEngine::MultimodalEmbed(_) => {
                 Err("this node serves embeddings, not chat completions".into())
+            }
+            InferenceEngine::Stt(_) => {
+                Err("this node serves transcription, not chat completions".into())
             }
             InferenceEngine::Server(e) => {
                 e.chat_completion(messages, temperature, max_tokens, tools, tool_choice)
@@ -1378,6 +1447,9 @@ impl InferenceEngine {
         match self {
             InferenceEngine::MultimodalEmbed(_) => {
                 Err("this node serves embeddings, not chat completions".into())
+            }
+            InferenceEngine::Stt(_) => {
+                Err("this node serves transcription, not chat completions".into())
             }
             InferenceEngine::Server(e) => {
                 e.chat_completion_stream(messages, tools, tool_choice, temperature, max_tokens, tx)

@@ -147,6 +147,10 @@ async fn explicit_runtime_requirement_cannot_fall_through_to_chat_or_gguf() {
     use sgl_node::inference::{EngineMode, InferenceEngine, InferenceEngineConfig, ServerEngine};
     let config = InferenceEngineConfig {
         embedding_python: None,
+        stt_whisper: None,
+        stt_whisper_sha256: None,
+        stt_python: None,
+        stt_smoke_dir: None,
         model_path: "/missing/eg2/snapshot".into(),
         model_name: "embeddinggemma-2".into(),
         port: 8081,

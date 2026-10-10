@@ -144,6 +144,8 @@ struct HeartbeatRequest {
 struct NodeCapabilities {
     #[serde(flatten, skip_serializing_if = "Option::is_none")]
     embedding: Option<crate::eg2::Capabilities>,
+    #[serde(rename = "transcription", skip_serializing_if = "Option::is_none")]
+    stt: Option<crate::stt::Capabilities>,
     streaming: bool,
     // This build forwards `tools` on the STREAM path and emits tool-call deltas. A routing
     // hint only — correctness comes from the per-chunk `fmt` tag, so a stale value here can
@@ -176,6 +178,7 @@ fn eg2_capabilities(embedding: Option<crate::eg2::Capabilities>) -> NodeCapabili
     let ready = embedding.is_some();
     NodeCapabilities {
         embedding,
+        stt: None,
         streaming: false,
         streaming_tools: false,
         context_size: 8192,
@@ -189,6 +192,26 @@ fn eg2_capabilities(embedding: Option<crate::eg2::Capabilities>) -> NodeCapabili
 /// Both heartbeat transports use one manifest and remove it immediately on worker death.
 pub fn eg2_capability_wire(embedding: Option<crate::eg2::Capabilities>) -> serde_json::Value {
     serde_json::to_value(eg2_capabilities(embedding)).expect("finite capability manifest")
+}
+
+fn stt_node_capabilities(stt: Option<crate::stt::Capabilities>) -> NodeCapabilities {
+    let ready = stt.is_some();
+    NodeCapabilities {
+        embedding: None,
+        stt,
+        streaming: false,
+        streaming_tools: false,
+        context_size: 0,
+        kind: ready.then(|| "transcription".into()),
+        dim: None,
+        vision: None,
+        engine: Some("stt-worker".into()),
+    }
+}
+
+/// Both heartbeat transports use one manifest and remove it immediately on worker death.
+pub fn stt_capability_wire(stt: Option<crate::stt::Capabilities>) -> serde_json::Value {
+    serde_json::to_value(stt_node_capabilities(stt)).expect("finite capability manifest")
 }
 
 #[derive(Deserialize)]
@@ -443,6 +466,7 @@ impl OrchestratorClient {
         // Additive routing telemetry; None (kill switch) omits the key entirely.
         telemetry: Option<crate::telemetry::HeartbeatTelemetry>,
         embedding: Option<crate::eg2::Capabilities>,
+        stt: Option<crate::stt::Capabilities>,
     ) -> Result<HeartbeatResponse, String> {
         let url = format!("{}/grid/nodes/heartbeat", self.base_url);
         let token = self.get_token()?;
@@ -455,9 +479,12 @@ impl OrchestratorClient {
             key_version,
             capabilities: if engine == Some("embedding-worker") {
                 eg2_capabilities(embedding)
+            } else if engine == Some("stt-worker") {
+                stt_node_capabilities(stt)
             } else {
                 NodeCapabilities {
                     embedding,
+                    stt: None,
                     streaming,
                     // Honest capability, passed in by the caller from the ENGINE'S OWN answer.
                     // It was briefly hardcoded false for in-process (which then could not do tool
@@ -864,6 +891,7 @@ mod heartbeat_wire_tests {
             key_version: None,
             capabilities: NodeCapabilities {
                 embedding: None,
+                stt: None,
                 streaming: true,
                 streaming_tools: true,
                 context_size: 4096,
@@ -967,5 +995,48 @@ mod embedding_capability_tests {
         }
         assert_eq!(dead["streaming"], false);
         assert!(dead.get("vision").is_none());
+    }
+    #[test]
+    fn transcription_heartbeat_is_nested_and_clears_when_worker_dies() {
+        let cap = crate::stt::Capabilities {
+            transcription_ready: true,
+            transcription_protocol: crate::stt::PROTOCOL.into(),
+            transcription_models: vec![crate::stt::MODEL_ID.into()],
+            transcription_runtime: crate::stt::RUNTIME.into(),
+            runtime_revision: crate::stt::RUNTIME_REVISION.into(),
+            model_revision: crate::stt::MODEL_REVISION.into(),
+            model_sha256: crate::stt::MODEL_SHA256.into(),
+            model_repository: crate::stt::MODEL_REPOSITORY.into(),
+            model_bytes: crate::stt::MODEL_BYTES,
+            runtime_binary_sha256: "11".repeat(32),
+            runtime_binary_bytes: 1,
+            os: "macos".into(),
+            architecture: "aarch64".into(),
+            model_license: "MIT".into(),
+            runtime_license: "MIT".into(),
+            audio_format: "pcm_s16le_16k_mono".into(),
+            max_duration_seconds: 60,
+            languages: vec!["auto".into(), "en".into()],
+            input_envelope_encodings: vec!["base64".into()],
+            media_transport: vec!["inline-base64".into()],
+            transcription_streaming: false,
+            free_slots: 1,
+            key_binding: None,
+        }
+        .bind_heartbeat(0, "encryption-key", Some("signature"), Some(1));
+        let wire = stt_capability_wire(Some(cap.clone()));
+        assert_eq!(
+            wire,
+            serde_json::to_value(stt_node_capabilities(Some(cap))).unwrap()
+        );
+        assert_eq!(wire["kind"], "transcription");
+        assert!(wire.get("transcription_ready").is_none());
+        assert_eq!(wire["transcription"]["free_slots"], 0);
+        assert_eq!(
+            wire["transcription"]["key_binding"]["encryption_public_key"],
+            "encryption-key"
+        );
+        assert!(stt_capability_wire(None).get("transcription").is_none());
+        assert!(stt_capability_wire(None).get("kind").is_none());
     }
 }
