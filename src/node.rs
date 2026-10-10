@@ -2320,10 +2320,10 @@ async fn process_job(
                         // Sign an envelope over the *public* ciphertext + job id so the
                         // orchestrator can prove which node produced this result for this
                         // job (anti-replay) without ever seeing the plaintext.
-                        let env_sig = crate::crypto::sign_result_envelope(
+                        let env_sig = sign_sealed_result_envelope(
                             node_secret,
+                            &job.job_type,
                             &job.id,
-                            "sealed",
                             ciphertext_b64.as_bytes(),
                         );
                         let sealed_result = serde_json::json!({
@@ -2369,6 +2369,23 @@ async fn process_job(
             }
         }
     }
+}
+
+/// The orchestrator verifies transcription completions in a distinct signature
+/// domain. Every other buffered encrypted result keeps the existing `sealed`
+/// domain for backward compatibility.
+fn sign_sealed_result_envelope(
+    node_secret: &[u8; 32],
+    job_type: &str,
+    job_id: &str,
+    ciphertext: &[u8],
+) -> String {
+    let kind = if job_type == "transcription" {
+        "transcription"
+    } else {
+        "sealed"
+    };
+    crate::crypto::sign_result_envelope(node_secret, job_id, kind, ciphertext)
 }
 
 /// Parse + bound the inference parameters from a (decrypted) job payload. Shared
@@ -3747,6 +3764,26 @@ async fn process_inference_stream(
 #[cfg(test)]
 mod transcription_binding_tests {
     use super::*;
+
+    #[test]
+    fn sealed_result_signatures_use_the_orchestrator_domain_for_each_job_type() {
+        let secret = [7u8; 32];
+        let job_id = "00000000-0000-4000-8000-000000000001";
+        let ciphertext = b"sealed-result";
+
+        assert_eq!(
+            sign_sealed_result_envelope(&secret, "transcription", job_id, ciphertext),
+            crate::crypto::sign_result_envelope(&secret, job_id, "transcription", ciphertext)
+        );
+
+        for job_type in ["inference", "embedding", "systemone"] {
+            assert_eq!(
+                sign_sealed_result_envelope(&secret, job_type, job_id, ciphertext),
+                crate::crypto::sign_result_envelope(&secret, job_id, "sealed", ciphertext),
+                "{job_type}"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn result_uses_authenticated_samples_and_rejects_job_or_reservation_drift() {
