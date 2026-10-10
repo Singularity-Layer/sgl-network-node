@@ -70,13 +70,22 @@ sgl start --model-name whisper-1 \
 # Optional dedicated stdlib interpreter: --stt-python /owned/stt/bin/python3
 ```
 
-The fixture directory must contain approved `audio.wav` and `smoke.json` with
-`audio_sha256`, `expected_contains`, and `min_chars`. Metadata for the original
-locally synthesized operational test clip is retained under `assets/whisper/smoke/`.
-It contains no human recording or personal data; its redistribution terms are
-not established, so its audio was removed from source and is not embedded in the
-binary. Production readiness requires a release-integrator-approved external
-fixture. `sgl service install` persists the same arguments. No STT model is advertised
+The versioned `whisper-stt-macos-arm64-v1.10.0.tar.gz` release asset includes
+`whisper-cli`, the unchanged approved runtime manifest, runtime MIT license,
+public upstream smoke `audio.wav`, `smoke.json`, and attribution. Verify its
+GitHub attestation and checksum before extraction. CI packages the reviewed
+binary byte-identically; it does not rebuild it or establish cross-machine
+reproducibility. Model weights and Python are supplied separately.
+
+The bundled smoke is unchanged whisper.cpp `samples/jfk.wav` at
+`d1be6fde11ac6e0407606b4e42fe72d34add8037`, SHA-256
+`59dfb9a4acb36fe2a2affc14bacbee2920ff435cb13cc314a08c13f66ba7860e`,
+176,000 samples / exactly 11 seconds. Startup expects `fellow`, `americans`,
+and `country`. [Bundle attribution](../assets/whisper/README.md) identifies
+the public historical speech sample without asserting an additional copyright
+or public-domain determination. It replaces the private synthesized fixture
+whose redistribution terms were not established. `sgl service install` persists
+the same arguments. No STT model is advertised
 before its startup smoke passes. REST and WebSocket heartbeats share a nested
 `capabilities.transcription` manifest with immutable revisions/hashes, OS/arch,
 format/languages, 60-second limit, no streaming, live free slots, and the current
@@ -139,6 +148,8 @@ readiness. Local temporary audio is removed when the worker ends.
 ## Verification
 
 ```sh
+python3 scripts/test_verify_whisper_release.py
+python3 scripts/verify_whisper_release.py verify
 cargo test --all-targets
 cargo test --features inprocess,metal,vision
 python3 tests/test_stt_worker.py
