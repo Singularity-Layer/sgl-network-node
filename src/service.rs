@@ -23,6 +23,10 @@ pub struct ServiceStartOptions {
     pub model_path: Option<String>,
     pub model_name: Option<String>,
     pub embedding_python: Option<String>,
+    pub stt_whisper: Option<String>,
+    pub stt_whisper_sha256: Option<String>,
+    pub stt_python: Option<String>,
+    pub stt_smoke_dir: Option<String>,
     pub systemone_sidecar_url: Option<String>,
     /// Vision (multimodal) models: path to the mmproj GGUF, baked into the service so the
     /// background node serves images across restarts. None for text/embedding models.
@@ -59,6 +63,22 @@ impl ServiceStartOptions {
         if let Some(python) = &self.embedding_python {
             args.push("--embedding-python".into());
             args.push(python.clone());
+        }
+        if let Some(whisper) = &self.stt_whisper {
+            args.push("--stt-whisper".into());
+            args.push(whisper.clone());
+        }
+        if let Some(sha256) = &self.stt_whisper_sha256 {
+            args.push("--stt-whisper-sha256".into());
+            args.push(sha256.clone());
+        }
+        if let Some(python) = &self.stt_python {
+            args.push("--stt-python".into());
+            args.push(python.clone());
+        }
+        if let Some(smoke) = &self.stt_smoke_dir {
+            args.push("--stt-smoke-dir".into());
+            args.push(smoke.clone());
         }
         if let Some(url) = &self.systemone_sidecar_url {
             args.push("--systemone-sidecar-url".into());
@@ -779,6 +799,10 @@ mod embedding_service_tests {
             model_path: Some("/owned/eg2/snapshot".into()),
             model_name: Some("embeddinggemma-2".into()),
             embedding_python: None,
+            stt_whisper: None,
+            stt_whisper_sha256: None,
+            stt_python: None,
+            stt_smoke_dir: None,
             systemone_sidecar_url: None,
             mmproj_path: None,
             image_max_tokens: None,
@@ -803,5 +827,42 @@ mod embedding_service_tests {
         let mut stripped = candidate;
         stripped.drain(at..at + 2);
         assert_eq!(stripped, legacy);
+    }
+    #[test]
+    fn transcription_runtime_pin_and_external_fixture_persist_together() {
+        let options = ServiceStartOptions {
+            model_path: Some("/owned/stt/model.bin".into()),
+            model_name: Some(crate::stt::MODEL_ID.into()),
+            embedding_python: None,
+            stt_whisper: Some("/owned/stt/whisper-cli".into()),
+            stt_whisper_sha256: Some(crate::stt::MACOS_AARCH64_RUNTIME_SHA256.into()),
+            stt_python: Some("/owned/stt/python3".into()),
+            stt_smoke_dir: Some("/owned/stt/approved-smoke".into()),
+            systemone_sidecar_url: None,
+            mmproj_path: None,
+            image_max_tokens: None,
+            orchestrator_url: "https://grid.x402compute.cc".into(),
+            resource_percent: 50,
+            inference_port: 8081,
+            max_jobs: 1,
+            context_size: 8192,
+            heartbeat_interval: 5,
+            enable_streaming: false,
+            sandbox: false,
+        };
+        let args = options.start_args();
+        for (flag, value) in [
+            ("--stt-whisper", "/owned/stt/whisper-cli"),
+            (
+                "--stt-whisper-sha256",
+                crate::stt::MACOS_AARCH64_RUNTIME_SHA256,
+            ),
+            ("--stt-python", "/owned/stt/python3"),
+            ("--stt-smoke-dir", "/owned/stt/approved-smoke"),
+        ] {
+            let at = args.iter().position(|arg| arg == flag).unwrap();
+            assert_eq!(args[at + 1], value);
+        }
+        assert!(!args.iter().any(|arg| arg == "--embedding-python"));
     }
 }

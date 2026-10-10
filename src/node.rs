@@ -1066,6 +1066,10 @@ pub async fn start(
     model_path: Option<&str>,
     model_name: Option<&str>,
     embedding_python: Option<&str>,
+    stt_whisper: Option<&str>,
+    stt_whisper_sha256: Option<&str>,
+    stt_python: Option<&str>,
+    stt_smoke_dir: Option<&str>,
     systemone_sidecar_url: Option<&str>,
     mmproj_path: Option<&str>,
     image_max_tokens: Option<u32>,
@@ -1213,7 +1217,9 @@ pub async fn start(
                 rc.max_jobs,
             ),
         };
-        if crate::embed_catalog::is_multimodal_embedding_model(&name) {
+        if crate::embed_catalog::is_multimodal_embedding_model(&name)
+            || crate::stt::MODEL_ID.eq_ignore_ascii_case(&name)
+        {
             effective_slots = 1;
         }
         wedge_ms = wedge_timeout_ms(&model_pb);
@@ -1230,6 +1236,10 @@ pub async fn start(
         );
         let eng_config = InferenceEngineConfig {
             embedding_python: embedding_python.map(PathBuf::from),
+            stt_whisper: stt_whisper.map(PathBuf::from),
+            stt_whisper_sha256: stt_whisper_sha256.map(str::to_string),
+            stt_python: stt_python.map(PathBuf::from),
+            stt_smoke_dir: stt_smoke_dir.map(PathBuf::from),
             model_path: model_pb,
             model_name: name.clone(),
             port: inference_port,
@@ -1404,13 +1414,34 @@ pub async fn start(
                         "max_concurrent_jobs":1})
                 }) as Arc<dyn Fn() -> serde_json::Value + Send + Sync>
             });
+        let stt_heartbeat: Option<Arc<dyn Fn() -> serde_json::Value + Send + Sync>> =
+            engine.as_ref().filter(|e| e.mode_label() == "stt-worker").map(|eng| {
+                let eng = eng.clone();
+                let models = models.clone();
+                let encryption_public_key = node_enc_pubkey.clone();
+                let signature = keybind_sig.clone();
+                let current_load = rc.load_factor();
+                let active = Arc::clone(&active_jobs);
+                Arc::new(move || {
+                    let snapshot=eng.stt_snapshot(&models).expect("dedicated transcription engine");
+                    let (available,cap)=(snapshot.available_models,snapshot.capabilities);
+                    let cap = cap.map(|c| c.bind_heartbeat(
+                        1u32.saturating_sub(active.load(Ordering::Relaxed)),
+                        &encryption_public_key, signature.as_deref(), key_version_opt));
+                    serde_json::json!({"type":"heartbeat", "current_load":current_load,
+                        "available_models":available, "capabilities":crate::orchestrator::stt_capability_wire(cap),
+                        "encryption_public_key":encryption_public_key,
+                        "encryption_public_key_signature":signature, "key_version":key_version_opt,
+                        "max_concurrent_jobs":1})
+                }) as Arc<dyn Fn() -> serde_json::Value + Send + Sync>
+            });
         tokio::spawn(async move {
             crate::ws::run(
                 base,
                 node_id,
                 client_ws,
                 st,
-                embedding_heartbeat,
+                stt_heartbeat.or(embedding_heartbeat),
                 move |job| {
                     maybe_spawn_job(
                         job,
@@ -1493,6 +1524,11 @@ pub async fn start(
     let embed_dim: Option<u32> = engine.as_ref().and_then(|e| e.embedding_dim());
     let node_kind: Option<&str> = if systemone_sidecar.is_some() {
         Some("systemone")
+    } else if engine
+        .as_ref()
+        .is_some_and(|e| e.mode_label() == "stt-worker")
+    {
+        Some("transcription")
     } else if embed_dim.is_some() {
         Some("embedding")
     } else {
@@ -1751,7 +1787,8 @@ pub async fn start(
                         );
                     }
                     Vec::new()
-                } else if eng.mode_label() == "embedding-worker" {
+                } else if eng.mode_label() == "embedding-worker" || eng.mode_label() == "stt-worker"
+                {
                     Vec::new() // dedicated worker readiness has no transient grace period
                 } else {
                     models.clone() // tolerate one transient blip before pulling the model
@@ -1767,14 +1804,28 @@ pub async fn start(
         let embedding_capabilities = embedding_snapshot
             .as_ref()
             .and_then(|s| s.capabilities.clone());
+        let stt_snapshot = engine.as_ref().and_then(|e| e.stt_snapshot(&models));
+        let stt_capabilities = stt_snapshot
+            .as_ref()
+            .and_then(|s| s.capabilities.clone())
+            .map(|c| {
+                c.bind_heartbeat(
+                    1u32.saturating_sub(active_jobs.load(Ordering::Relaxed)),
+                    &node_enc_pubkey,
+                    keybind_sig.as_deref(),
+                    key_version_opt,
+                )
+            });
         let advertised: Vec<String> = if let Some(snapshot) = embedding_snapshot {
+            snapshot.available_models
+        } else if let Some(snapshot) = stt_snapshot {
             snapshot.available_models
         } else if empty_quarantined {
             Vec::new()
         } else {
             health_advertised
         };
-        let heartbeat_telemetry = telemetry.snapshot(crate::telemetry::SnapshotInputs {
+        let mut heartbeat_telemetry = telemetry.snapshot(crate::telemetry::SnapshotInputs {
             has_sidecar: systemone_sidecar.is_some(),
             accelerator: engine.as_ref().map(|e| e.accelerator_hint(rc.gpu_layers)),
             has_engine: engine.is_some(),
@@ -1784,6 +1835,12 @@ pub async fn start(
             slots_busy: active_jobs.load(Ordering::Relaxed),
             slots_total: effective_slots,
         });
+
+        if node_engine == Some("stt-worker") {
+            if let Some(t) = &mut heartbeat_telemetry {
+                t.runtime = crate::stt::RUNTIME;
+            }
+        }
 
         match client
             .heartbeat(
@@ -1805,6 +1862,7 @@ pub async fn start(
                 node_tools_capable,
                 heartbeat_telemetry,
                 embedding_capabilities,
+                stt_capabilities,
             )
             .await
         {
@@ -2061,6 +2119,31 @@ async fn process_job(
 ) {
     tracing::info!("Processing job {} (type: {})", job.id, job.job_type);
 
+    let transcription_reservation = if job.job_type == "transcription" {
+        if job.model.as_deref() != Some(crate::stt::MODEL_ID) {
+            let _ = client
+                .fail_job(&job.id, "transcription_input_invalid")
+                .await;
+            return;
+        }
+        match job
+            .input_payload
+            .as_ref()
+            .ok_or_else(|| "missing transcription dispatch".to_string())
+            .and_then(crate::stt::ReservationBinding::parse_dispatch)
+        {
+            Ok(binding) => Some(binding),
+            Err(_) => {
+                let _ = client
+                    .fail_job(&job.id, "transcription_input_invalid")
+                    .await;
+                return;
+            }
+        }
+    } else {
+        None
+    };
+
     // If the prompt is sealed (E2E), decrypt it with the node's X25519 key and
     // remember the caller's response key so we can seal the reply back.
     let mut response_pubkey: Option<[u8; 32]> = None;
@@ -2124,6 +2207,20 @@ async fn process_job(
         }
     }
 
+    // Transcription audio must use the negotiated sealed base64 envelope, with the
+    // protocol authenticated inside the envelope. A relay cannot downgrade it, and
+    // plaintext PCM is never accepted on this path.
+    if job.job_type == "transcription"
+        && (response_pubkey.is_none()
+            || enc_version != crate::encryption::EncVersion::V2
+            || transcription_reservation.is_none())
+    {
+        let _ = client
+            .fail_job(&job.id, "transcription_input_invalid")
+            .await;
+        return;
+    }
+
     // Streaming path requires three independent agreements, so a single party
     // can't force it:
     //   1. this node has streaming enabled locally (`streaming_enabled`)
@@ -2169,6 +2266,14 @@ async fn process_job(
     let result = match effective_job.job_type.as_str() {
         "inference" => execute_inference(engine, &effective_job, empty_health).await,
         "embedding" => execute_embedding(engine, &effective_job).await,
+        "transcription" => {
+            execute_transcription(
+                engine,
+                &effective_job,
+                transcription_reservation.as_ref().expect("checked above"),
+            )
+            .await
+        }
         "systemone" => {
             execute_systemone(
                 systemone_sidecar_url.as_deref().map(|s| s.as_str()),
@@ -2670,6 +2775,54 @@ async fn execute_embedding(
                 "prompt_tokens": out.prompt_tokens,
                 "total_tokens": out.prompt_tokens,
             }
+        }))
+    }
+}
+
+async fn execute_transcription(
+    engine: &Option<Arc<InferenceEngine>>,
+    job: &PendingJob,
+    reservation: &crate::stt::ReservationBinding,
+) -> Result<serde_json::Value, String> {
+    {
+        let engine = engine
+            .as_ref()
+            .ok_or("No transcription engine configured — start with --stt-whisper")?;
+        if engine.mode_label() != "stt-worker" {
+            return Err("this node is not a transcription node".to_string());
+        }
+        let payload = job
+            .input_payload
+            .as_ref()
+            .ok_or("Job has no input payload")?;
+        let audio = crate::stt::AudioRequest::parse(payload)
+            .map_err(|_| "transcription_input_invalid".to_string())?;
+        if !reservation.matches(&audio)
+            || audio.request_id != job.id
+            || job.model.as_deref() != Some(audio.model.as_str())
+        {
+            return Err("transcription_input_invalid".into());
+        }
+        let request_id = audio.request_id.clone();
+        let model_revision = audio.model_revision.clone();
+        let sample_count = audio.sample_count;
+        let out = engine.transcribe(audio).await?;
+        let duration_seconds = sample_count as f64 / crate::stt::SAMPLE_RATE as f64;
+        Ok(serde_json::json!({
+            "object": "transcription",
+            "protocol": crate::stt::PROTOCOL,
+            "request_id": request_id,
+            "job_id": job.id,
+            "model": crate::stt::MODEL_ID,
+            "model_revision": model_revision,
+            "model_sha256": crate::stt::MODEL_SHA256,
+            "sample_count": sample_count,
+            "text": out.text,
+            "language": out.language,
+            "language_hint": reservation.language,
+            "duration_seconds": duration_seconds,
+            "segments": out.segments,
+            "usage": {"audio_seconds": duration_seconds},
         }))
     }
 }
@@ -3589,4 +3742,98 @@ async fn process_inference_stream(
     }
     tracing::warn!("Job {} stream failed: {reason}", job.id);
     (Failed, None)
+}
+
+#[cfg(test)]
+mod transcription_binding_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn result_uses_authenticated_samples_and_rejects_job_or_reservation_drift() {
+        let ready = serde_json::json!({
+            "type":"ready", "protocol":crate::stt::PROTOCOL, "runtime":crate::stt::RUNTIME,
+            "runtime_revision":crate::stt::RUNTIME_REVISION, "model_revision":crate::stt::MODEL_REVISION,
+            "model_sha256":crate::stt::MODEL_SHA256, "model_bytes":crate::stt::MODEL_BYTES,
+            "runtime_binary_sha256":"11".repeat(32), "runtime_binary_bytes":123,
+            "model_id":crate::stt::MODEL_ID, "audio_format":"pcm_s16le_16k_mono",
+            "max_duration_seconds":60, "smoke_transcript":"the node is ready for service",
+        });
+        let script = format!(
+            "import sys,json\nprint({},flush=True)\nfor line in sys.stdin:\n r=json.loads(line)\n print(json.dumps({{'type':'result','request_id':r['request_id'],'text':'hello','language':'en','duration_seconds':0.2,'segments':[]}}),flush=True)",
+            serde_json::to_string(&ready.to_string()).unwrap()
+        );
+        let stt = crate::stt::SttEngine::start(crate::stt::WorkerConfig {
+            program: "python3".into(),
+            args: vec!["-u".into(), "-c".into(), script],
+            startup_timeout: std::time::Duration::from_secs(10),
+            request_timeout: std::time::Duration::from_secs(5),
+            expected_runtime_sha256: "11".repeat(32),
+            expected_runtime_bytes: 123,
+        })
+        .await
+        .unwrap();
+        let engine = Some(Arc::new(InferenceEngine::Stt(Box::new(stt))));
+        use base64::Engine;
+        let request_id = "00000000-0000-4000-8000-000000000001";
+        let payload = serde_json::json!({
+            "protocol":crate::stt::PROTOCOL,"request_id":request_id,"model":crate::stt::MODEL_ID,
+            "model_revision":crate::stt::MODEL_REVISION,"model_sha256":crate::stt::MODEL_SHA256,"language":"auto",
+            "audio":{"format":"pcm_s16le","sample_rate":16000,"channels":1,"bits_per_sample":16,"sample_count":1600,"data":base64::engine::general_purpose::STANDARD.encode(vec![0u8;3200])},
+        });
+        let reservation: crate::stt::ReservationBinding = serde_json::from_value(serde_json::json!({
+            "protocol":crate::stt::PROTOCOL,"request_id":request_id,"model":crate::stt::MODEL_ID,
+            "model_revision":crate::stt::MODEL_REVISION,"model_sha256":crate::stt::MODEL_SHA256,"language":"auto","sample_count":1600,
+        })).unwrap();
+        let mut job = PendingJob {
+            id: request_id.into(),
+            job_type: "transcription".into(),
+            model: Some(crate::stt::MODEL_ID.into()),
+            input_payload: Some(payload),
+        };
+        job.id = "00000000-0000-4000-8000-000000000002".into();
+        assert_eq!(
+            execute_transcription(&engine, &job, &reservation)
+                .await
+                .unwrap_err(),
+            "transcription_input_invalid"
+        );
+        job.id = request_id.into();
+        let mut wrong = reservation.clone();
+        wrong.sample_count += 1;
+        assert_eq!(
+            execute_transcription(&engine, &job, &wrong)
+                .await
+                .unwrap_err(),
+            "transcription_input_invalid"
+        );
+        job.model = Some("other-model".into());
+        assert_eq!(
+            execute_transcription(&engine, &job, &reservation)
+                .await
+                .unwrap_err(),
+            "transcription_input_invalid"
+        );
+        job.model = Some(crate::stt::MODEL_ID.into());
+        let out = execute_transcription(&engine, &job, &reservation)
+            .await
+            .unwrap();
+        assert_eq!(out["request_id"], request_id);
+        assert_eq!(out["job_id"], request_id);
+        assert_eq!(out["model_revision"], crate::stt::MODEL_REVISION);
+        assert_eq!(out["model_sha256"], crate::stt::MODEL_SHA256);
+        assert_eq!(out["sample_count"], 1600);
+        assert_eq!(out["duration_seconds"], 0.1);
+        assert_eq!(out["usage"]["audio_seconds"], 0.1);
+        assert_eq!(out["language_hint"], "auto");
+        let second_id = "00000000-0000-4000-8000-000000000002";
+        job.id = second_id.into();
+        job.input_payload.as_mut().unwrap()["request_id"] = serde_json::json!(second_id);
+        job.input_payload.as_mut().unwrap()["language"] = serde_json::json!("fr");
+        let mut french = reservation.clone();
+        french.language = "fr".into();
+        french.request_id = second_id.into();
+        let french_out = execute_transcription(&engine, &job, &french).await.unwrap();
+        assert_eq!(french_out["language_hint"], "fr");
+        assert_eq!(french_out["language"], "en");
+    }
 }
