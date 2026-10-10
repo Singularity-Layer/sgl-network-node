@@ -13,7 +13,7 @@ fn worker(body: &str) -> WorkerConfig {
         "runtime_binary_sha256": "11".repeat(32), "runtime_binary_bytes": 123,
         "model_id":MODEL_ID,"audio_format":"pcm_s16le_16k_mono",
         "max_duration_seconds":60,
-        "smoke_transcript":"the grid node is ready for service"
+        "smoke_transcript":"and so my fellow americans ask not what your country can do for you"
     });
     WorkerConfig {
         program: "python3".into(),
@@ -217,7 +217,7 @@ async fn production_worker_real_canary() {
     );
     assert_eq!(caps.os, "macos");
     assert_eq!(caps.architecture, "aarch64");
-    // External approved known-audio fixture; no speech audio is bundled in the release.
+    // Packaged approved public JFK fixture, pinned and attributed by the release manifest.
     let wav = std::fs::read(std::path::Path::new(&smoke).join("audio.wav")).expect("smoke fixture");
     let pcm = &wav[44..];
     let value = canonical_audio(pcm);
@@ -228,7 +228,7 @@ async fn production_worker_real_canary() {
         .expect("real transcription");
     let lowered = out.text.to_lowercase();
     assert!(
-        lowered.contains("ready") && lowered.contains("service"),
+        lowered.contains("fellow") && lowered.contains("americans") && lowered.contains("country"),
         "unexpected transcript: {}",
         out.text
     );

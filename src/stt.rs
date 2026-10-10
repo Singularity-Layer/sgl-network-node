@@ -960,7 +960,10 @@ fn validate_ready(
         return Err("transcription worker identity or smoke mismatch".into());
     }
     let lowered = ready.smoke_transcript.to_lowercase();
-    for word in ["ready", "for", "service"] {
+    // The packaged startup fixture is whisper.cpp's pinned public JFK sample.
+    // Keep an independent semantic check here so replacing both audio.wav and
+    // smoke.json cannot make an arbitrary clip establish readiness.
+    for word in ["fellow", "americans", "country"] {
         if !lowered.contains(word) {
             return Err("transcription smoke transcript mismatch".into());
         }
