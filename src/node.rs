@@ -3756,7 +3756,7 @@ mod transcription_binding_tests {
             "model_sha256":crate::stt::MODEL_SHA256, "model_bytes":crate::stt::MODEL_BYTES,
             "runtime_binary_sha256":"11".repeat(32), "runtime_binary_bytes":123,
             "model_id":crate::stt::MODEL_ID, "audio_format":"pcm_s16le_16k_mono",
-            "max_duration_seconds":60, "smoke_transcript":"the node is ready for service",
+            "max_duration_seconds":60, "smoke_transcript":"and so my fellow americans ask not what your country can do for you",
         });
         let script = format!(
             "import sys,json\nprint({},flush=True)\nfor line in sys.stdin:\n r=json.loads(line)\n print(json.dumps({{'type':'result','request_id':r['request_id'],'text':'hello','language':'en','duration_seconds':0.2,'segments':[]}}),flush=True)",
