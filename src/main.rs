@@ -27,6 +27,14 @@ mod ws;
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
+fn parse_sha256(value: &str) -> Result<String, String> {
+    if value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        Ok(value.to_ascii_lowercase())
+    } else {
+        Err("SHA-256 must be exactly 64 hexadecimal characters".into())
+    }
+}
+
 #[derive(Parser)]
 #[command(
     name = "sgl",
@@ -96,6 +104,15 @@ enum Commands {
         /// Model name to advertise (e.g. "llama-3.2-3b")
         #[arg(long)]
         model_name: Option<String>,
+
+        /// Absolute canonical path to an approved llama-server executable. Requires
+        /// --llama-server-sha256 and disables executable discovery.
+        #[arg(long, requires = "llama_server_sha256")]
+        llama_server_path: Option<String>,
+
+        /// Exact SHA-256 of --llama-server-path (64 hexadecimal characters).
+        #[arg(long, requires = "llama_server_path", value_parser = parse_sha256)]
+        llama_server_sha256: Option<String>,
 
         /// App-owned EmbeddingGemma 2 Python interpreter, separate from chat runtimes.
         #[arg(long)]
@@ -266,6 +283,15 @@ enum ServiceAction {
         #[arg(long)]
         model_name: Option<String>,
 
+        /// Absolute canonical path to an approved llama-server executable. Requires
+        /// --llama-server-sha256 and disables executable discovery.
+        #[arg(long, requires = "llama_server_sha256")]
+        llama_server_path: Option<String>,
+
+        /// Exact SHA-256 of --llama-server-path (64 hexadecimal characters).
+        #[arg(long, requires = "llama_server_path", value_parser = parse_sha256)]
+        llama_server_sha256: Option<String>,
+
         /// App-owned EmbeddingGemma 2 Python interpreter, separate from chat runtimes.
         #[arg(long)]
         embedding_python: Option<String>,
@@ -419,6 +445,8 @@ async fn main() {
         Commands::Start {
             model_path,
             model_name,
+            llama_server_path,
+            llama_server_sha256,
             embedding_python,
             stt_whisper,
             stt_whisper_sha256,
@@ -465,6 +493,8 @@ async fn main() {
                 &cli.orchestrator_url,
                 model_path.as_deref(),
                 model_name.as_deref(),
+                llama_server_path.as_deref(),
+                llama_server_sha256.as_deref(),
                 embedding_python.as_deref(),
                 stt_whisper.as_deref(),
                 stt_whisper_sha256.as_deref(),
@@ -558,6 +588,8 @@ async fn main() {
                 ServiceAction::Install {
                     model_path,
                     model_name,
+                    llama_server_path,
+                    llama_server_sha256,
                     embedding_python,
                     stt_whisper,
                     stt_whisper_sha256,
@@ -577,6 +609,8 @@ async fn main() {
                     let opts = service::ServiceStartOptions {
                         model_path,
                         model_name,
+                        llama_server_path,
+                        llama_server_sha256,
                         embedding_python,
                         stt_whisper,
                         stt_whisper_sha256,

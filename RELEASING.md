@@ -70,21 +70,22 @@ no v1.10.0 canary node remains online.
 For a staged candidate:
 
 ```sh
-gh release download v1.10.1 --repo Singularity-Layer/sgl-network-node --dir /tmp/sgl-v1.10.1
-cd /tmp/sgl-v1.10.1
-sha256sum --check sgl-node-v1.10.1.sha256
-for asset in sgl-darwin-arm64 sgl-linux-* sgl-windows-x86_64.exe whisper-stt-macos-arm64-v1.10.1.tar.gz; do
+tag=v1.10.2
+gh release download "$tag" --repo Singularity-Layer/sgl-network-node --dir "/tmp/sgl-$tag"
+cd "/tmp/sgl-$tag"
+sha256sum --check "sgl-node-$tag.sha256"
+for asset in sgl-darwin-arm64 sgl-linux-* sgl-windows-x86_64.exe "whisper-stt-macos-arm64-$tag.tar.gz"; do
   gh attestation verify "$asset" --repo Singularity-Layer/sgl-network-node
 done
 ```
 
 After the orchestrator preserves the prior accepted hashes, adds all six
-v1.10.1 node hashes, and the candidate canaries pass, apply the prepared release
+candidate node hashes, and the candidate canaries pass, apply the prepared release
 note and promote the same immutable draft:
 
 ```sh
-gh release edit v1.10.1 --repo Singularity-Layer/sgl-network-node \
-  --notes-file docs/releases/v1.10.1.md --draft=false --latest
+gh release edit "$tag" --repo Singularity-Layer/sgl-network-node \
+  --notes-file "docs/releases/$tag.md" --draft=false --latest
 ```
 
 Do not delete and recreate a draft to promote it. That would make the reviewed

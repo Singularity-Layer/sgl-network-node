@@ -146,6 +146,7 @@ async fn mixed_modalities_preserve_parts_and_native_request_dimensions() {
 async fn explicit_runtime_requirement_cannot_fall_through_to_chat_or_gguf() {
     use sgl_node::inference::{EngineMode, InferenceEngine, InferenceEngineConfig, ServerEngine};
     let config = InferenceEngineConfig {
+        llama_server: None,
         embedding_python: None,
         stt_whisper: None,
         stt_whisper_sha256: None,
