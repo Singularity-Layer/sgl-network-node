@@ -22,6 +22,8 @@ const SERVICE_LABEL: &str = "cc.x402compute.sglnode";
 pub struct ServiceStartOptions {
     pub model_path: Option<String>,
     pub model_name: Option<String>,
+    pub llama_server_path: Option<String>,
+    pub llama_server_sha256: Option<String>,
     pub embedding_python: Option<String>,
     pub stt_whisper: Option<String>,
     pub stt_whisper_sha256: Option<String>,
@@ -59,6 +61,12 @@ impl ServiceStartOptions {
         if let Some(mn) = &self.model_name {
             args.push("--model-name".into());
             args.push(mn.clone());
+        }
+        if let (Some(path), Some(sha256)) = (&self.llama_server_path, &self.llama_server_sha256) {
+            args.push("--llama-server-path".into());
+            args.push(path.clone());
+            args.push("--llama-server-sha256".into());
+            args.push(sha256.clone());
         }
         if let Some(python) = &self.embedding_python {
             args.push("--embedding-python".into());
@@ -798,6 +806,8 @@ mod embedding_service_tests {
         let mut opts = ServiceStartOptions {
             model_path: Some("/owned/eg2/snapshot".into()),
             model_name: Some("embeddinggemma-2".into()),
+            llama_server_path: None,
+            llama_server_sha256: None,
             embedding_python: None,
             stt_whisper: None,
             stt_whisper_sha256: None,
@@ -827,12 +837,25 @@ mod embedding_service_tests {
         let mut stripped = candidate;
         stripped.drain(at..at + 2);
         assert_eq!(stripped, legacy);
+
+        opts.llama_server_path = Some("/opt/sgl/bin/llama-server".into());
+        opts.llama_server_sha256 = Some("a".repeat(64));
+        let pinned = opts.start_args();
+        let path_at = pinned
+            .iter()
+            .position(|arg| arg == "--llama-server-path")
+            .unwrap();
+        assert_eq!(pinned[path_at + 1], "/opt/sgl/bin/llama-server");
+        assert_eq!(pinned[path_at + 2], "--llama-server-sha256");
+        assert_eq!(pinned[path_at + 3], "a".repeat(64));
     }
     #[test]
     fn transcription_runtime_pin_and_external_fixture_persist_together() {
         let options = ServiceStartOptions {
             model_path: Some("/owned/stt/model.bin".into()),
             model_name: Some(crate::stt::MODEL_ID.into()),
+            llama_server_path: None,
+            llama_server_sha256: None,
             embedding_python: None,
             stt_whisper: Some("/owned/stt/whisper-cli".into()),
             stt_whisper_sha256: Some(crate::stt::MACOS_AARCH64_RUNTIME_SHA256.into()),

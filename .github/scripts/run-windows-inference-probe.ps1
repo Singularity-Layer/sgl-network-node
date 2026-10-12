@@ -45,12 +45,28 @@ if ($out -notmatch 'stream matches: true') {
 }
 
 $content = [regex]::Match($out, 'content_len\s+:\s+(\d+)')
-if (-not $content.Success -or [int]$content.Groups[1].Value -lt 1) {
-  throw "real Windows inference produced no content"
+if (-not $content.Success) {
+  throw "real Windows inference did not report content length"
+}
+if ([int]$content.Groups[1].Value -lt 1) {
+  # A tool-call-only response correctly has empty assistant text. Validate the
+  # generated tool call rather than requiring text the model should not emit.
+  if ($out -notmatch 'finish_reason\s+:\s+Some\("tool_calls"\)') {
+    throw "real Windows inference produced neither text nor a tool-call finish"
+  }
+  $callLine = [regex]::Match($out, '(?m)^tool_calls\s+:\s+(.+)$')
+  if (-not $callLine.Success) {
+    throw "real Windows inference produced no tool call"
+  }
+  $calls = @($callLine.Groups[1].Value | ConvertFrom-Json)
+  if ($calls.Count -lt 1 -or $calls[0].function.name -ne 'get_weather') {
+    throw "real Windows inference produced an unexpected tool call"
+  }
+  $null = $calls[0].function.arguments | ConvertFrom-Json
 }
 $completionTokens = [int]$buffered.Groups[2].Value
 if ($completionTokens -lt 1 -or $completionTokens -ge 80) {
   throw "completion tokens $completionTokens hit the cap - real inference did not finish"
 }
 
-Write-Host "OK: Windows real inference matches across both paths ($($buffered.Groups[1].Value)/$completionTokens tokens); deterministic tool parser fixture passed"
+Write-Host "OK: Windows real inference matches across both paths ($($buffered.Groups[1].Value)/$completionTokens tokens); text or a valid tool call completed"

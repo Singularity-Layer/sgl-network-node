@@ -1,7 +1,8 @@
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use std::io::BufRead;
-use std::path::PathBuf;
+use sha2::{Digest, Sha256};
+use std::io::{BufRead, Read};
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use tokio::time::{sleep, Duration};
 
@@ -10,6 +11,229 @@ use tokio::time::{sleep, Duration};
 /// and the in-process engine offloads all layers (Mac unified memory). Set by `sgl start
 /// --gpu-layers-auto`. This is the universal replacement for hardcoded per-model VRAM caps.
 pub const GPU_LAYERS_AUTO: u32 = u32::MAX;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ExecutableIdentity {
+    canonical_path: PathBuf,
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+}
+
+impl ExecutableIdentity {
+    fn from_metadata(canonical_path: PathBuf, metadata: &std::fs::Metadata) -> Self {
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt;
+
+        Self {
+            canonical_path,
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+            #[cfg(unix)]
+            device: metadata.dev(),
+            #[cfg(unix)]
+            inode: metadata.ino(),
+        }
+    }
+}
+
+/// A caller-supplied llama-server executable pinned to one canonical file identity and hash.
+/// This is intentionally separate from legacy discovery: once present, every launch either
+/// executes this exact verified path or fails closed.
+#[derive(Clone, Debug)]
+pub struct ExplicitLlamaServer {
+    path: PathBuf,
+    expected_sha256: String,
+    identity: ExecutableIdentity,
+    approved_root: PathBuf,
+}
+
+impl ExplicitLlamaServer {
+    fn new_with_roots(
+        path: &Path,
+        expected_sha256: &str,
+        approved_roots: &[PathBuf],
+    ) -> Result<Self, String> {
+        if !valid_sha256(expected_sha256) {
+            return Err("--llama-server-sha256 must be exactly 64 hexadecimal characters".into());
+        }
+        let expected_sha256 = expected_sha256.to_ascii_lowercase();
+        let (identity, actual_sha256) = inspect_llama_server(path, approved_roots)?;
+        if actual_sha256 != expected_sha256 {
+            return Err(format!(
+                "llama-server SHA-256 mismatch for {}",
+                identity.canonical_path.display()
+            ));
+        }
+        let approved_root = approved_roots
+            .iter()
+            .find(|root| identity.canonical_path.starts_with(root))
+            .cloned()
+            .ok_or("explicit llama-server escaped its approved install location")?;
+        Ok(Self {
+            path: identity.canonical_path.clone(),
+            expected_sha256,
+            identity,
+            approved_root,
+        })
+    }
+
+    fn verify_for_spawn(&self) -> Result<PathBuf, String> {
+        let (identity, actual_sha256) =
+            inspect_llama_server(&self.path, std::slice::from_ref(&self.approved_root))?;
+        if identity != self.identity || actual_sha256 != self.expected_sha256 {
+            return Err(
+                "explicit llama-server changed after validation; refusing to execute it"
+                    .to_string(),
+            );
+        }
+        Ok(identity.canonical_path)
+    }
+}
+
+/// Validate the all-or-nothing explicit engine contract used by `start` and service install.
+pub fn explicit_llama_server(
+    path: Option<&str>,
+    sha256: Option<&str>,
+) -> Result<Option<ExplicitLlamaServer>, String> {
+    match (path, sha256) {
+        (None, None) => Ok(None),
+        (Some(path), Some(sha256)) => {
+            ExplicitLlamaServer::new_with_roots(Path::new(path), sha256, &approved_llama_roots())
+                .map(Some)
+        }
+        _ => Err(
+            "--llama-server-path and --llama-server-sha256 must be provided together".to_string(),
+        ),
+    }
+}
+
+fn valid_sha256(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn approved_llama_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let Some(local) = dirs::data_local_dir() {
+        roots.push(local.join("sgl-node").join("bin"));
+    }
+    #[cfg(not(windows))]
+    {
+        roots.push(PathBuf::from("/usr/local/bin"));
+        roots.push(PathBuf::from("/usr/local/Cellar/llama.cpp"));
+    }
+    #[cfg(target_os = "macos")]
+    {
+        roots.push(PathBuf::from("/opt/homebrew/bin"));
+        roots.push(PathBuf::from("/opt/homebrew/Cellar/llama.cpp"));
+    }
+    #[cfg(target_os = "linux")]
+    roots.push(PathBuf::from("/opt/sgl/bin"));
+    #[cfg(windows)]
+    if let Some(program_files) = std::env::var_os("ProgramFiles") {
+        roots.push(PathBuf::from(program_files).join("llama.cpp"));
+    }
+    roots
+}
+
+fn inspect_llama_server(
+    path: &Path,
+    approved_roots: &[PathBuf],
+) -> Result<(ExecutableIdentity, String), String> {
+    if !path.is_absolute() {
+        return Err("--llama-server-path must be an absolute canonical path".into());
+    }
+    let original_metadata = std::fs::symlink_metadata(path).map_err(|e| {
+        format!(
+            "cannot inspect explicit llama-server {}: {e}",
+            path.display()
+        )
+    })?;
+    if original_metadata.file_type().is_symlink() || !original_metadata.file_type().is_file() {
+        return Err("--llama-server-path must name a regular non-symlink file".into());
+    }
+    let canonical = std::fs::canonicalize(path)
+        .map_err(|e| format!("cannot canonicalize explicit llama-server: {e}"))?;
+    if canonical != path {
+        return Err(format!(
+            "--llama-server-path must already be canonical (expected {})",
+            canonical.display()
+        ));
+    }
+    let approved = approved_roots
+        .iter()
+        .any(|root| canonical.starts_with(root));
+    if !approved {
+        return Err("--llama-server-path is outside approved llama.cpp install locations".into());
+    }
+    let file_name = canonical.file_name().and_then(|name| name.to_str());
+    let expected_name = if cfg!(windows) {
+        "llama-server.exe"
+    } else {
+        "llama-server"
+    };
+    if file_name != Some(expected_name) {
+        return Err(format!("--llama-server-path must end in {expected_name}"));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if original_metadata.permissions().mode() & 0o111 == 0 {
+            return Err("--llama-server-path is not executable".into());
+        }
+    }
+
+    let before = ExecutableIdentity::from_metadata(canonical.clone(), &original_metadata);
+    let mut file = std::fs::File::open(&canonical)
+        .map_err(|e| format!("cannot open explicit llama-server: {e}"))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let count = file
+            .read(&mut buffer)
+            .map_err(|e| format!("cannot hash explicit llama-server: {e}"))?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+    let after_metadata = std::fs::symlink_metadata(&canonical)
+        .map_err(|e| format!("cannot re-inspect explicit llama-server: {e}"))?;
+    let after = ExecutableIdentity::from_metadata(canonical, &after_metadata);
+    if before != after {
+        return Err("explicit llama-server changed while it was being validated".into());
+    }
+    Ok((after, hex::encode(hasher.finalize())))
+}
+
+fn clear_llama_environment(command: &mut Command) {
+    const ALLOWED: &[&str] = &[
+        "HOME",
+        "TMPDIR",
+        "TMP",
+        "TEMP",
+        "SystemRoot",
+        "WINDIR",
+        "LOCALAPPDATA",
+        "XDG_CACHE_HOME",
+        "CUDA_VISIBLE_DEVICES",
+        "HIP_VISIBLE_DEVICES",
+        "ROCR_VISIBLE_DEVICES",
+        "GGML_CUDA_ENABLE_UNIFIED_MEMORY",
+        "GGML_VK_VISIBLE_DEVICES",
+    ];
+    let preserved: Vec<_> = ALLOWED
+        .iter()
+        .filter_map(|name| std::env::var_os(name).map(|value| ((*name).to_string(), value)))
+        .collect();
+    command.env_clear();
+    for (name, value) in preserved {
+        command.env(name, value);
+    }
+}
 
 fn inference_transport_error(err: reqwest::Error) -> String {
     tracing::warn!("local inference backend request failed: {err}");
@@ -37,6 +261,8 @@ pub struct InferenceEngineConfig {
     pub stt_python: Option<PathBuf>,
     /// Explicit release-integrator-approved known-audio fixture directory.
     pub stt_smoke_dir: Option<PathBuf>,
+    /// Explicit, pinned llama-server contract. When present, discovery is disabled.
+    pub llama_server: Option<ExplicitLlamaServer>,
     pub model_path: PathBuf,
     pub model_name: String,
     pub port: u16,
@@ -420,10 +646,15 @@ impl ServerEngine {
                 None
             };
 
-        let llama_server = find_llama_server()?;
+        // An explicit contract is a fail-closed trust decision. Do not consult PATH or any
+        // legacy candidate when it is present; verification is repeated in spawn_server.
+        let llama_server = match &self.config.llama_server {
+            Some(explicit) => explicit.verify_for_spawn()?,
+            None => PathBuf::from(find_llama_server()?),
+        };
         let variant = installed_engine_variant();
         let hint = crate::telemetry::server_accelerator(
-            &llama_server,
+            llama_server.to_string_lossy().as_ref(),
             self.config.gpu_layers,
             variant.as_deref(),
         );
@@ -558,9 +789,22 @@ impl ServerEngine {
     /// Spawn llama-server with the given args, stream its stderr into tracing, store the
     /// child handle, and wait (up to 30s) for /health. Shared by the chat and embedding
     /// launch paths.
-    async fn spawn_server(&self, llama_server: &str, args: &[&str]) -> Result<(), String> {
-        let mut cmd = Command::new(llama_server);
+    async fn spawn_server(&self, llama_server: &Path, args: &[&str]) -> Result<(), String> {
+        let executable = match &self.config.llama_server {
+            Some(explicit) => {
+                let verified = explicit.verify_for_spawn()?;
+                if verified != llama_server {
+                    return Err("explicit llama-server path identity changed before spawn".into());
+                }
+                verified
+            }
+            None => llama_server.to_path_buf(),
+        };
+        let mut cmd = Command::new(&executable);
         cmd.args(args);
+        if self.config.llama_server.is_some() {
+            clear_llama_environment(&mut cmd);
+        }
         // Windows: the node may itself run windowless (app-spawned / Scheduled Task);
         // without this flag each llama-server child pops a console window at the operator.
         #[cfg(windows)]
@@ -1030,8 +1274,8 @@ impl InferenceEngine {
     /// these apart unless we say so — and without that it cannot refuse to route
     /// confidential traffic to an exposed node.
     ///
-    /// Report what is TRUE right now: a vision model silently forces the server engine
-    /// (node.rs), so a node can be `inprocess` for text and `server` for vision.
+    /// Report the engine that actually started. A caller-pinned llama-server selects
+    /// the server engine in node.rs, while unpinned vision can run in-process.
     pub fn mode_label(&self) -> &'static str {
         match self {
             InferenceEngine::MultimodalEmbed(_) => "embedding-worker",
@@ -1058,6 +1302,19 @@ impl InferenceEngine {
 
     /// Build + start the chosen engine.
     pub async fn create(config: InferenceEngineConfig, mode: EngineMode) -> Result<Self, String> {
+        if config.llama_server.is_some() {
+            if mode != EngineMode::Server {
+                return Err("a pinned llama-server requires the server engine".to_string());
+            }
+            if crate::embed_catalog::is_embedding_model(&config.model_name)
+                || crate::stt::MODEL_ID.eq_ignore_ascii_case(&config.model_name)
+            {
+                return Err(
+                    "a pinned llama-server cannot be used with an embedding or voice worker"
+                        .to_string(),
+                );
+            }
+        }
         // Must precede either llama.cpp engine and the GGUF embedding catalog lookup.
         if crate::embed_catalog::is_multimodal_embedding_model(&config.model_name) {
             return crate::eg2::Eg2Engine::production(
@@ -1550,6 +1807,120 @@ mod template_override_tests {
         assert!(!qwen_template_override(Path::new(
             "/opt/sgl/models/gemma-2-2b.gguf"
         )));
+    }
+}
+
+#[cfg(test)]
+mod explicit_llama_server_tests {
+    use super::*;
+    use std::io::Write;
+
+    fn fixture() -> (PathBuf, PathBuf, String) {
+        let root = std::env::temp_dir().join(format!(
+            "sgl-explicit-llama-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let executable = root.join(if cfg!(windows) {
+            "llama-server.exe"
+        } else {
+            "llama-server"
+        });
+        std::fs::write(&executable, b"verified llama fixture").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        std::fs::File::open(&executable)
+            .unwrap()
+            .sync_all()
+            .unwrap();
+        let sha = hex::encode(Sha256::digest(b"verified llama fixture"));
+        let root = std::fs::canonicalize(root).unwrap();
+        let executable = root.join(executable.file_name().unwrap());
+        (root, executable, sha)
+    }
+
+    #[test]
+    fn explicit_engine_binds_path_hash_and_file_identity() {
+        let (root, executable, sha) = fixture();
+        let explicit =
+            ExplicitLlamaServer::new_with_roots(&executable, &sha, std::slice::from_ref(&root))
+                .unwrap();
+        assert_eq!(explicit.verify_for_spawn().unwrap(), executable);
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&executable)
+            .unwrap();
+        file.write_all(b"tamper").unwrap();
+        file.sync_all().unwrap();
+        assert!(explicit.verify_for_spawn().is_err());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn explicit_engine_flags_are_all_or_nothing() {
+        let sha = "0".repeat(64);
+        assert!(explicit_llama_server(None, Some(&sha)).is_err());
+        assert!(explicit_llama_server(Some("/tmp/llama-server"), None).is_err());
+    }
+
+    #[tokio::test]
+    async fn pinned_runtime_cannot_be_bypassed_by_another_engine() {
+        let (root, executable, sha) = fixture();
+        let pinned =
+            ExplicitLlamaServer::new_with_roots(&executable, &sha, std::slice::from_ref(&root))
+                .unwrap();
+        let mut config = InferenceEngineConfig {
+            llama_server: Some(pinned),
+            embedding_python: None,
+            stt_whisper: None,
+            stt_whisper_sha256: None,
+            stt_python: None,
+            stt_smoke_dir: None,
+            model_path: root.join("model.gguf"),
+            model_name: "llama-3.2-1b".into(),
+            port: 8081,
+            threads: 1,
+            gpu_layers: 0,
+            context_size: 4096,
+            batch_size: 1,
+            parallel_slots: 1,
+            mmproj_path: None,
+            image_max_tokens: None,
+        };
+        assert!(InferenceEngine::create(config.clone(), EngineMode::InProcess)
+            .await
+            .err()
+            .unwrap()
+            .contains("requires the server engine"));
+        for model_name in [crate::stt::MODEL_ID, "embeddinggemma-2"] {
+            config.model_name = model_name.into();
+            assert!(InferenceEngine::create(config.clone(), EngineMode::Server)
+                .await
+                .err()
+                .unwrap()
+                .contains("embedding or voice worker"));
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explicit_engine_rejects_symlinks() {
+        use std::os::unix::fs::symlink;
+        let (root, executable, sha) = fixture();
+        let link = root.join("llama-server-link");
+        symlink(&executable, &link).unwrap();
+        assert!(
+            ExplicitLlamaServer::new_with_roots(&link, &sha, std::slice::from_ref(&root)).is_err()
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 }
 

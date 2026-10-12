@@ -1060,11 +1060,64 @@ fn wedge_timeout_ms(model_path: &Path) -> u64 {
     }
 }
 
+/// A pinned external executable is a request to run the server engine. Never accept
+/// its identity and then silently serve through the in-process engine instead.
+fn select_pinned_llama_engine(
+    mode: crate::inference::EngineMode,
+    mode_explicit: bool,
+    pinned_llama_server: bool,
+) -> Result<crate::inference::EngineMode, String> {
+    if !pinned_llama_server {
+        return Ok(mode);
+    }
+    if mode_explicit && mode == crate::inference::EngineMode::InProcess {
+        return Err(
+            "--llama-server-path cannot be combined with SGL_ENGINE=inprocess".to_string(),
+        );
+    }
+    Ok(crate::inference::EngineMode::Server)
+}
+
+#[cfg(test)]
+mod pinned_llama_engine_tests {
+    use super::select_pinned_llama_engine;
+    use crate::inference::EngineMode;
+
+    #[test]
+    fn pinned_runtime_selects_the_server_engine_from_the_mac_default() {
+        assert_eq!(
+            select_pinned_llama_engine(EngineMode::InProcess, false, true).unwrap(),
+            EngineMode::Server
+        );
+    }
+
+    #[test]
+    fn explicit_inprocess_cannot_ignore_the_pinned_runtime() {
+        assert!(select_pinned_llama_engine(EngineMode::InProcess, true, true)
+            .unwrap_err()
+            .contains("SGL_ENGINE=inprocess"));
+    }
+
+    #[test]
+    fn unpinned_and_explicit_server_modes_keep_their_selected_engines() {
+        assert_eq!(
+            select_pinned_llama_engine(EngineMode::InProcess, false, false).unwrap(),
+            EngineMode::InProcess
+        );
+        assert_eq!(
+            select_pinned_llama_engine(EngineMode::Server, true, true).unwrap(),
+            EngineMode::Server
+        );
+    }
+}
+
 pub async fn start(
     config_dir: &Path,
     orchestrator_url: &str,
     model_path: Option<&str>,
     model_name: Option<&str>,
+    llama_server_path: Option<&str>,
+    llama_server_sha256: Option<&str>,
     embedding_python: Option<&str>,
     stt_whisper: Option<&str>,
     stt_whisper_sha256: Option<&str>,
@@ -1076,6 +1129,11 @@ pub async fn start(
     inference_port: u16,
     rc: &ResourceConfig,
 ) -> Result<(), String> {
+    let explicit_llama_server =
+        crate::inference::explicit_llama_server(llama_server_path, llama_server_sha256)?;
+    if explicit_llama_server.is_some() && model_path.is_none() {
+        return Err("--llama-server-path requires --model-path".to_string());
+    }
     let cfg = config::load_config(config_dir)?;
     let keypair = NodeKeypair::load(&config::keypair_path(config_dir))?;
 
@@ -1197,6 +1255,11 @@ pub async fn start(
             }
             m => m,
         };
+        let engine_mode = select_pinned_llama_engine(
+            engine_mode,
+            engine_explicit,
+            explicit_llama_server.is_some(),
+        )?;
 
         let model_pb = PathBuf::from(path);
         // Continuous batching applies to BOTH engines, sized by the same machine+model-aware
@@ -1235,6 +1298,7 @@ pub async fn start(
             rc.context_size
         );
         let eng_config = InferenceEngineConfig {
+            llama_server: explicit_llama_server.clone(),
             embedding_python: embedding_python.map(PathBuf::from),
             stt_whisper: stt_whisper.map(PathBuf::from),
             stt_whisper_sha256: stt_whisper_sha256.map(str::to_string),
