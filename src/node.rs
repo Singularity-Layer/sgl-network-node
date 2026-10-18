@@ -2978,14 +2978,17 @@ async fn execute_systemone(
         .as_object()
         .ok_or("System One payload must be a JSON object")?;
 
+    let public_model = job
+        .model
+        .as_ref()
+        .filter(|model| !model.trim().is_empty())
+        .ok_or("System One job is missing its catalog model id")?
+        .clone();
     let mut request = serde_json::Map::new();
-    if let Some(model) = payload_obj.get("model").cloned().or_else(|| {
-        job.model
-            .as_ref()
-            .map(|m| serde_json::Value::String(m.clone()))
-    }) {
-        request.insert("model".to_string(), model);
-    }
+    request.insert(
+        "model".to_string(),
+        serde_json::Value::String(public_model.clone()),
+    );
     for key in ["state", "questions", "task", "lang"] {
         if let Some(v) = payload_obj.get(key) {
             request.insert(key.to_string(), v.clone());
@@ -2998,11 +3001,6 @@ async fn execute_systemone(
         return Err("System One payload missing 'questions'".to_string());
     }
 
-    let public_model = request
-        .get("model")
-        .and_then(|value| value.as_str())
-        .unwrap_or_default()
-        .to_string();
     let request_value = serde_json::Value::Object(request);
     let request_bytes = serde_json::to_vec(&request_value)
         .map_err(|e| format!("failed to encode System One payload: {e}"))?;
