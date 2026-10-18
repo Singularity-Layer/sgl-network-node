@@ -2,6 +2,13 @@ name: xmesh-runtime-canary
 
 on:
   workflow_dispatch:
+  pull_request:
+    paths:
+      - .github/workflows/xmesh-runtime-canary.yml
+      - scripts/xmesh_runtime_canary.py
+      - src/inference.rs
+      - src/node.rs
+      - src/setup.rs
 
 permissions:
   contents: read
@@ -12,6 +19,7 @@ env:
 jobs:
   linux-x64:
     runs-on: ubuntu-24.04
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - name: Install native runtime dependency
@@ -33,6 +41,7 @@ jobs:
 
   windows-x64:
     runs-on: windows-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - name: Download verified runtime and model
