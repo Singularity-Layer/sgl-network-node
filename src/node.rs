@@ -1177,7 +1177,7 @@ pub async fn start(
 
     let mut engine: Option<Arc<InferenceEngine>> = None;
     let mut models: Vec<String> = vec![];
-    let systemone_sidecar_url = if model_path.is_none() {
+    let mut systemone_sidecar_url = if model_path.is_none() {
         systemone_sidecar_url
             .map(|s| s.trim().trim_end_matches('/').to_string())
             .filter(|s| !s.is_empty())
@@ -1207,6 +1207,7 @@ pub async fn start(
                 .map(|s| s.to_string_lossy().to_string())
                 .unwrap_or_else(|| "unknown".to_string())
         });
+        let gguf_systemone = crate::inference::is_gguf_systemone_model(&name);
 
         // Crash-loop engine auto-swap: if the OS service keeps restarting a young-dying
         // node on the GPU (Vulkan) engine, swap to the CPU build before creating the
@@ -1241,6 +1242,27 @@ pub async fn start(
             #[cfg(not(feature = "inprocess"))]
             _ => crate::inference::EngineMode::Server,
         };
+        // xMESH uses llama.cpp's native /v1/systemone server endpoint. The embedded
+        // llama-cpp crate does not expose the decision batch API yet, so this model
+        // must use the hash-pinned server engine on every platform.
+        let engine_mode = if gguf_systemone {
+            if engine_explicit
+                && std::env::var("SGL_ENGINE")
+                    .map(|value| {
+                        value.eq_ignore_ascii_case("inprocess")
+                            || value.eq_ignore_ascii_case("in-process")
+                    })
+                    .unwrap_or(false)
+            {
+                return Err(format!(
+                    "{} requires the llama-server engine for /v1/systemone",
+                    crate::inference::XMESH_MODEL_ID
+                ));
+            }
+            crate::inference::EngineMode::Server
+        } else {
+            engine_mode
+        };
         // Vision used to REQUIRE the server engine, which meant handing the decrypted prompt
         // and the image to a llama-server child over an unauthenticated 127.0.0.1 socket the
         // operator could read. A `vision` build serves images in-process instead, so the force
@@ -1266,19 +1288,26 @@ pub async fn start(
         // budget (RAM, model size, per-request context) so a node advertises the same honest
         // capacity whichever engine it runs. In-process additionally honors the
         // SGL_INPROCESS_SLOTS override (custom, still RAM-capped) — see inprocess_slots().
-        effective_slots = match engine_mode {
-            crate::inference::EngineMode::Server => compute_parallel_slots(
-                tee::detect().memory_gb,
-                &model_pb,
-                rc.context_size,
-                rc.max_jobs,
-            ),
-            crate::inference::EngineMode::InProcess => inprocess_slots(
-                tee::detect().memory_gb,
-                &model_pb,
-                rc.context_size,
-                rc.max_jobs,
-            ),
+        effective_slots = if gguf_systemone {
+            // A complete 2K decision batch is substantially heavier than token
+            // generation. One universal slot is the verified safe default for CPU,
+            // Metal, Vulkan, and CUDA; raise only after platform canaries prove it.
+            1
+        } else {
+            match engine_mode {
+                crate::inference::EngineMode::Server => compute_parallel_slots(
+                    tee::detect().memory_gb,
+                    &model_pb,
+                    rc.context_size,
+                    rc.max_jobs,
+                ),
+                crate::inference::EngineMode::InProcess => inprocess_slots(
+                    tee::detect().memory_gb,
+                    &model_pb,
+                    rc.context_size,
+                    rc.max_jobs,
+                ),
+            }
         };
         if crate::embed_catalog::is_multimodal_embedding_model(&name)
             || crate::stt::MODEL_ID.eq_ignore_ascii_case(&name)
@@ -1288,14 +1317,19 @@ pub async fn start(
         wedge_ms = wedge_timeout_ms(&model_pb);
         // llama-server divides its total `-c` across slots, so pass slots × context_size
         // to keep each slot at the operator's configured per-request context.
+        let per_slot_ctx = if gguf_systemone {
+            crate::inference::XMESH_CONTEXT_TOKENS
+        } else {
+            rc.context_size
+        };
         let total_ctx = effective_slots
-            .saturating_mul(rc.context_size)
-            .max(rc.context_size);
+            .saturating_mul(per_slot_ctx)
+            .max(per_slot_ctx);
 
         tracing::info!("Loading model: {name} from {path}");
         tracing::info!(
             "  Parallel slots: {effective_slots} (continuous batching) — total ctx {total_ctx} ({} per slot)",
-            rc.context_size
+            per_slot_ctx
         );
         let eng_config = InferenceEngineConfig {
             llama_server: explicit_llama_server.clone(),
@@ -1310,7 +1344,11 @@ pub async fn start(
             threads: rc.threads,
             gpu_layers: rc.gpu_layers,
             context_size: total_ctx,
-            batch_size: rc.batch_size,
+            batch_size: if gguf_systemone {
+                crate::inference::XMESH_CONTEXT_TOKENS
+            } else {
+                rc.batch_size
+            },
             parallel_slots: effective_slots,
             mmproj_path: mmproj_path.map(PathBuf::from),
             image_max_tokens,
@@ -1353,6 +1391,12 @@ pub async fn start(
             }
             Err(err) => return Err(err),
         };
+        if gguf_systemone {
+            systemone_sidecar_url = eng.systemone_base_url().map(str::to_string);
+            if systemone_sidecar_url.is_none() {
+                return Err("xMESH started without a /v1/systemone runtime".into());
+            }
+        }
         models.push(name);
         engine = Some(Arc::new(eng));
         tracing::info!("Inference engine ready ({engine_mode:?})");

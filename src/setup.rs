@@ -18,10 +18,10 @@ use std::io::Cursor;
 use std::path::{Path, PathBuf};
 
 /// Pinned llama.cpp release. Bump the tag + all three hashes together after vetting a new build.
-/// Hashes verified against ggml-org/llama.cpp release assets on 2026-08-17.
-/// b10419 adds the qwen3_5 arch (Qwen3-VL / Qwen3.8) while still serving Qwen2.5-VL — verified
-/// locally against the qwen2.5-vl-3b vision model before this bump.
-const LLAMA_TAG: &str = "b10419";
+/// Hashes verified against ggml-org/llama.cpp release assets on 2026-10-18.
+/// b11719 includes native Clef conversion/runtime support and `/v1/systemone`
+/// while retaining the previously required Qwen3.5 and Qwen2.5-VL support.
+const LLAMA_TAG: &str = "b11719";
 
 struct Asset {
     /// Release asset filename.
@@ -43,8 +43,17 @@ fn asset_for(cpu_only: bool) -> Option<Asset> {
         // pinned copy is found FIRST (see find_llama_server()).
         let _ = cpu_only;
         return Some(Asset {
-            name: "llama-b10419-bin-macos-arm64.tar.gz",
-            sha256: "10e16c9092b193b26b02326079776c7b5605e67b70e21d3230e9970b1cccb0c0",
+            name: "llama-b11719-bin-macos-arm64.tar.gz",
+            sha256: "076a2b0d15253078b90bd520a82dc2edc6c17657968878876ba3def3e80f54ba",
+            is_zip: false,
+        });
+    }
+    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+    {
+        let _ = cpu_only;
+        return Some(Asset {
+            name: "llama-b11719-bin-macos-x64.tar.gz",
+            sha256: "739708dca398960462725dd885010e10e6b9fed79e812a29f18d260af23f9929",
             is_zip: false,
         });
     }
@@ -52,26 +61,48 @@ fn asset_for(cpu_only: bool) -> Option<Asset> {
     {
         return Some(if cpu_only {
             Asset {
-                name: "llama-b10419-bin-win-cpu-x64.zip",
-                sha256: "f72735759c13df57e24bcca6a65e6cc77897a710d12a79261fad4b311c9d59db",
+                name: "llama-b11719-bin-win-cpu-x64.zip",
+                sha256: "1b1234d208a8b851cc27cd3d96b850d1547a4e5cfc5cd75f0a9fdd1d4c5bea20",
                 is_zip: true,
             }
         } else {
             Asset {
-                name: "llama-b10419-bin-win-vulkan-x64.zip",
-                sha256: "dd4b896fa8a85eb59a8eafe03f096c0a52848c8e46840f1d815d063696b610b9",
+                name: "llama-b11719-bin-win-vulkan-x64.zip",
+                sha256: "08dde7f4133443ac629431c35f0435e267ca73251fc002cb95e10625424e2963",
                 is_zip: true,
             }
         });
     }
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     {
-        // Linux ships CPU inside the vulkan tarball too; one artifact covers both.
-        let _ = cpu_only;
-        return Some(Asset {
-            name: "llama-b10419-bin-ubuntu-vulkan-x64.tar.gz",
-            sha256: "b95c5138625862b4ffa677153a1d7656a14222734e84d2c68bff90b192b6fe63",
-            is_zip: false,
+        return Some(if cpu_only {
+            Asset {
+                name: "llama-b11719-bin-ubuntu-x64.tar.gz",
+                sha256: "2c50edd1422cdc686a1620923a7dda9a33634509566d2821155fb3d4879510a3",
+                is_zip: false,
+            }
+        } else {
+            Asset {
+                name: "llama-b11719-bin-ubuntu-vulkan-x64.tar.gz",
+                sha256: "9a09cce245acf8823feb99fb7ba8ddd3e878e3827564888131e0185044aa4429",
+                is_zip: false,
+            }
+        });
+    }
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    {
+        return Some(if cpu_only {
+            Asset {
+                name: "llama-b11719-bin-ubuntu-arm64.tar.gz",
+                sha256: "290aa4432ad8e28b638285be6a75d0dd6f327d9b2d95f7048a8cf5e69704bee9",
+                is_zip: false,
+            }
+        } else {
+            Asset {
+                name: "llama-b11719-bin-ubuntu-vulkan-arm64.tar.gz",
+                sha256: "ec2b1e886192c9e1e686e4a5a4d95079f75b98966274264e7bf6e2e13a063185",
+                is_zip: false,
+            }
         });
     }
     #[allow(unreachable_code)]
@@ -121,6 +152,12 @@ fn sha256_hex(bytes: &[u8]) -> String {
     let mut h = Sha256::new();
     h.update(bytes);
     hex::encode(h.finalize())
+}
+
+fn launch_dependency_hint(stderr: &str) -> Option<&'static str> {
+    stderr.contains("libgomp.so.1").then_some(
+        " Install the standard libgomp runtime first (Ubuntu/Debian: sudo apt-get install libgomp1).",
+    )
 }
 
 /// Crash-loop engine auto-swap. Called once at node startup: if this process keeps
@@ -387,11 +424,13 @@ pub async fn run(cpu_only: bool) -> Result<(), String> {
         Ok(o) if o.status.success() => {}
         Ok(o) => {
             let stderr = String::from_utf8_lossy(&o.stderr).trim().to_string();
+            let dependency = launch_dependency_hint(&stderr).unwrap_or("");
             return Err(fail(&staging, format!(
                 "Downloaded llama-server exited with {} during the launch check{}\n\
-                 (Missing runtime libs? On Windows a GPU driver may be needed.) Nothing installed.",
+                 (Missing runtime libs? On Windows a GPU driver may be needed.){} Nothing installed.",
                 o.status,
                 if stderr.is_empty() { String::new() } else { format!(": {stderr}") },
+                dependency,
             )));
         }
         Err(e) => {
@@ -534,6 +573,15 @@ mod setup_tests {
             assert!(a.sha256.chars().all(|c| c.is_ascii_hexdigit()));
             assert!(a.name.contains(LLAMA_TAG));
         }
+    }
+
+    #[test]
+    fn missing_openmp_runtime_has_an_actionable_linux_fix() {
+        assert_eq!(
+            launch_dependency_hint("error while loading shared libraries: libgomp.so.1: cannot open shared object file"),
+            Some(" Install the standard libgomp runtime first (Ubuntu/Debian: sudo apt-get install libgomp1).")
+        );
+        assert_eq!(launch_dependency_hint("unrelated loader error"), None);
     }
 
     #[test]
