@@ -2952,6 +2952,16 @@ async fn execute_transcription(
     }
 }
 
+fn set_public_systemone_model(
+    output: &mut serde_json::Map<String, serde_json::Value>,
+    public_model: &str,
+) {
+    output.insert(
+        "model".to_string(),
+        serde_json::Value::String(public_model.to_string()),
+    );
+}
+
 async fn execute_systemone(
     sidecar_url: Option<&str>,
     job: &PendingJob,
@@ -2988,6 +2998,11 @@ async fn execute_systemone(
         return Err("System One payload missing 'questions'".to_string());
     }
 
+    let public_model = request
+        .get("model")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default()
+        .to_string();
     let request_value = serde_json::Value::Object(request);
     let request_bytes = serde_json::to_vec(&request_value)
         .map_err(|e| format!("failed to encode System One payload: {e}"))?;
@@ -3024,12 +3039,10 @@ async fn execute_systemone(
     let out_obj = out
         .as_object_mut()
         .ok_or("System One sidecar response must be a JSON object")?;
-    if !out_obj.contains_key("model") {
-        out_obj.insert(
-            "model".to_string(),
-            serde_json::Value::String(job.model.clone().unwrap_or_default()),
-        );
-    }
+    // llama-server identifies itself with the local GGUF path. Never expose an
+    // operator filesystem path to a Grid caller; the public catalog id is the
+    // only model identity that crosses this boundary.
+    set_public_systemone_model(out_obj, &public_model);
     match out_obj.get_mut("usage") {
         Some(serde_json::Value::Object(usage)) => {
             usage
@@ -3073,7 +3086,10 @@ fn validate_systemone_sidecar_url(raw: &str) -> Result<(), String> {
 
 #[cfg(test)]
 mod tool_extract_tests {
-    use super::{extract_text_tool_calls, systemone_sidecar_slots, validate_systemone_sidecar_url};
+    use super::{
+        extract_text_tool_calls, set_public_systemone_model, systemone_sidecar_slots,
+        validate_systemone_sidecar_url,
+    };
 
     fn allowed() -> Vec<String> {
         vec!["get_weather".to_string()]
@@ -3107,6 +3123,28 @@ mod tool_extract_tests {
         assert_eq!(systemone_sidecar_slots(32.0, 1), 1);
         assert_eq!(systemone_sidecar_slots(32.0, 2), 2);
         assert_eq!(systemone_sidecar_slots(32.0, 99), 3);
+    }
+
+    #[test]
+    fn systemone_response_never_exposes_the_runtime_model_path() {
+        let mut output = serde_json::json!({
+            "model": "/Users/operator/private/models/xmesh.gguf",
+            "answers": {}
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        set_public_systemone_model(
+            &mut output,
+            crate::inference::XMESH_MODEL_ID,
+        );
+        assert_eq!(
+            output.get("model").and_then(|value| value.as_str()),
+            Some(crate::inference::XMESH_MODEL_ID)
+        );
+        assert!(!serde_json::Value::Object(output)
+            .to_string()
+            .contains("/Users/operator"));
     }
 
     #[test]
