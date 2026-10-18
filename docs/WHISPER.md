@@ -145,6 +145,23 @@ durable job UUID uniqueness and terminal-job replay protection across node
 sessions. Cancellation and timeout terminate the owned process tree and clear
 readiness. Local temporary audio is removed when the worker ends.
 
+## Operator pricing
+
+The node does not advertise or calculate money in its heartbeat or transcription
+dispatch. Operators manage the separate Grid Voice unit through the authenticated
+pricing API:
+
+```bash
+sgl price show
+sgl price set --model whisper-1 --audio-second 0.0001
+sgl price reset --model whisper-1
+```
+
+The orchestrator enforces the audio-rate band, one-minute cooldown, ownership,
+and audit history. It snapshots the effective rate and exact sample-count quote
+when it reserves a provider. Existing node dispatch fields stay unchanged; the
+runtime reports authenticated audio seconds and never decides the charge.
+
 ## Verification
 
 ```sh

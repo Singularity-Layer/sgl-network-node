@@ -623,6 +623,32 @@ impl OrchestratorClient {
         Ok(())
     }
 
+    /// Set a custom Grid Voice rate in USD per audio second. The orchestrator
+    /// canonicalizes to integer micro-USDC and enforces the allowed band.
+    pub async fn set_audio_price(
+        &self,
+        node_id: &str,
+        model: &str,
+        audio_per_second: f64,
+    ) -> Result<(), String> {
+        let url = format!("{}/grid/nodes/{}/prices", self.base_url, enc_seg(node_id));
+        let token = self.get_token()?;
+        let resp = self
+            .client
+            .post(&url)
+            .header("X-Node-Auth", token)
+            .json(&serde_json::json!({ "model": model, "audio_per_second": audio_per_second }))
+            .send()
+            .await
+            .map_err(|e| format!("Set audio price failed: {e}"))?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            return Err(format!("Set audio price failed ({status}): {text}"));
+        }
+        Ok(())
+    }
+
     /// Reset a model's price back to the platform suggested rate.
     pub async fn reset_price(&self, node_id: &str, model: &str) -> Result<(), String> {
         let url = format!("{}/grid/nodes/{}/prices", self.base_url, enc_seg(node_id));

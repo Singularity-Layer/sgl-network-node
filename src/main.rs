@@ -12,6 +12,7 @@ mod inprocess;
 mod multimodal;
 mod node;
 mod orchestrator;
+mod pricing;
 mod runtime_hardening;
 mod service;
 mod setup;
@@ -240,8 +241,8 @@ enum Commands {
         action: ServiceAction,
     },
 
-    /// View or set your per-token prices (USD per 1M tokens). You earn 80% of
-    /// whatever you charge; prices must stay within the network's allowed band.
+    /// View or set token and Grid Voice prices. You earn 80% of whatever you
+    /// charge; prices must stay within the network's allowed band.
     Price {
         #[command(subcommand)]
         action: PriceAction,
@@ -252,17 +253,20 @@ enum Commands {
 enum PriceAction {
     /// Show your per-model prices, the platform suggested rate, and the band.
     Show,
-    /// Set a custom price for a model (USD per 1M tokens).
+    /// Set a token price (--input + --output) or voice price (--audio-second).
     Set {
         /// Model id you serve (e.g. "llama-3.2-3b")
         #[arg(long)]
         model: String,
         /// Input (prompt) price, USD per 1M tokens
-        #[arg(long)]
-        input: f64,
+        #[arg(long, requires = "output", conflicts_with = "audio_second")]
+        input: Option<f64>,
         /// Output (completion) price, USD per 1M tokens
-        #[arg(long)]
-        output: f64,
+        #[arg(long, requires = "input", conflicts_with = "audio_second")]
+        output: Option<f64>,
+        /// Grid Voice price, USD per audio second
+        #[arg(long, conflicts_with_all = ["input", "output"])]
+        audio_second: Option<f64>,
     },
     /// Reset a model back to the platform suggested price.
     Reset {
@@ -556,16 +560,17 @@ async fn main() {
         }
         Commands::Price { action } => {
             let result = match action {
-                PriceAction::Show => node::show_prices(&config_dir, &cli.orchestrator_url).await,
+                PriceAction::Show => pricing::show_prices(&config_dir, &cli.orchestrator_url).await,
                 PriceAction::Set {
                     model,
                     input,
                     output,
-                } => {
-                    node::set_price(&config_dir, &cli.orchestrator_url, &model, input, output).await
-                }
+                    audio_second,
+                } => pricing::set_price(
+                    &config_dir, &cli.orchestrator_url, &model, input, output, audio_second,
+                ).await,
                 PriceAction::Reset { model } => {
-                    node::reset_price(&config_dir, &cli.orchestrator_url, &model).await
+                    pricing::reset_price(&config_dir, &cli.orchestrator_url, &model).await
                 }
             };
             if let Err(e) = result {
