@@ -1,0 +1,53 @@
+name: xmesh-runtime-canary
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  MODEL_URL: https://huggingface.co/singularity-layer/Singularity-xMESH-0.8B/resolve/main/Singularity-xMESH-0.8B-BF16.gguf
+
+jobs:
+  linux-x64:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install native runtime dependency
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq libgomp1
+      - name: Download verified runtime and model
+        run: |
+          curl -fL --retry 3 -o llama.tar.gz https://github.com/ggml-org/llama.cpp/releases/download/b11719/llama-b11719-bin-ubuntu-x64.tar.gz
+          echo '2c50edd1422cdc686a1620923a7dda9a33634509566d2821155fb3d4879510a3  llama.tar.gz' | sha256sum -c -
+          tar -xzf llama.tar.gz
+          curl -fL --retry 3 -o xmesh.gguf "$MODEL_URL"
+      - name: Run real System One canary
+        run: python3 scripts/xmesh_runtime_canary.py --server llama-b11719/llama-server --model xmesh.gguf
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: xmesh-linux-x64-canary
+          path: xmesh-canary-*.json
+          if-no-files-found: ignore
+
+  windows-x64:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download verified runtime and model
+        shell: pwsh
+        run: |
+          curl.exe -fL --retry 3 -o llama.zip https://github.com/ggml-org/llama.cpp/releases/download/b11719/llama-b11719-bin-win-cpu-x64.zip
+          $actual = (Get-FileHash llama.zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actual -ne '1b1234d208a8b851cc27cd3d96b850d1547a4e5cfc5cd75f0a9fdd1d4c5bea20') { throw "runtime SHA-256 mismatch: $actual" }
+          Expand-Archive llama.zip -DestinationPath llama
+          curl.exe -fL --retry 3 -o xmesh.gguf $env:MODEL_URL
+      - name: Run real System One canary
+        run: python scripts/xmesh_runtime_canary.py --server llama/llama-server.exe --model xmesh.gguf
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: xmesh-windows-x64-canary
+          path: xmesh-canary-*.json
+          if-no-files-found: ignore
