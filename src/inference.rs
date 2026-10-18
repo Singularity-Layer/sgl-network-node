@@ -27,7 +27,10 @@ pub fn gpu_layers_for_model(model_name: &str, configured: u32) -> u32 {
 }
 
 pub fn validate_model_memory(model_name: &str, memory_gb: f64) -> Result<(), String> {
-    if is_gguf_systemone_model(model_name) && memory_gb < XMESH_MIN_MEMORY_GB {
+    // OS APIs report binary GiB while machines are sold in nominal whole-GB tiers.
+    // Match the desktop picker so a normal "8 GB" machine does not pass one layer
+    // and fail the other merely because it reports 7.7-7.9 GiB.
+    if is_gguf_systemone_model(model_name) && memory_gb.round() < XMESH_MIN_MEMORY_GB {
         return Err(format!(
             "{} requires at least {:.0} GB of system memory; this machine reports {:.1} GB",
             XMESH_MODEL_ID, XMESH_MIN_MEMORY_GB, memory_gb
@@ -1910,7 +1913,9 @@ mod systemone_gguf_tests {
 
     #[test]
     fn xmesh_refuses_machines_below_the_published_memory_floor() {
-        assert!(validate_model_memory(XMESH_MODEL_ID, 7.9).is_err());
+        assert!(validate_model_memory(XMESH_MODEL_ID, 7.4).is_err());
+        assert!(validate_model_memory(XMESH_MODEL_ID, 7.5).is_ok());
+        assert!(validate_model_memory(XMESH_MODEL_ID, 7.9).is_ok());
         assert!(validate_model_memory(XMESH_MODEL_ID, 8.0).is_ok());
         assert!(validate_model_memory("qwen-2.5-7b", 4.0).is_ok());
     }
