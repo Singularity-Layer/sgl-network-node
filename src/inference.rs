@@ -10,9 +10,30 @@ use tokio::time::{sleep, Duration};
 /// Keep this exact id aligned with the Desktop and Grid catalog entries.
 pub const XMESH_MODEL_ID: &str = "singularity-layer/Singularity-xMESH-0.8B";
 pub const XMESH_CONTEXT_TOKENS: u32 = 2048;
+pub const XMESH_MIN_MEMORY_GB: f64 = 8.0;
 
 pub fn is_gguf_systemone_model(model_name: &str) -> bool {
     model_name.eq_ignore_ascii_case(XMESH_MODEL_ID)
+}
+
+/// xMESH's release evidence is CPU-only outside Apple Metal. Keep the portable
+/// runtime on the verified path until each accelerator has decision-parity evidence.
+pub fn gpu_layers_for_model(model_name: &str, configured: u32) -> u32 {
+    if is_gguf_systemone_model(model_name) {
+        0
+    } else {
+        configured
+    }
+}
+
+pub fn validate_model_memory(model_name: &str, memory_gb: f64) -> Result<(), String> {
+    if is_gguf_systemone_model(model_name) && memory_gb < XMESH_MIN_MEMORY_GB {
+        return Err(format!(
+            "{} requires at least {:.0} GB of system memory; this machine reports {:.1} GB",
+            XMESH_MODEL_ID, XMESH_MIN_MEMORY_GB, memory_gb
+        ));
+    }
+    Ok(())
 }
 
 /// Sentinel for `gpu_layers` meaning "auto-fit": the server engine omits `-ngl` so llama.cpp
@@ -1865,7 +1886,10 @@ mod template_override_tests {
 
 #[cfg(test)]
 mod systemone_gguf_tests {
-    use super::{is_gguf_systemone_model, XMESH_MODEL_ID};
+    use super::{
+        gpu_layers_for_model, is_gguf_systemone_model, validate_model_memory, GPU_LAYERS_AUTO,
+        XMESH_MODEL_ID,
+    };
 
     #[test]
     fn only_the_pinned_xmesh_id_uses_native_systemone() {
@@ -1875,6 +1899,20 @@ mod systemone_gguf_tests {
         ));
         assert!(!is_gguf_systemone_model("convaiinnovations/laya"));
         assert!(!is_gguf_systemone_model("qwen-2.5-7b"));
+    }
+
+    #[test]
+    fn xmesh_stays_on_the_verified_cpu_path() {
+        assert_eq!(gpu_layers_for_model(XMESH_MODEL_ID, GPU_LAYERS_AUTO), 0);
+        assert_eq!(gpu_layers_for_model(XMESH_MODEL_ID, 42), 0);
+        assert_eq!(gpu_layers_for_model("qwen-2.5-7b", 42), 42);
+    }
+
+    #[test]
+    fn xmesh_refuses_machines_below_the_published_memory_floor() {
+        assert!(validate_model_memory(XMESH_MODEL_ID, 7.9).is_err());
+        assert!(validate_model_memory(XMESH_MODEL_ID, 8.0).is_ok());
+        assert!(validate_model_memory("qwen-2.5-7b", 4.0).is_ok());
     }
 }
 

@@ -1197,6 +1197,7 @@ pub async fn start(
     // RAM-aware value below. Used for the LOCAL capacity gate AND advertised to the
     // orchestrator so it dispatches up to this many concurrent jobs.
     let mut effective_slots: u32 = 1;
+    let mut active_gpu_layers = rc.gpu_layers;
     // #159 watchdog timeout, model-aware (set from the GGUF size once we know the model).
     let mut wedge_ms: u64 = 600_000;
 
@@ -1208,6 +1209,12 @@ pub async fn start(
                 .unwrap_or_else(|| "unknown".to_string())
         });
         let gguf_systemone = crate::inference::is_gguf_systemone_model(&name);
+        let machine_memory_gb = tee::detect().memory_gb;
+        crate::inference::validate_model_memory(&name, machine_memory_gb)?;
+        active_gpu_layers = crate::inference::gpu_layers_for_model(&name, rc.gpu_layers);
+        if active_gpu_layers != rc.gpu_layers {
+            tracing::info!("  GPU layers:   {active_gpu_layers} (xMESH verified CPU release path)");
+        }
 
         // Crash-loop engine auto-swap: if the OS service keeps restarting a young-dying
         // node on the GPU (Vulkan) engine, swap to the CPU build before creating the
@@ -1296,13 +1303,13 @@ pub async fn start(
         } else {
             match engine_mode {
                 crate::inference::EngineMode::Server => compute_parallel_slots(
-                    tee::detect().memory_gb,
+                    machine_memory_gb,
                     &model_pb,
                     rc.context_size,
                     rc.max_jobs,
                 ),
                 crate::inference::EngineMode::InProcess => inprocess_slots(
-                    tee::detect().memory_gb,
+                    machine_memory_gb,
                     &model_pb,
                     rc.context_size,
                     rc.max_jobs,
@@ -1342,7 +1349,7 @@ pub async fn start(
             model_name: name.clone(),
             port: inference_port,
             threads: rc.threads,
-            gpu_layers: rc.gpu_layers,
+            gpu_layers: active_gpu_layers,
             context_size: total_ctx,
             batch_size: if gguf_systemone {
                 crate::inference::XMESH_CONTEXT_TOKENS
@@ -1935,7 +1942,9 @@ pub async fn start(
         };
         let mut heartbeat_telemetry = telemetry.snapshot(crate::telemetry::SnapshotInputs {
             has_sidecar: systemone_sidecar.is_some(),
-            accelerator: engine.as_ref().map(|e| e.accelerator_hint(rc.gpu_layers)),
+            accelerator: engine
+                .as_ref()
+                .map(|e| e.accelerator_hint(active_gpu_layers)),
             has_engine: engine.is_some(),
             unhealthy_streak,
             quarantined: empty_quarantined,

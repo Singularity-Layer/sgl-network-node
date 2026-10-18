@@ -23,11 +23,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install native runtime dependency
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq libgomp1
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq libgomp1 libvulkan1
       - name: Download verified runtime and model
         run: |
-          curl -fL --retry 3 -o llama.tar.gz https://github.com/ggml-org/llama.cpp/releases/download/b11719/llama-b11719-bin-ubuntu-x64.tar.gz
-          echo '2c50edd1422cdc686a1620923a7dda9a33634509566d2821155fb3d4879510a3  llama.tar.gz' | sha256sum -c -
+          curl -fL --retry 3 -o llama.tar.gz https://github.com/ggml-org/llama.cpp/releases/download/b11719/llama-b11719-bin-ubuntu-vulkan-x64.tar.gz
+          echo '9a09cce245acf8823feb99fb7ba8ddd3e878e3827564888131e0185044aa4429  llama.tar.gz' | sha256sum -c -
           tar -xzf llama.tar.gz
           curl -fL --retry 3 -o xmesh.gguf "$MODEL_URL"
       - name: Run real System One canary
@@ -47,9 +47,9 @@ jobs:
       - name: Download verified runtime and model
         shell: pwsh
         run: |
-          curl.exe -fL --retry 3 -o llama.zip https://github.com/ggml-org/llama.cpp/releases/download/b11719/llama-b11719-bin-win-cpu-x64.zip
+          curl.exe -fL --retry 3 -o llama.zip https://github.com/ggml-org/llama.cpp/releases/download/b11719/llama-b11719-bin-win-vulkan-x64.zip
           $actual = (Get-FileHash llama.zip -Algorithm SHA256).Hash.ToLowerInvariant()
-          if ($actual -ne '1b1234d208a8b851cc27cd3d96b850d1547a4e5cfc5cd75f0a9fdd1d4c5bea20') { throw "runtime SHA-256 mismatch: $actual" }
+          if ($actual -ne '08dde7f4133443ac629431c35f0435e267ca73251fc002cb95e10625424e2963') { throw "runtime SHA-256 mismatch: $actual" }
           Expand-Archive llama.zip -DestinationPath llama
           curl.exe -fL --retry 3 -o xmesh.gguf $env:MODEL_URL
       - name: Run real System One canary
