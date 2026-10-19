@@ -65,6 +65,10 @@ wallet. `sgl init --wallet <ADDRESS>` is the non-interactive alternative.
 | `sgl start --model-path <gguf> --model-name <name>` | Start serving: heartbeat + process jobs. |
 | `sgl attest` | Sign the orchestrator's challenge + send the hardware report. |
 | `sgl status` | Node status, reputation, jobs completed/failed. |
+| `sgl price show` | Show effective token and Grid Voice rates, bands, and custom/default state. |
+| `sgl price set --model <id> --input <usd> --output <usd>` | Set a token rate in USD per 1M tokens. |
+| `sgl price set --model whisper-1 --audio-second <usd>` | Set a Grid Voice rate in USD per audio second. |
+| `sgl price reset --model <id>` | Return the model to its suggested rate. |
 | `sgl service install \| status \| uninstall` | Run as a background OS service across reboots. |
 
 `sgl start` flags include `--resource-percent` (a preset that scales threads / GPU
