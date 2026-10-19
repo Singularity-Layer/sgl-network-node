@@ -16,11 +16,46 @@ pub fn is_gguf_systemone_model(model_name: &str) -> bool {
     model_name.eq_ignore_ascii_case(XMESH_MODEL_ID)
 }
 
-/// xMESH's release evidence is CPU-only outside Apple Metal. Keep the portable
-/// runtime on the verified path until each accelerator has decision-parity evidence.
+/// Full offload for xMESH (0.8B: every layer fits on any supported GPU).
+pub const XMESH_FULL_OFFLOAD_LAYERS: u32 = 99;
+
+/// Accelerators with xMESH decision-parity evidence against the CPU reference on the
+/// frozen 80-case suite (960 decisions, llama.cpp b11719, -ngl 99):
+/// - Apple Metal (M4): 959/960 identical (one 50.09/49.91 tie), median 0.82 s vs 4.67 s.
+/// - NVIDIA via the Vulkan build (RTX A4000): 960/960 identical, median 0.31 s.
+/// AMD/Intel Vulkan, CUDA, and unknown installs stay on CPU until they pass the same suite.
+pub fn xmesh_gpu_verified() -> bool {
+    static VERIFIED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *VERIFIED.get_or_init(|| {
+        let apple_silicon = cfg!(all(target_os = "macos", target_arch = "aarch64"));
+        // Only probe for NVIDIA where it can matter (never on macOS).
+        let nvidia = !cfg!(target_os = "macos") && nvidia_gpu_present();
+        xmesh_gpu_path(apple_silicon, installed_engine_variant().as_deref(), nvidia)
+    })
+}
+
+/// Pure decision behind `xmesh_gpu_verified`, so the rule is testable on any host.
+pub fn xmesh_gpu_path(apple_silicon: bool, engine_variant: Option<&str>, nvidia: bool) -> bool {
+    apple_silicon || (engine_variant == Some("vulkan") && nvidia)
+}
+
+fn nvidia_gpu_present() -> bool {
+    std::process::Command::new("nvidia-smi")
+        .arg("-L")
+        .output()
+        .map(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).contains("GPU "))
+        .unwrap_or(false)
+}
+
+/// xMESH runs only on verified paths: full GPU offload where an accelerator has parity
+/// evidence, CPU everywhere else. The operator's --gpu-layers cannot move it off them.
 pub fn gpu_layers_for_model(model_name: &str, configured: u32) -> u32 {
     if is_gguf_systemone_model(model_name) {
-        0
+        if xmesh_gpu_verified() {
+            XMESH_FULL_OFFLOAD_LAYERS
+        } else {
+            0
+        }
     } else {
         configured
     }
@@ -1890,7 +1925,9 @@ mod template_override_tests {
 #[cfg(test)]
 mod systemone_gguf_tests {
     use super::{
-        gpu_layers_for_model, is_gguf_systemone_model, validate_model_memory, GPU_LAYERS_AUTO,
+        gpu_layers_for_model, is_gguf_systemone_model, validate_model_memory, xmesh_gpu_path,
+        xmesh_gpu_verified,
+        GPU_LAYERS_AUTO, XMESH_FULL_OFFLOAD_LAYERS,
         XMESH_MODEL_ID,
     };
 
@@ -1906,8 +1943,15 @@ mod systemone_gguf_tests {
 
     #[test]
     fn xmesh_stays_on_the_verified_cpu_path() {
-        assert_eq!(gpu_layers_for_model(XMESH_MODEL_ID, GPU_LAYERS_AUTO), 0);
-        assert_eq!(gpu_layers_for_model(XMESH_MODEL_ID, 42), 0);
+        let verified = if xmesh_gpu_verified() { XMESH_FULL_OFFLOAD_LAYERS } else { 0 };
+        assert_eq!(gpu_layers_for_model(XMESH_MODEL_ID, GPU_LAYERS_AUTO), verified);
+        assert_eq!(gpu_layers_for_model(XMESH_MODEL_ID, 42), verified);
+        assert_eq!(gpu_layers_for_model(XMESH_MODEL_ID, 0), verified);
+        assert!(xmesh_gpu_path(true, None, false)); // Apple silicon
+        assert!(xmesh_gpu_path(false, Some("vulkan"), true)); // NVIDIA on the Vulkan build
+        assert!(!xmesh_gpu_path(false, Some("vulkan"), false)); // AMD/Intel Vulkan: unverified
+        assert!(!xmesh_gpu_path(false, Some("cpu"), true)); // CPU build on an NVIDIA box
+        assert!(!xmesh_gpu_path(false, None, true)); // legacy/unknown install
         assert_eq!(gpu_layers_for_model("qwen-2.5-7b", 42), 42);
     }
 

@@ -1213,7 +1213,7 @@ pub async fn start(
         crate::inference::validate_model_memory(&name, machine_memory_gb)?;
         active_gpu_layers = crate::inference::gpu_layers_for_model(&name, rc.gpu_layers);
         if active_gpu_layers != rc.gpu_layers {
-            tracing::info!("  GPU layers:   {active_gpu_layers} (xMESH verified CPU release path)");
+            tracing::info!("  GPU layers:   {active_gpu_layers} (xMESH verified accelerator path)");
         }
 
         // Crash-loop engine auto-swap: if the OS service keeps restarting a young-dying
