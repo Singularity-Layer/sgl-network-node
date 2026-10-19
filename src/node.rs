@@ -1177,7 +1177,7 @@ pub async fn start(
 
     let mut engine: Option<Arc<InferenceEngine>> = None;
     let mut models: Vec<String> = vec![];
-    let systemone_sidecar_url = if model_path.is_none() {
+    let mut systemone_sidecar_url = if model_path.is_none() {
         systemone_sidecar_url
             .map(|s| s.trim().trim_end_matches('/').to_string())
             .filter(|s| !s.is_empty())
@@ -1197,6 +1197,7 @@ pub async fn start(
     // RAM-aware value below. Used for the LOCAL capacity gate AND advertised to the
     // orchestrator so it dispatches up to this many concurrent jobs.
     let mut effective_slots: u32 = 1;
+    let mut active_gpu_layers = rc.gpu_layers;
     // #159 watchdog timeout, model-aware (set from the GGUF size once we know the model).
     let mut wedge_ms: u64 = 600_000;
 
@@ -1207,6 +1208,13 @@ pub async fn start(
                 .map(|s| s.to_string_lossy().to_string())
                 .unwrap_or_else(|| "unknown".to_string())
         });
+        let gguf_systemone = crate::inference::is_gguf_systemone_model(&name);
+        let machine_memory_gb = tee::detect().memory_gb;
+        crate::inference::validate_model_memory(&name, machine_memory_gb)?;
+        active_gpu_layers = crate::inference::gpu_layers_for_model(&name, rc.gpu_layers);
+        if active_gpu_layers != rc.gpu_layers {
+            tracing::info!("  GPU layers:   {active_gpu_layers} (xMESH verified CPU release path)");
+        }
 
         // Crash-loop engine auto-swap: if the OS service keeps restarting a young-dying
         // node on the GPU (Vulkan) engine, swap to the CPU build before creating the
@@ -1241,6 +1249,27 @@ pub async fn start(
             #[cfg(not(feature = "inprocess"))]
             _ => crate::inference::EngineMode::Server,
         };
+        // xMESH uses llama.cpp's native /v1/systemone server endpoint. The embedded
+        // llama-cpp crate does not expose the decision batch API yet, so this model
+        // must use the hash-pinned server engine on every platform.
+        let engine_mode = if gguf_systemone {
+            if engine_explicit
+                && std::env::var("SGL_ENGINE")
+                    .map(|value| {
+                        value.eq_ignore_ascii_case("inprocess")
+                            || value.eq_ignore_ascii_case("in-process")
+                    })
+                    .unwrap_or(false)
+            {
+                return Err(format!(
+                    "{} requires the llama-server engine for /v1/systemone",
+                    crate::inference::XMESH_MODEL_ID
+                ));
+            }
+            crate::inference::EngineMode::Server
+        } else {
+            engine_mode
+        };
         // Vision used to REQUIRE the server engine, which meant handing the decrypted prompt
         // and the image to a llama-server child over an unauthenticated 127.0.0.1 socket the
         // operator could read. A `vision` build serves images in-process instead, so the force
@@ -1266,19 +1295,26 @@ pub async fn start(
         // budget (RAM, model size, per-request context) so a node advertises the same honest
         // capacity whichever engine it runs. In-process additionally honors the
         // SGL_INPROCESS_SLOTS override (custom, still RAM-capped) — see inprocess_slots().
-        effective_slots = match engine_mode {
-            crate::inference::EngineMode::Server => compute_parallel_slots(
-                tee::detect().memory_gb,
-                &model_pb,
-                rc.context_size,
-                rc.max_jobs,
-            ),
-            crate::inference::EngineMode::InProcess => inprocess_slots(
-                tee::detect().memory_gb,
-                &model_pb,
-                rc.context_size,
-                rc.max_jobs,
-            ),
+        effective_slots = if gguf_systemone {
+            // A complete 2K decision batch is substantially heavier than token
+            // generation. One universal slot is the verified safe default for CPU,
+            // Metal, Vulkan, and CUDA; raise only after platform canaries prove it.
+            1
+        } else {
+            match engine_mode {
+                crate::inference::EngineMode::Server => compute_parallel_slots(
+                    machine_memory_gb,
+                    &model_pb,
+                    rc.context_size,
+                    rc.max_jobs,
+                ),
+                crate::inference::EngineMode::InProcess => inprocess_slots(
+                    machine_memory_gb,
+                    &model_pb,
+                    rc.context_size,
+                    rc.max_jobs,
+                ),
+            }
         };
         if crate::embed_catalog::is_multimodal_embedding_model(&name)
             || crate::stt::MODEL_ID.eq_ignore_ascii_case(&name)
@@ -1288,14 +1324,19 @@ pub async fn start(
         wedge_ms = wedge_timeout_ms(&model_pb);
         // llama-server divides its total `-c` across slots, so pass slots × context_size
         // to keep each slot at the operator's configured per-request context.
+        let per_slot_ctx = if gguf_systemone {
+            crate::inference::XMESH_CONTEXT_TOKENS
+        } else {
+            rc.context_size
+        };
         let total_ctx = effective_slots
-            .saturating_mul(rc.context_size)
-            .max(rc.context_size);
+            .saturating_mul(per_slot_ctx)
+            .max(per_slot_ctx);
 
         tracing::info!("Loading model: {name} from {path}");
         tracing::info!(
             "  Parallel slots: {effective_slots} (continuous batching) — total ctx {total_ctx} ({} per slot)",
-            rc.context_size
+            per_slot_ctx
         );
         let eng_config = InferenceEngineConfig {
             llama_server: explicit_llama_server.clone(),
@@ -1308,9 +1349,13 @@ pub async fn start(
             model_name: name.clone(),
             port: inference_port,
             threads: rc.threads,
-            gpu_layers: rc.gpu_layers,
+            gpu_layers: active_gpu_layers,
             context_size: total_ctx,
-            batch_size: rc.batch_size,
+            batch_size: if gguf_systemone {
+                crate::inference::XMESH_CONTEXT_TOKENS
+            } else {
+                rc.batch_size
+            },
             parallel_slots: effective_slots,
             mmproj_path: mmproj_path.map(PathBuf::from),
             image_max_tokens,
@@ -1353,6 +1398,12 @@ pub async fn start(
             }
             Err(err) => return Err(err),
         };
+        if gguf_systemone {
+            systemone_sidecar_url = eng.systemone_base_url().map(str::to_string);
+            if systemone_sidecar_url.is_none() {
+                return Err("xMESH started without a /v1/systemone runtime".into());
+            }
+        }
         models.push(name);
         engine = Some(Arc::new(eng));
         tracing::info!("Inference engine ready ({engine_mode:?})");
@@ -1891,7 +1942,9 @@ pub async fn start(
         };
         let mut heartbeat_telemetry = telemetry.snapshot(crate::telemetry::SnapshotInputs {
             has_sidecar: systemone_sidecar.is_some(),
-            accelerator: engine.as_ref().map(|e| e.accelerator_hint(rc.gpu_layers)),
+            accelerator: engine
+                .as_ref()
+                .map(|e| e.accelerator_hint(active_gpu_layers)),
             has_engine: engine.is_some(),
             unhealthy_streak,
             quarantined: empty_quarantined,
@@ -2908,6 +2961,16 @@ async fn execute_transcription(
     }
 }
 
+fn set_public_systemone_model(
+    output: &mut serde_json::Map<String, serde_json::Value>,
+    public_model: &str,
+) {
+    output.insert(
+        "model".to_string(),
+        serde_json::Value::String(public_model.to_string()),
+    );
+}
+
 async fn execute_systemone(
     sidecar_url: Option<&str>,
     job: &PendingJob,
@@ -2924,14 +2987,17 @@ async fn execute_systemone(
         .as_object()
         .ok_or("System One payload must be a JSON object")?;
 
+    let public_model = job
+        .model
+        .as_ref()
+        .filter(|model| !model.trim().is_empty())
+        .ok_or("System One job is missing its catalog model id")?
+        .clone();
     let mut request = serde_json::Map::new();
-    if let Some(model) = payload_obj.get("model").cloned().or_else(|| {
-        job.model
-            .as_ref()
-            .map(|m| serde_json::Value::String(m.clone()))
-    }) {
-        request.insert("model".to_string(), model);
-    }
+    request.insert(
+        "model".to_string(),
+        serde_json::Value::String(public_model.clone()),
+    );
     for key in ["state", "questions", "task", "lang"] {
         if let Some(v) = payload_obj.get(key) {
             request.insert(key.to_string(), v.clone());
@@ -2980,12 +3046,10 @@ async fn execute_systemone(
     let out_obj = out
         .as_object_mut()
         .ok_or("System One sidecar response must be a JSON object")?;
-    if !out_obj.contains_key("model") {
-        out_obj.insert(
-            "model".to_string(),
-            serde_json::Value::String(job.model.clone().unwrap_or_default()),
-        );
-    }
+    // llama-server identifies itself with the local GGUF path. Never expose an
+    // operator filesystem path to a Grid caller; the public catalog id is the
+    // only model identity that crosses this boundary.
+    set_public_systemone_model(out_obj, &public_model);
     match out_obj.get_mut("usage") {
         Some(serde_json::Value::Object(usage)) => {
             usage
@@ -3029,7 +3093,10 @@ fn validate_systemone_sidecar_url(raw: &str) -> Result<(), String> {
 
 #[cfg(test)]
 mod tool_extract_tests {
-    use super::{extract_text_tool_calls, systemone_sidecar_slots, validate_systemone_sidecar_url};
+    use super::{
+        extract_text_tool_calls, set_public_systemone_model, systemone_sidecar_slots,
+        validate_systemone_sidecar_url,
+    };
 
     fn allowed() -> Vec<String> {
         vec!["get_weather".to_string()]
@@ -3063,6 +3130,28 @@ mod tool_extract_tests {
         assert_eq!(systemone_sidecar_slots(32.0, 1), 1);
         assert_eq!(systemone_sidecar_slots(32.0, 2), 2);
         assert_eq!(systemone_sidecar_slots(32.0, 99), 3);
+    }
+
+    #[test]
+    fn systemone_response_never_exposes_the_runtime_model_path() {
+        let mut output = serde_json::json!({
+            "model": "/Users/operator/private/models/xmesh.gguf",
+            "answers": {}
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        set_public_systemone_model(
+            &mut output,
+            crate::inference::XMESH_MODEL_ID,
+        );
+        assert_eq!(
+            output.get("model").and_then(|value| value.as_str()),
+            Some(crate::inference::XMESH_MODEL_ID)
+        );
+        assert!(!serde_json::Value::Object(output)
+            .to_string()
+            .contains("/Users/operator"));
     }
 
     #[test]

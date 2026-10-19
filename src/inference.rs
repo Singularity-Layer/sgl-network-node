@@ -6,6 +6,39 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use tokio::time::{sleep, Duration};
 
+/// GGUF decision models served through llama.cpp's native `/v1/systemone` API.
+/// Keep this exact id aligned with the Desktop and Grid catalog entries.
+pub const XMESH_MODEL_ID: &str = "singularity-layer/Singularity-xMESH-0.8B";
+pub const XMESH_CONTEXT_TOKENS: u32 = 2048;
+pub const XMESH_MIN_MEMORY_GB: f64 = 8.0;
+
+pub fn is_gguf_systemone_model(model_name: &str) -> bool {
+    model_name.eq_ignore_ascii_case(XMESH_MODEL_ID)
+}
+
+/// xMESH's release evidence is CPU-only outside Apple Metal. Keep the portable
+/// runtime on the verified path until each accelerator has decision-parity evidence.
+pub fn gpu_layers_for_model(model_name: &str, configured: u32) -> u32 {
+    if is_gguf_systemone_model(model_name) {
+        0
+    } else {
+        configured
+    }
+}
+
+pub fn validate_model_memory(model_name: &str, memory_gb: f64) -> Result<(), String> {
+    // OS APIs report binary GiB while machines are sold in nominal whole-GB tiers.
+    // Match the desktop picker so a normal "8 GB" machine does not pass one layer
+    // and fail the other merely because it reports 7.7-7.9 GiB.
+    if is_gguf_systemone_model(model_name) && memory_gb.round() < XMESH_MIN_MEMORY_GB {
+        return Err(format!(
+            "{} requires at least {:.0} GB of system memory; this machine reports {:.1} GB",
+            XMESH_MODEL_ID, XMESH_MIN_MEMORY_GB, memory_gb
+        ));
+    }
+    Ok(())
+}
+
 /// Sentinel for `gpu_layers` meaning "auto-fit": the server engine omits `-ngl` so llama.cpp
 /// sizes the GPU offload to available VRAM (spilling the rest to system RAM — it can't OOM),
 /// and the in-process engine offloads all layers (Mac unified memory). Set by `sgl start
@@ -470,6 +503,12 @@ impl ServerEngine {
         self.embed_spec.map(|s| s.dim)
     }
 
+    /// Loopback base used by the node's existing System One proxy. Only expose it
+    /// for a model whose GGUF embeds llama.cpp's native decision contract.
+    pub fn systemone_base_url(&self) -> Option<&str> {
+        is_gguf_systemone_model(&self.config.model_name).then_some(self.base_url.as_str())
+    }
+
     /// Forward an embedding batch to llama-server's native /v1/embeddings (embedding mode
     /// only). Mirrors the in-process engine's contract: catalog prefixes by input_type,
     /// Matryoshka truncate + renormalize, L2-normalize per the spec, input-only usage.
@@ -709,6 +748,37 @@ impl ServerEngine {
                 "--pooling",
                 spec.pooling.as_server_flag(),
             ];
+            return self.spawn_server(&llama_server, &args).await;
+        }
+
+        // Clef decision models require the complete prompt in one physical batch.
+        // The generic 512-token ubatch returns HTTP 500 for normal xMESH requests.
+        // They also use llama.cpp's native /v1/systemone endpoint rather than chat
+        // templates or token generation, so keep this launch contract explicit.
+        if is_gguf_systemone_model(&self.config.model_name) {
+            let decision_batch = XMESH_CONTEXT_TOKENS.to_string();
+            let mut args: Vec<&str> = vec![
+                "-m",
+                &model_str,
+                "--host",
+                "127.0.0.1",
+                "--port",
+                &port_str,
+                "-c",
+                &ctx_str,
+                "-t",
+                &threads_str,
+                "-b",
+                &decision_batch,
+                "-ub",
+                &decision_batch,
+                "--parallel",
+                &parallel_str,
+            ];
+            if self.config.gpu_layers != GPU_LAYERS_AUTO {
+                args.push("-ngl");
+                args.push(&gpu_layers_str);
+            }
             return self.spawn_server(&llama_server, &args).await;
         }
         let mut args: Vec<&str> = vec![
@@ -1288,6 +1358,13 @@ impl InferenceEngine {
         }
     }
 
+    pub fn systemone_base_url(&self) -> Option<&str> {
+        match self {
+            InferenceEngine::Server(engine) => engine.systemone_base_url(),
+            _ => None,
+        }
+    }
+
     /// Heartbeat telemetry hint (see telemetry::server_accelerator). Never a trust signal.
     #[cfg_attr(not(feature = "inprocess"), allow(unused_variables))]
     pub fn accelerator_hint(&self, gpu_layers: u32) -> &'static str {
@@ -1807,6 +1884,40 @@ mod template_override_tests {
         assert!(!qwen_template_override(Path::new(
             "/opt/sgl/models/gemma-2-2b.gguf"
         )));
+    }
+}
+
+#[cfg(test)]
+mod systemone_gguf_tests {
+    use super::{
+        gpu_layers_for_model, is_gguf_systemone_model, validate_model_memory, GPU_LAYERS_AUTO,
+        XMESH_MODEL_ID,
+    };
+
+    #[test]
+    fn only_the_pinned_xmesh_id_uses_native_systemone() {
+        assert!(is_gguf_systemone_model(XMESH_MODEL_ID));
+        assert!(is_gguf_systemone_model(
+            "SINGULARITY-LAYER/SINGULARITY-XMESH-0.8B"
+        ));
+        assert!(!is_gguf_systemone_model("convaiinnovations/laya"));
+        assert!(!is_gguf_systemone_model("qwen-2.5-7b"));
+    }
+
+    #[test]
+    fn xmesh_stays_on_the_verified_cpu_path() {
+        assert_eq!(gpu_layers_for_model(XMESH_MODEL_ID, GPU_LAYERS_AUTO), 0);
+        assert_eq!(gpu_layers_for_model(XMESH_MODEL_ID, 42), 0);
+        assert_eq!(gpu_layers_for_model("qwen-2.5-7b", 42), 42);
+    }
+
+    #[test]
+    fn xmesh_refuses_machines_below_the_published_memory_floor() {
+        assert!(validate_model_memory(XMESH_MODEL_ID, 7.4).is_err());
+        assert!(validate_model_memory(XMESH_MODEL_ID, 7.5).is_ok());
+        assert!(validate_model_memory(XMESH_MODEL_ID, 7.9).is_ok());
+        assert!(validate_model_memory(XMESH_MODEL_ID, 8.0).is_ok());
+        assert!(validate_model_memory("qwen-2.5-7b", 4.0).is_ok());
     }
 }
 

@@ -147,7 +147,7 @@ fn detect_memory_gb() -> f64 {
         let s = run_cmd("sysctl", &["-n", "hw.memsize"]);
         return s.parse::<u64>()
             .map(|b| b as f64 / (1024.0 * 1024.0 * 1024.0))
-            .unwrap_or(16.0);
+            .unwrap_or(0.0);
     }
     #[cfg(target_os = "linux")]
     {
@@ -163,11 +163,28 @@ fn detect_memory_gb() -> f64 {
                 }
             }
         }
-        16.0
+        0.0
     }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(target_os = "windows")]
     {
-        16.0
+        let bytes = run_cmd(
+            "powershell.exe",
+            &[
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "[int64](Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory",
+            ],
+        );
+        bytes
+            .trim()
+            .parse::<u64>()
+            .map(|value| value as f64 / (1024.0 * 1024.0 * 1024.0))
+            .unwrap_or(0.0)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
+        0.0
     }
 }
 
