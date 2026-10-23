@@ -462,6 +462,63 @@ impl StreamSealer {
     }
 }
 
+/// Test-only client half of the v2 protocol (what SDKs/the cloud do), so node-level tests can
+/// drive a sealed job end to end without duplicating private crypto.
+#[cfg(test)]
+pub(crate) mod test_client {
+    use super::*;
+
+    /// Seal `plaintext` to a node as a v2 base64 input envelope. Returns the `enc` object.
+    pub fn seal_input_v2(
+        node_public_b58: &str,
+        ephemeral_secret: [u8; 32],
+        response_public: &[u8; 32],
+        plaintext: &[u8],
+    ) -> serde_json::Value {
+        use base64::Engine;
+        let eph = StaticSecret::from(ephemeral_secret);
+        let eph_pub = PublicKey::from(&eph);
+        let node_pub = bs58_to_32(node_public_b58).unwrap();
+        let shared = eph.diffie_hellman(&PublicKey::from(node_pub));
+        let key = hkdf_key(shared.as_bytes(), HKDF_INFO_INPUT);
+        let eph_b58 = bs58::encode(eph_pub.as_bytes()).into_string();
+        let resp_b58 = bs58::encode(response_public).into_string();
+        let aad = aad_input(node_public_b58, &eph_b58, &resp_b58);
+        let nonce = [0x31u8; 24];
+        let sealed = XChaCha20Poly1305::new_from_slice(&key)
+            .unwrap()
+            .encrypt(XNonce::from_slice(&nonce), Payload { msg: plaintext, aad: &aad })
+            .unwrap();
+        let mut blob = nonce.to_vec();
+        blob.extend(sealed);
+        serde_json::json!({
+            "ciphertext": base64::engine::general_purpose::STANDARD.encode(blob),
+            "client_ephemeral_pubkey": eph_b58,
+            "client_response_pubkey": resp_b58,
+            "algorithm": ALGO_V2,
+            "encoding": "base64",
+        })
+    }
+
+    /// Open a v2 sealed result with the client's response secret.
+    pub fn open_result_v2(
+        response_secret: [u8; 32],
+        node_ephemeral_public: &[u8; 32],
+        sealed: &[u8],
+    ) -> Vec<u8> {
+        let resp = StaticSecret::from(response_secret);
+        let resp_b58 = bs58::encode(PublicKey::from(&resp).as_bytes()).into_string();
+        let eph_b58 = bs58::encode(node_ephemeral_public).into_string();
+        let shared = resp.diffie_hellman(&PublicKey::from(*node_ephemeral_public));
+        let key = hkdf_key(shared.as_bytes(), HKDF_INFO_OUTPUT);
+        let aad = aad_output(&resp_b58, &eph_b58);
+        XChaCha20Poly1305::new_from_slice(&key)
+            .unwrap()
+            .decrypt(XNonce::from_slice(&sealed[..24]), Payload { msg: &sealed[24..], aad: &aad })
+            .unwrap()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

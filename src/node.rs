@@ -4215,6 +4215,95 @@ mod speech_binding_tests {
         );
     }
 
+    /// Full node path on real hardware: a client seals the canonical request exactly as the
+    /// spec says, the node unseals it, binds it to the reservation, speaks with the real
+    /// Kokoro worker, seals speech-result-v1 back, and the client opens a playable m4a.
+    /// SGL_TTS_CANARY_PYTHON=... SGL_TTS_CANARY_MODEL_DIR=... [SGL_TTS_CANARY_OUT=x.m4a]
+    /// cargo test --bin sgl speech_binding_tests::real_sealed_round_trip -- --ignored
+    #[tokio::test]
+    #[ignore]
+    async fn real_sealed_round_trip() {
+        use base64::Engine;
+        let python = std::env::var("SGL_TTS_CANARY_PYTHON").expect("SGL_TTS_CANARY_PYTHON");
+        let model = std::env::var("SGL_TTS_CANARY_MODEL_DIR").expect("SGL_TTS_CANARY_MODEL_DIR");
+        let tts = crate::tts::TtsEngine::production(
+            std::path::Path::new(&model),
+            std::path::Path::new(&python),
+        )
+        .await
+        .expect("worker starts");
+        let engine = Some(Arc::new(InferenceEngine::Tts(Box::new(tts))));
+
+        let node_seed = [0x55u8; 32];
+        let node_pub_b58 = crate::encryption::EncryptionKeypair::from_ed25519_seed(&node_seed)
+            .public_key_bs58();
+        let response_secret = [0x66u8; 32];
+        let response_pub = *x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(
+            response_secret,
+        ))
+        .as_bytes();
+
+        let request_id = "6f1d2c3b-4a59-4e8f-9a7b-1c2d3e4f5a6b";
+        let text = "Hello from a Singularity Layer node. Every word of this was private.";
+        let data = base64::engine::general_purpose::STANDARD.encode(text);
+        // Canonical plaintext, exact key order, as the spec defines it.
+        let canonical = format!(
+            r#"{{"protocol":"{}","request_id":"{}","model":"{}","model_revision":"{}","model_sha256":"{}","voice":"am_michael","speed":"1.00","input":{{"encoding":"base64","bytes":{},"data":"{}"}}}}"#,
+            crate::tts::PROTOCOL,
+            request_id,
+            crate::tts::MODEL_ID,
+            crate::tts::MODEL_REVISION,
+            crate::tts::MODEL_SHA256,
+            text.len(),
+            data
+        );
+        let enc = crate::encryption::test_client::seal_input_v2(
+            &node_pub_b58,
+            [0x77u8; 32],
+            &response_pub,
+            canonical.as_bytes(),
+        );
+        // The billing invariant the orchestrator relies on.
+        let template = canonical.replace(&data, "");
+        let sealed_len = base64::engine::general_purpose::STANDARD
+            .decode(enc["ciphertext"].as_str().unwrap())
+            .unwrap()
+            .len();
+        assert_eq!(sealed_len, template.len() + text.len().div_ceil(3) * 4 + 40);
+
+        let dispatch = serde_json::json!({"enc": enc, "speech_reservation": {
+            "protocol": crate::tts::PROTOCOL, "request_id": request_id, "model": crate::tts::MODEL_ID,
+            "model_revision": crate::tts::MODEL_REVISION, "model_sha256": crate::tts::MODEL_SHA256,
+            "voice": "am_michael", "speed": "1.00", "input_bytes": text.len()}});
+        let reservation = crate::tts::ReservationBinding::parse_dispatch(&dispatch).unwrap();
+        let (inner, resp, version) = crate::encryption::unseal_input(&dispatch, &node_seed).unwrap();
+        assert_eq!(version, crate::encryption::EncVersion::V2);
+        assert_eq!(resp.unwrap(), response_pub);
+        let job = PendingJob {
+            id: request_id.into(),
+            job_type: "speech".into(),
+            model: Some(crate::tts::MODEL_ID.into()),
+            input_payload: Some(inner),
+        };
+        let (plaintext, usage) = execute_speech(&engine, &job, &reservation).await.unwrap();
+        assert_eq!(usage["input_bytes"], text.len());
+
+        let (sealed, node_eph) =
+            crate::encryption::encrypt_for_recipient_v2(&response_pub, &plaintext).unwrap();
+        let opened = crate::encryption::test_client::open_result_v2(response_secret, &node_eph, &sealed);
+        assert_eq!(opened, plaintext);
+        let split = opened.iter().position(|b| *b == b'\n').unwrap();
+        let header: serde_json::Value = serde_json::from_slice(&opened[..split]).unwrap();
+        let audio = &opened[split + 1..];
+        assert_eq!(header["audio"]["bytes"], audio.len());
+        assert_eq!(header["voice"], "am_michael");
+        assert!(header["audio"]["duration_seconds"].as_f64().unwrap() > 3.0);
+        assert!(base64::engine::general_purpose::STANDARD.encode(&sealed).len() < 1_000_000);
+        if let Ok(path) = std::env::var("SGL_TTS_CANARY_OUT") {
+            std::fs::write(path, audio).unwrap();
+        }
+    }
+
     #[tokio::test]
     async fn speech_job_binds_reservation_job_and_model() {
         let ready = serde_json::json!({
