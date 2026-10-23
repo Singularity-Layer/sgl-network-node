@@ -18,6 +18,7 @@ mod setup;
 mod stream_relay;
 mod streamseal;
 mod stt;
+mod tts;
 mod tee;
 mod telemetry;
 mod toolcall;
