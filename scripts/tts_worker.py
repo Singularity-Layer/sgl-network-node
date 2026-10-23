@@ -156,10 +156,13 @@ def install_espeak_stub():
     misaki.espeak = stub
 
 
-def synthesize(model, text, voice, speed):
+def synthesize(model, model_dir, text, voice, speed):
     import numpy as np
 
-    chunks = list(model.generate(text=text, voice=voice, speed=speed, lang_code=voice[0]))
+    # Always the pinned, verified voice file. A bare voice name makes mlx-audio fetch the
+    # voice through the Hugging Face cache, which is neither pinned nor available offline.
+    voice_path = os.path.join(model_dir, "voices", f"{voice}.safetensors")
+    chunks = list(model.generate(text=text, voice=voice_path, speed=speed, lang_code=voice[0]))
     if not chunks:
         raise ValueError("no audio")
     audio = np.concatenate([np.array(c.audio).reshape(-1) for c in chunks])
@@ -211,7 +214,7 @@ def main():
 
     import numpy as np
 
-    smoke = synthesize(model, SMOKE_TEXT, "af_heart", 1.0)
+    smoke = synthesize(model, model_dir, SMOKE_TEXT, "af_heart", 1.0)
     seconds = len(smoke) / SAMPLE_RATE
     if not (0.8 <= seconds <= 10.0) or float(np.sqrt(np.mean(smoke ** 2))) < 0.005:
         fail("smoke audio implausible")
@@ -263,7 +266,7 @@ def main():
             reject()
             continue
         try:
-            audio = synthesize(model, text, voice, speed)
+            audio = synthesize(model, model_dir, text, voice, speed)
         except Exception:  # noqa: BLE001
             reject()  # unspeakable text (e.g. only symbols) is the caller's input
             continue

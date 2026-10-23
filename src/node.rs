@@ -1203,6 +1203,13 @@ pub async fn start(
     // #159 watchdog timeout, model-aware (set from the GGUF size once we know the model).
     let mut wedge_ms: u64 = 600_000;
 
+    // A speech node has no single model file: its pinned folder doubles as the model path,
+    // so `--model-name kokoro-82m --tts-python .. --tts-model-dir ..` is enough.
+    let model_path = model_path.or(
+        model_name
+            .filter(|n| crate::tts::MODEL_ID.eq_ignore_ascii_case(n))
+            .and(tts_model_dir),
+    );
     if let Some(path) = model_path {
         let name = model_name.map(|s| s.to_string()).unwrap_or_else(|| {
             Path::new(path)
