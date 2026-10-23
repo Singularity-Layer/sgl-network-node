@@ -499,7 +499,9 @@ impl TtsEngine {
         python: &std::path::Path,
     ) -> Result<Self, String> {
         if !platform_approved() {
-            return Err("speech runtime is not approved on this platform (Apple Silicon macOS only)".into());
+            return Err(
+                "speech runtime is not approved on this platform (Apple Silicon macOS only)".into(),
+            );
         }
         if !model_dir.is_dir() {
             return Err("speech model directory unavailable; --tts-model-dir must point at the pinned Kokoro-82M-bf16 folder".into());
@@ -1168,7 +1170,10 @@ mod tests {
     fn request_parse_enforces_bounds_and_binding() {
         let request = SpeechRequest::parse(&canonical("Hello there.", "af_heart", "1.00")).unwrap();
         assert!(binding(12).matches(&request));
-        assert!(!binding(11).matches(&request), "byte count must bind exactly");
+        assert!(
+            !binding(11).matches(&request),
+            "byte count must bind exactly"
+        );
         let mut other_voice = binding(12);
         other_voice.voice = "am_puck".into();
         assert!(!other_voice.matches(&request));
@@ -1182,10 +1187,16 @@ mod tests {
 
         let mut lying = canonical("Hello", "af_heart", "1.00");
         lying["input"]["bytes"] = serde_json::json!(4);
-        assert!(SpeechRequest::parse(&lying).is_err(), "declared bytes must equal decoded bytes");
+        assert!(
+            SpeechRequest::parse(&lying).is_err(),
+            "declared bytes must equal decoded bytes"
+        );
         let mut extra = canonical("Hello", "af_heart", "1.00");
         extra["instructions"] = serde_json::json!("x");
-        assert!(SpeechRequest::parse(&extra).is_err(), "unknown fields rejected");
+        assert!(
+            SpeechRequest::parse(&extra).is_err(),
+            "unknown fields rejected"
+        );
         let mut wrong_model = canonical("Hello", "af_heart", "1.00");
         wrong_model["model_sha256"] = serde_json::json!("0".repeat(64));
         assert!(SpeechRequest::parse(&wrong_model).is_err());
@@ -1200,7 +1211,10 @@ mod tests {
             "protocol": PROTOCOL, "request_id": RID, "model": MODEL_ID,
             "model_revision": MODEL_REVISION, "model_sha256": MODEL_SHA256,
             "voice": "af_heart", "speed": "1.00", "input_bytes": 12}});
-        assert_eq!(ReservationBinding::parse_dispatch(&good).unwrap(), binding(12));
+        assert_eq!(
+            ReservationBinding::parse_dispatch(&good).unwrap(),
+            binding(12)
+        );
         let mut extra = good.clone();
         extra["transcription_reservation"] = serde_json::json!({});
         assert!(ReservationBinding::parse_dispatch(&extra).is_err());
@@ -1211,8 +1225,7 @@ mod tests {
         over["speech_reservation"]["input_bytes"] = serde_json::json!(MAX_INPUT_BYTES + 1);
         assert!(ReservationBinding::parse_dispatch(&over).is_err());
         let mut upper = good;
-        upper["speech_reservation"]["request_id"] =
-            serde_json::json!(RID.to_ascii_uppercase());
+        upper["speech_reservation"]["request_id"] = serde_json::json!(RID.to_ascii_uppercase());
         assert!(ReservationBinding::parse_dispatch(&upper).is_err());
     }
 
@@ -1271,7 +1284,12 @@ mod tests {
 
     #[test]
     fn worker_env_is_scrubbed() {
-        for name in ["DYLD_INSERT_LIBRARIES", "PYTHONPATH", "LD_PRELOAD", "MLX_METAL_PATH"] {
+        for name in [
+            "DYLD_INSERT_LIBRARIES",
+            "PYTHONPATH",
+            "LD_PRELOAD",
+            "MLX_METAL_PATH",
+        ] {
             assert!(blocked_worker_env(name), "{name}");
         }
         assert!(!blocked_worker_env("HOME"));
@@ -1295,7 +1313,10 @@ mod tests {
         assert!(cap.speech_ready);
         assert_eq!(cap.kind, "speech");
         let unbound = cap.clone().bind_heartbeat(1, "pk", None, None);
-        assert!(!unbound.speech_ready && unbound.free_slots == 0, "no key signature, no routing");
+        assert!(
+            !unbound.speech_ready && unbound.free_slots == 0,
+            "no key signature, no routing"
+        );
         let bound = cap.bind_heartbeat(4, "pk", Some("sig"), Some(1));
         assert!(bound.speech_ready && bound.free_slots == 1);
         for (field, value) in [
@@ -1306,7 +1327,10 @@ mod tests {
         ] {
             let mut bad = ready_frame();
             bad[field] = value;
-            assert!(validate_ready(&serde_json::to_vec(&bad).unwrap()).is_err(), "{field}");
+            assert!(
+                validate_ready(&serde_json::to_vec(&bad).unwrap()).is_err(),
+                "{field}"
+            );
         }
     }
 
@@ -1345,20 +1369,35 @@ for line in sys.stdin:
     async fn supervisor_speaks_rejects_and_fails_closed() {
         let request = SpeechRequest::parse(&canonical("Hello there.", "af_heart", "1.00")).unwrap();
 
-        let engine = TtsEngine::start(fake_worker(&fake_script("ok"))).await.unwrap();
+        let engine = TtsEngine::start(fake_worker(&fake_script("ok")))
+            .await
+            .unwrap();
         let out = engine.speak(request.clone()).await.unwrap();
         assert_eq!(&out.audio[4..8], b"ftyp");
         // Same request id again is a replay.
-        assert_eq!(engine.speak(request.clone()).await.unwrap_err(), "speech_input_invalid");
+        assert_eq!(
+            engine.speak(request.clone()).await.unwrap_err(),
+            "speech_input_invalid"
+        );
         engine.stop();
 
-        let engine = TtsEngine::start(fake_worker(&fake_script("invalid"))).await.unwrap();
-        assert_eq!(engine.speak(request.clone()).await.unwrap_err(), "speech_input_invalid");
+        let engine = TtsEngine::start(fake_worker(&fake_script("invalid")))
+            .await
+            .unwrap();
+        assert_eq!(
+            engine.speak(request.clone()).await.unwrap_err(),
+            "speech_input_invalid"
+        );
         assert!(engine.is_healthy(), "client mistakes keep the node ready");
         engine.stop();
 
-        let engine = TtsEngine::start(fake_worker(&fake_script("lie"))).await.unwrap();
-        assert_eq!(engine.speak(request).await.unwrap_err(), "speech_runtime_failed");
+        let engine = TtsEngine::start(fake_worker(&fake_script("lie")))
+            .await
+            .unwrap();
+        assert_eq!(
+            engine.speak(request).await.unwrap_err(),
+            "speech_runtime_failed"
+        );
         assert!(!engine.is_healthy(), "a lying worker is de-advertised");
         assert!(engine.capabilities().is_none());
     }
@@ -1379,9 +1418,10 @@ for line in sys.stdin:
     async fn real_canary() {
         let python = std::env::var("SGL_TTS_CANARY_PYTHON").expect("SGL_TTS_CANARY_PYTHON");
         let model = std::env::var("SGL_TTS_CANARY_MODEL_DIR").expect("SGL_TTS_CANARY_MODEL_DIR");
-        let engine = TtsEngine::production(std::path::Path::new(&model), std::path::Path::new(&python))
-            .await
-            .expect("production worker starts");
+        let engine =
+            TtsEngine::production(std::path::Path::new(&model), std::path::Path::new(&python))
+                .await
+                .expect("production worker starts");
         let request = SpeechRequest::parse(&canonical(
             "This sentence was spoken by a node on the Singularity Layer grid.",
             "am_michael",

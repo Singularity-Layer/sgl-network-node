@@ -133,11 +133,30 @@ pub fn unseal_input(
             parsed.client_response_pubkey,
         );
     }
+    // Speech text: same strict v2/base64 envelope, a much smaller cap, and never both lanes.
+    let speech = payload.get("speech_reservation").is_some();
+    if speech {
+        if transcription {
+            return Err("ambiguous sealed media lane".into());
+        }
+        let parsed: TranscriptionEnvelope =
+            serde_json::from_value(enc.clone()).map_err(|_| "invalid speech input envelope")?;
+        if parsed.algorithm != ALGO_V2 || parsed.encoding != "base64" {
+            return Err("invalid speech input envelope".into());
+        }
+        let _ = (
+            parsed.ciphertext,
+            parsed.client_ephemeral_pubkey,
+            parsed.client_response_pubkey,
+        );
+    }
     let encoded_cap = if multimodal {
         32 * 1024 * 1024 + 256
     } else if transcription {
         // 60 s PCM (1,920,000 bytes) plus canonical JSON and AEAD overhead.
         8 * 1024 * 1024 + 4096
+    } else if speech {
+        crate::tts::MAX_SEALED_INPUT.div_ceil(3) * 4
     } else {
         MAX_SEALED_B58_LEN
     };
@@ -180,6 +199,9 @@ pub fn unseal_input(
     if transcription && ciphertext.len() > crate::stt::MAX_INPUT_FRAME {
         return Err("transcription ciphertext exceeds decoded limit".into());
     }
+    if speech && ciphertext.len() > crate::tts::MAX_SEALED_INPUT {
+        return Err("speech ciphertext exceeds decoded limit".into());
+    }
     let ephemeral = bs58_to_32(ephemeral_b58)?;
     let response_pub = bs58_to_32(response_b58)?;
 
@@ -212,6 +234,9 @@ pub fn unseal_input(
     if transcription && inner.get("protocol").and_then(|v| v.as_str()) != Some(crate::stt::PROTOCOL)
     {
         return Err("sealed transcription protocol mismatch".into());
+    }
+    if speech && inner.get("protocol").and_then(|v| v.as_str()) != Some(crate::tts::PROTOCOL) {
+        return Err("sealed speech protocol mismatch".into());
     }
     Ok((inner, Some(response_pub), version))
 }
@@ -553,6 +578,69 @@ mod tests {
             .unwrap();
         assert_eq!(pt, msg);
     }
+    #[test]
+    fn speech_v2_seal_is_strict_and_lane_exclusive() {
+        use base64::Engine;
+        let node_seed = [0x42; 32];
+        let node = EncryptionKeypair::from_ed25519_seed(&node_seed);
+        let ephemeral = StaticSecret::from([0x14; 32]);
+        let ephemeral_pub = PublicKey::from(&ephemeral);
+        let response_pub = PublicKey::from(&StaticSecret::from([0x1a; 32]));
+        let eph_b58 = bs58::encode(ephemeral_pub.as_bytes()).into_string();
+        let resp_b58 = bs58::encode(response_pub.as_bytes()).into_string();
+        let seal = |inner: &serde_json::Value| {
+            let shared = ephemeral.diffie_hellman(&node.public);
+            let key = hkdf_key(shared.as_bytes(), HKDF_INFO_INPUT);
+            let cipher = XChaCha20Poly1305::new_from_slice(&key).unwrap();
+            let aad = aad_input(&node.public_key_bs58(), &eph_b58, &resp_b58);
+            let nonce = [0x28; 24];
+            let encrypted = cipher
+                .encrypt(
+                    XNonce::from_slice(&nonce),
+                    Payload {
+                        msg: inner.to_string().as_bytes(),
+                        aad: &aad,
+                    },
+                )
+                .unwrap();
+            let mut blob = nonce.to_vec();
+            blob.extend(encrypted);
+            serde_json::json!({
+                "enc":{"ciphertext":base64::engine::general_purpose::STANDARD.encode(blob),"algorithm":ALGO_V2,"encoding":"base64","client_ephemeral_pubkey":eph_b58,"client_response_pubkey":resp_b58},
+                "speech_reservation":{}
+            })
+        };
+        let inner =
+            serde_json::json!({"protocol": crate::tts::PROTOCOL, "input": {"data": "aGk="}});
+        let payload = seal(&inner);
+        let (opened, resp, version) = unseal_input(&payload, &node_seed).unwrap();
+        assert_eq!((opened, version), (inner, EncVersion::V2));
+        assert_eq!(resp.unwrap(), *response_pub.as_bytes());
+        for (field, value) in [
+            ("encoding", serde_json::json!("base58")),
+            ("algorithm", serde_json::json!(ALGO_V1)),
+            ("extra", serde_json::json!(true)),
+        ] {
+            let mut changed = payload.clone();
+            changed["enc"][field] = value;
+            assert!(unseal_input(&changed, &node_seed).is_err(), "{field}");
+        }
+        let mut both = payload.clone();
+        both["transcription_reservation"] = serde_json::json!({});
+        assert!(unseal_input(&both, &node_seed).is_err(), "never both lanes");
+        let wrong = seal(&serde_json::json!({"protocol": crate::stt::PROTOCOL}));
+        assert!(
+            unseal_input(&wrong, &node_seed).is_err(),
+            "inner protocol must be speech-v1"
+        );
+        let mut huge = payload.clone();
+        huge["enc"]["ciphertext"] = serde_json::json!("A".repeat(64 * 1024));
+        assert!(
+            unseal_input(&huge, &node_seed).is_err(),
+            "speech cap is small"
+        );
+    }
+
     #[test]
     fn transcription_v2_seal_rejects_downgrades_and_response_key_swap() {
         use base64::Engine;

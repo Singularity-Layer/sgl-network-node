@@ -146,6 +146,8 @@ struct NodeCapabilities {
     embedding: Option<crate::eg2::Capabilities>,
     #[serde(rename = "transcription", skip_serializing_if = "Option::is_none")]
     stt: Option<crate::stt::Capabilities>,
+    #[serde(rename = "speech", skip_serializing_if = "Option::is_none")]
+    tts: Option<crate::tts::Capabilities>,
     streaming: bool,
     // This build forwards `tools` on the STREAM path and emits tool-call deltas. A routing
     // hint only — correctness comes from the per-chunk `fmt` tag, so a stale value here can
@@ -179,6 +181,7 @@ fn eg2_capabilities(embedding: Option<crate::eg2::Capabilities>) -> NodeCapabili
     NodeCapabilities {
         embedding,
         stt: None,
+        tts: None,
         streaming: false,
         streaming_tools: false,
         context_size: 8192,
@@ -199,6 +202,7 @@ fn stt_node_capabilities(stt: Option<crate::stt::Capabilities>) -> NodeCapabilit
     NodeCapabilities {
         embedding: None,
         stt,
+        tts: None,
         streaming: false,
         streaming_tools: false,
         context_size: 0,
@@ -207,6 +211,27 @@ fn stt_node_capabilities(stt: Option<crate::stt::Capabilities>) -> NodeCapabilit
         vision: None,
         engine: Some("stt-worker".into()),
     }
+}
+
+fn tts_node_capabilities(tts: Option<crate::tts::Capabilities>) -> NodeCapabilities {
+    let ready = tts.is_some();
+    NodeCapabilities {
+        embedding: None,
+        stt: None,
+        tts,
+        streaming: false,
+        streaming_tools: false,
+        context_size: 0,
+        kind: ready.then(|| "speech".into()),
+        dim: None,
+        vision: None,
+        engine: Some("tts-worker".into()),
+    }
+}
+
+/// Speech (Grid TTS) manifest, nested under `capabilities.speech`; gone the moment the worker dies.
+pub fn tts_capability_wire(tts: Option<crate::tts::Capabilities>) -> serde_json::Value {
+    serde_json::to_value(tts_node_capabilities(tts)).expect("finite capability manifest")
 }
 
 /// Both heartbeat transports use one manifest and remove it immediately on worker death.
@@ -467,6 +492,7 @@ impl OrchestratorClient {
         telemetry: Option<crate::telemetry::HeartbeatTelemetry>,
         embedding: Option<crate::eg2::Capabilities>,
         stt: Option<crate::stt::Capabilities>,
+        tts: Option<crate::tts::Capabilities>,
     ) -> Result<HeartbeatResponse, String> {
         let url = format!("{}/grid/nodes/heartbeat", self.base_url);
         let token = self.get_token()?;
@@ -481,10 +507,13 @@ impl OrchestratorClient {
                 eg2_capabilities(embedding)
             } else if engine == Some("stt-worker") {
                 stt_node_capabilities(stt)
+            } else if engine == Some("tts-worker") {
+                tts_node_capabilities(tts)
             } else {
                 NodeCapabilities {
                     embedding,
                     stt: None,
+                    tts: None,
                     streaming,
                     // Honest capability, passed in by the caller from the ENGINE'S OWN answer.
                     // It was briefly hardcoded false for in-process (which then could not do tool
@@ -892,6 +921,7 @@ mod heartbeat_wire_tests {
             capabilities: NodeCapabilities {
                 embedding: None,
                 stt: None,
+                tts: None,
                 streaming: true,
                 streaming_tools: true,
                 context_size: 4096,
@@ -1038,5 +1068,40 @@ mod embedding_capability_tests {
         );
         assert!(stt_capability_wire(None).get("transcription").is_none());
         assert!(stt_capability_wire(None).get("kind").is_none());
+    }
+
+    #[test]
+    fn speech_manifest_is_nested_and_dropped_when_unready() {
+        let cap = crate::tts::Capabilities {
+            kind: "speech".into(),
+            speech_ready: true,
+            speech_protocol: crate::tts::PROTOCOL.into(),
+            speech_models: vec![crate::tts::MODEL_ID.into()],
+            speech_runtime: crate::tts::RUNTIME.into(),
+            runtime_revision: crate::tts::RUNTIME_REVISION.into(),
+            model_revision: crate::tts::MODEL_REVISION.into(),
+            model_sha256: crate::tts::MODEL_SHA256.into(),
+            model_repository: crate::tts::MODEL_REPOSITORY.into(),
+            os: "macos".into(),
+            architecture: "aarch64".into(),
+            model_license: "Apache-2.0".into(),
+            voices: crate::tts::VOICES.iter().map(|v| v.to_string()).collect(),
+            max_input_bytes: crate::tts::MAX_INPUT_BYTES,
+            max_audio_seconds: crate::tts::MAX_AUDIO_SECONDS,
+            output_format: crate::tts::OUTPUT_FORMAT.into(),
+            input_envelope_encodings: vec!["base64".into()],
+            media_transport: vec!["inline-base64".into()],
+            free_slots: 1,
+            key_binding: None,
+        }
+        .bind_heartbeat(1, "encryption-key", Some("signature"), Some(1));
+        let wire = tts_capability_wire(Some(cap));
+        assert_eq!(wire["kind"], "speech");
+        assert_eq!(wire["engine"], "tts-worker");
+        assert_eq!(wire["speech"]["speech_ready"], true);
+        assert_eq!(wire["speech"]["free_slots"], 1);
+        assert!(wire.get("transcription").is_none());
+        assert!(tts_capability_wire(None).get("speech").is_none());
+        assert!(tts_capability_wire(None).get("kind").is_none());
     }
 }
