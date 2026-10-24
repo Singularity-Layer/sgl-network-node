@@ -1,7 +1,9 @@
-//! Dedicated Kokoro (mlx-audio) text-to-speech worker supervisor for the Grid `speech-v1` lane.
+//! Dedicated mlx-audio text-to-speech worker supervisor for the Grid `speech-v1` lane
+//! (registry: Kokoro 82M, Chatterbox Turbo; one model per node).
 //! Mirrors `stt.rs`: one owned, serialized, framed worker that is timed out, killed and reaped
 //! on failure. Text in (UTF-8, byte count bound in the reservation), m4a AAC audio out.
-//! Spec: x402Studio documentation/product/sgl-network/GRID_TTS_SPEECH_V1.md.
+//! Spec: x402Studio documentation/product/sgl-network/GRID_TTS_SPEECH_V1.md and
+//! GRID_TTS_MULTI_MODEL.md.
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Child, Command, Stdio};
@@ -43,6 +45,71 @@ const MAX_OUTPUT_FRAME: u64 = 1024 * 1024;
 const REPLAY_CACHE_SIZE: usize = 65_536;
 const REPLAY_WINDOW: Duration = Duration::from_secs(24 * 60 * 60);
 const MODEL_MANIFEST: &str = include_str!("../scripts/tts_model_files.json");
+const CHATTERBOX_TURBO_MANIFEST: &str =
+    include_str!("../scripts/tts_model_files_chatterbox_turbo.json");
+
+/// One Grid speech model. Entry 0 is kokoro-82m and must stay exactly as above.
+#[derive(Debug, PartialEq)]
+pub struct SpeechModel {
+    pub id: &'static str,
+    pub repository: &'static str,
+    pub revision: &'static str,
+    /// sha256 of the canonical file manifest.
+    pub sha256: &'static str,
+    pub license: &'static str,
+    pub voices: &'static [&'static str],
+    /// Speed is part of the binding; a fixed-speed model only accepts `"1.00"`.
+    pub fixed_speed: bool,
+    manifest: &'static str,
+}
+
+pub const MODELS: [SpeechModel; 2] = [
+    SpeechModel {
+        id: MODEL_ID,
+        repository: MODEL_REPOSITORY,
+        revision: MODEL_REVISION,
+        sha256: MODEL_SHA256,
+        license: "Apache-2.0",
+        voices: VOICES,
+        fixed_speed: false,
+        manifest: MODEL_MANIFEST,
+    },
+    SpeechModel {
+        id: "chatterbox-turbo",
+        repository: "mlx-community/chatterbox-turbo-4bit",
+        revision: "c63817725071d7b5269c7b558772d6e8cbf59cec",
+        sha256: "196bd3c645a8b9969610d63d17663740ade3f5baabacf2e096623f53d34581fe",
+        license: "MIT",
+        voices: &["aria"],
+        fixed_speed: true,
+        manifest: CHATTERBOX_TURBO_MANIFEST,
+    },
+];
+
+pub fn model_by_id(id: &str) -> Option<&'static SpeechModel> {
+    MODELS.iter().find(|m| m.id == id)
+}
+
+/// Operator-facing lookup for `--model-name` (case-insensitive, like the rest of the CLI).
+pub fn model_for_name(name: &str) -> Option<&'static SpeechModel> {
+    MODELS.iter().find(|m| m.id.eq_ignore_ascii_case(name))
+}
+
+pub fn is_speech_model(name: &str) -> bool {
+    model_for_name(name).is_some()
+}
+
+impl SpeechModel {
+    fn pins_match(&self, model: &str, revision: &str, sha256: &str) -> bool {
+        self.id == model && self.revision == revision && self.sha256 == sha256
+    }
+    fn speed_ok(&self, speed: &str) -> bool {
+        valid_speed(speed) && (!self.fixed_speed || speed == "1.00")
+    }
+    fn voice_ok(&self, voice: &str) -> bool {
+        self.voices.contains(&voice)
+    }
+}
 
 fn platform_approved() -> bool {
     cfg!(all(target_os = "macos", target_arch = "aarch64"))
@@ -50,6 +117,7 @@ fn platform_approved() -> bool {
 
 #[derive(Clone)]
 pub struct WorkerConfig {
+    pub model: &'static SpeechModel,
     pub program: String,
     pub args: Vec<String>,
     pub startup_timeout: Duration,
@@ -182,10 +250,6 @@ pub fn valid_speed(value: &str) -> bool {
     (50..=200).contains(&hundredths)
 }
 
-fn valid_voice(value: &str) -> bool {
-    VOICES.contains(&value)
-}
-
 impl ReservationBinding {
     pub fn parse_dispatch(value: &serde_json::Value) -> Result<Self, String> {
         let dispatch: SpeechDispatch = serde_json::from_value(value.clone())
@@ -194,13 +258,12 @@ impl ReservationBinding {
             return Err("speech encrypted envelope missing".into());
         }
         let binding = dispatch.speech_reservation;
+        let model = model_by_id(&binding.model).ok_or("speech reservation binding invalid")?;
         if binding.protocol != PROTOCOL
             || !canonical_uuid(&binding.request_id)
-            || binding.model != MODEL_ID
-            || binding.model_revision != MODEL_REVISION
-            || binding.model_sha256 != MODEL_SHA256
-            || !valid_voice(&binding.voice)
-            || !valid_speed(&binding.speed)
+            || !model.pins_match(&binding.model, &binding.model_revision, &binding.model_sha256)
+            || !model.voice_ok(&binding.voice)
+            || !model.speed_ok(&binding.speed)
             || binding.input_bytes == 0
             || binding.input_bytes > MAX_INPUT_BYTES as u64
         {
@@ -231,13 +294,10 @@ impl SpeechRequest {
         if !canonical_uuid(&request.request_id) {
             return Err("speech request id invalid".into());
         }
-        if request.model != MODEL_ID
-            || request.model_revision != MODEL_REVISION
-            || request.model_sha256 != MODEL_SHA256
-        {
-            return Err("speech model binding mismatch".into());
-        }
-        if !valid_voice(&request.voice) || !valid_speed(&request.speed) {
+        let model = model_by_id(&request.model)
+            .filter(|m| m.pins_match(&request.model, &request.model_revision, &request.model_sha256))
+            .ok_or("speech model binding mismatch")?;
+        if !model.voice_ok(&request.voice) || !model.speed_ok(&request.speed) {
             return Err("speech voice or speed invalid".into());
         }
         if request.input.encoding != "base64"
@@ -495,6 +555,7 @@ impl TtsEngine {
     /// app passes the one it installs) and the local model directory. The node verifies every
     /// pinned model file before starting the worker, and the worker verifies them again.
     pub async fn production(
+        model: &'static SpeechModel,
         model_dir: &std::path::Path,
         python: &std::path::Path,
     ) -> Result<Self, String> {
@@ -504,14 +565,18 @@ impl TtsEngine {
             );
         }
         if !model_dir.is_dir() {
-            return Err("speech model directory unavailable; --tts-model-dir must point at the pinned Kokoro-82M-bf16 folder".into());
+            return Err(format!(
+                "speech model directory unavailable; --tts-model-dir must point at the pinned {} folder",
+                model.repository.rsplit('/').next().unwrap_or(model.repository)
+            ));
         }
         if !python.is_file() {
             return Err("speech interpreter unavailable; --tts-python must point at the mlx-audio venv python".into());
         }
-        verify_model_dir(model_dir)?;
-        let assets = materialize_assets()?;
+        verify_model_dir(model, model_dir)?;
+        let assets = materialize_assets(model)?;
         let config = WorkerConfig {
+            model,
             program: python
                 .to_str()
                 .ok_or("speech interpreter path is not UTF-8")?
@@ -537,6 +602,8 @@ impl TtsEngine {
                     .to_str()
                     .ok_or("speech runtime path is not UTF-8")?
                     .into(),
+                "--model-id".into(),
+                model.id.into(),
             ],
             startup_timeout: Duration::from_secs(180),
             request_timeout: Duration::from_secs(120),
@@ -575,6 +642,10 @@ impl TtsEngine {
         }
     }
 
+    pub fn model(&self) -> &'static SpeechModel {
+        self.config.model
+    }
+
     pub fn is_healthy(&self) -> bool {
         self.healthy.load(Ordering::Acquire) && !self.stopped.load(Ordering::Acquire)
     }
@@ -604,7 +675,10 @@ impl TtsEngine {
         if !self.is_healthy() {
             return Err("speech_runtime_failed".into());
         }
-        if request.text.is_empty() || request.text.len() > MAX_INPUT_BYTES {
+        if request.text.is_empty()
+            || request.text.len() > MAX_INPUT_BYTES
+            || request.model != self.model().id
+        {
             return Err("speech_input_invalid".into());
         }
         if !self
@@ -674,21 +748,21 @@ fn manifest_digest(files: &[ManifestFile]) -> String {
     hex::encode(sha2::Sha256::digest(text.as_bytes()))
 }
 
-fn embedded_manifest() -> Result<Manifest, String> {
+fn embedded_manifest(model: &SpeechModel) -> Result<Manifest, String> {
     let manifest: Manifest =
-        serde_json::from_str(MODEL_MANIFEST).map_err(|_| "speech model manifest invalid")?;
-    if manifest.model_id != MODEL_ID
-        || manifest.model_revision != MODEL_REVISION
-        || manifest.model_sha256 != MODEL_SHA256
-        || manifest_digest(&manifest.files) != MODEL_SHA256
+        serde_json::from_str(model.manifest).map_err(|_| "speech model manifest invalid")?;
+    if manifest.model_id != model.id
+        || manifest.model_revision != model.revision
+        || manifest.model_sha256 != model.sha256
+        || manifest_digest(&manifest.files) != model.sha256
     {
         return Err("speech model manifest does not match its pins".into());
     }
     Ok(manifest)
 }
 
-fn verify_model_dir(model_dir: &std::path::Path) -> Result<(), String> {
-    let manifest = embedded_manifest()?;
+fn verify_model_dir(model: &SpeechModel, model_dir: &std::path::Path) -> Result<(), String> {
+    let manifest = embedded_manifest(model)?;
     for file in &manifest.files {
         if file.path.starts_with('/') || file.path.split('/').any(|part| part == "..") {
             return Err("speech model manifest path invalid".into());
@@ -772,14 +846,14 @@ impl Drop for PrivateWorkerTemp {
     }
 }
 
-fn materialize_assets() -> Result<PrivateWorkerTemp, String> {
+fn materialize_assets(model: &SpeechModel) -> Result<PrivateWorkerTemp, String> {
     let assets = PrivateWorkerTemp::create()?;
     for (name, bytes) in [
         (
             "tts_worker.py",
             include_bytes!("../scripts/tts_worker.py").as_slice(),
         ),
-        ("tts_model_files.json", MODEL_MANIFEST.as_bytes()),
+        ("tts_model_files.json", model.manifest.as_bytes()),
     ] {
         std::fs::write(assets.0.join(name), bytes)
             .map_err(|_| "speech runtime materialization failed")?;
@@ -885,7 +959,7 @@ fn supervise(
         open.store(false, Ordering::Release);
     });
     let startup = receive_frame(&frames_rx, config.startup_timeout, &stopped, None)
-        .and_then(|frame| validate_ready(&frame));
+        .and_then(|frame| validate_ready(&frame, config.model));
     match startup {
         Ok(cap)
             if output_open.load(Ordering::Acquire)
@@ -965,17 +1039,15 @@ fn receive_frame(
     }
 }
 
-fn validate_ready(frame: &[u8]) -> Result<Capabilities, String> {
+fn validate_ready(frame: &[u8], model: &SpeechModel) -> Result<Capabilities, String> {
     let ready: Ready = serde_json::from_slice(frame).map_err(|_| "invalid speech readiness")?;
-    let voices_match =
-        ready.voices.len() == VOICES.len() && ready.voices.iter().zip(VOICES).all(|(a, b)| a == b);
+    let voices_match = ready.voices.len() == model.voices.len()
+        && ready.voices.iter().zip(model.voices).all(|(a, b)| a == b);
     if ready.frame_type != "ready"
         || ready.protocol != PROTOCOL
         || ready.runtime != RUNTIME
         || ready.runtime_revision != RUNTIME_REVISION
-        || ready.model_id != MODEL_ID
-        || ready.model_revision != MODEL_REVISION
-        || ready.model_sha256 != MODEL_SHA256
+        || !model.pins_match(&ready.model_id, &ready.model_revision, &ready.model_sha256)
         || !voices_match
         || ready.output_format != OUTPUT_FORMAT
         || ready.max_input_bytes != MAX_INPUT_BYTES
@@ -988,16 +1060,16 @@ fn validate_ready(frame: &[u8]) -> Result<Capabilities, String> {
         kind: "speech".into(),
         speech_ready: true,
         speech_protocol: PROTOCOL.into(),
-        speech_models: vec![MODEL_ID.into()],
+        speech_models: vec![model.id.into()],
         speech_runtime: RUNTIME.into(),
         runtime_revision: ready.runtime_revision,
         model_revision: ready.model_revision,
         model_sha256: ready.model_sha256,
-        model_repository: MODEL_REPOSITORY.into(),
+        model_repository: model.repository.into(),
         os: std::env::consts::OS.into(),
         architecture: std::env::consts::ARCH.into(),
-        model_license: "Apache-2.0".into(),
-        voices: VOICES.iter().map(|v| (*v).to_string()).collect(),
+        model_license: model.license.into(),
+        voices: model.voices.iter().map(|v| (*v).to_string()).collect(),
         max_input_bytes: MAX_INPUT_BYTES,
         max_audio_seconds: MAX_AUDIO_SECONDS,
         output_format: OUTPUT_FORMAT.into(),
@@ -1146,7 +1218,7 @@ mod tests {
 
     #[test]
     fn embedded_manifest_matches_pins() {
-        let manifest = embedded_manifest().expect("manifest matches its pins");
+        let manifest = embedded_manifest(&MODELS[0]).expect("manifest matches its pins");
         assert_eq!(manifest.files.len(), 2 + VOICES.len());
         for voice in VOICES {
             assert!(manifest
@@ -1154,6 +1226,66 @@ mod tests {
                 .iter()
                 .any(|f| f.path == format!("voices/{voice}.safetensors")));
         }
+    }
+
+    fn chatterbox_dispatch(voice: &str, speed: &str, sha: &str) -> serde_json::Value {
+        let m = &MODELS[1];
+        serde_json::json!({"enc": {}, "speech_reservation": {
+            "protocol": PROTOCOL, "request_id": RID, "model": m.id,
+            "model_revision": m.revision, "model_sha256": sha,
+            "voice": voice, "speed": speed, "input_bytes": 12}})
+    }
+
+    #[test]
+    fn registry_keeps_kokoro_first_and_pins_every_manifest() {
+        assert_eq!(MODELS[0].id, MODEL_ID);
+        assert_eq!(MODELS[0].sha256, MODEL_SHA256);
+        assert_eq!(MODELS[0].voices, VOICES);
+        for m in &MODELS {
+            let manifest = embedded_manifest(m).expect("manifest matches its pins");
+            assert!(!manifest.files.is_empty());
+        }
+        let turbo = embedded_manifest(&MODELS[1]).unwrap();
+        assert_eq!(turbo.files.len(), 9);
+        assert!(turbo.files.iter().any(|f| f.path == "conds.safetensors"));
+        assert_eq!(model_for_name("Chatterbox-Turbo").map(|m| m.id), Some("chatterbox-turbo"));
+        assert!(is_speech_model("kokoro-82m") && !is_speech_model("whisper-1"));
+    }
+
+    #[test]
+    fn chatterbox_binding_is_its_own_pins_voice_and_fixed_speed() {
+        let sha = MODELS[1].sha256;
+        assert!(ReservationBinding::parse_dispatch(&chatterbox_dispatch("aria", "1.00", sha)).is_ok());
+        assert!(ReservationBinding::parse_dispatch(&chatterbox_dispatch("aria", "1.25", sha)).is_err());
+        assert!(ReservationBinding::parse_dispatch(&chatterbox_dispatch("af_heart", "1.00", sha)).is_err());
+        // Mixed pins (chatterbox id with Kokoro's manifest digest) never pass.
+        assert!(ReservationBinding::parse_dispatch(&chatterbox_dispatch("aria", "1.00", MODEL_SHA256)).is_err());
+        // Kokoro voices stay Kokoro-only and keep their speed range.
+        let mut kokoro = chatterbox_dispatch("aria", "1.50", MODEL_SHA256);
+        kokoro["speech_reservation"]["model"] = MODEL_ID.into();
+        kokoro["speech_reservation"]["model_revision"] = MODEL_REVISION.into();
+        assert!(ReservationBinding::parse_dispatch(&kokoro).is_err());
+        kokoro["speech_reservation"]["voice"] = "af_heart".into();
+        assert!(ReservationBinding::parse_dispatch(&kokoro).is_ok());
+    }
+
+    #[test]
+    fn readiness_must_name_the_configured_model() {
+        let m = &MODELS[1];
+        let ready = serde_json::json!({
+            "type": "ready", "protocol": PROTOCOL, "runtime": RUNTIME,
+            "runtime_revision": RUNTIME_REVISION, "model_id": m.id,
+            "model_revision": m.revision, "model_sha256": m.sha256,
+            "voices": m.voices, "output_format": OUTPUT_FORMAT,
+            "max_input_bytes": MAX_INPUT_BYTES, "max_audio_seconds": MAX_AUDIO_SECONDS,
+            "smoke_seconds": 2.0});
+        let bytes = serde_json::to_vec(&ready).unwrap();
+        let cap = validate_ready(&bytes, m).unwrap();
+        assert_eq!(cap.speech_models, vec!["chatterbox-turbo".to_string()]);
+        assert_eq!(cap.voices, vec!["aria".to_string()]);
+        assert_eq!(cap.model_license, "MIT");
+        // A worker reporting another model than the one configured is refused.
+        assert!(validate_ready(&bytes, &MODELS[0]).is_err());
     }
 
     #[test]
@@ -1309,7 +1441,7 @@ mod tests {
     #[test]
     fn readiness_must_match_every_pin() {
         let ok = serde_json::to_vec(&ready_frame()).unwrap();
-        let cap = validate_ready(&ok).unwrap();
+        let cap = validate_ready(&ok, &MODELS[0]).unwrap();
         assert!(cap.speech_ready);
         assert_eq!(cap.kind, "speech");
         let unbound = cap.clone().bind_heartbeat(1, "pk", None, None);
@@ -1328,7 +1460,7 @@ mod tests {
             let mut bad = ready_frame();
             bad[field] = value;
             assert!(
-                validate_ready(&serde_json::to_vec(&bad).unwrap()).is_err(),
+                validate_ready(&serde_json::to_vec(&bad).unwrap(), &MODELS[0]).is_err(),
                 "{field}"
             );
         }
@@ -1337,6 +1469,7 @@ mod tests {
     /// A fake worker exercises the supervisor end to end without the real model.
     fn fake_worker(script: &str) -> WorkerConfig {
         WorkerConfig {
+            model: &MODELS[0],
             program: "python3".into(),
             args: vec!["-I".into(), "-u".into(), "-c".into(), script.into()],
             startup_timeout: Duration::from_secs(20),
@@ -1412,22 +1545,34 @@ for line in sys.stdin:
     }
 
     /// Real model on this Mac. Run with:
-    /// SGL_TTS_CANARY_PYTHON=... SGL_TTS_CANARY_MODEL_DIR=... cargo test --lib tts::tests::real_canary -- --ignored
+    /// SGL_TTS_CANARY_PYTHON=... SGL_TTS_CANARY_MODEL_DIR=... [SGL_TTS_CANARY_MODEL=chatterbox-turbo] cargo test --lib tts::tests::real_canary -- --ignored
     #[tokio::test]
     #[ignore]
     async fn real_canary() {
         let python = std::env::var("SGL_TTS_CANARY_PYTHON").expect("SGL_TTS_CANARY_PYTHON");
         let model = std::env::var("SGL_TTS_CANARY_MODEL_DIR").expect("SGL_TTS_CANARY_MODEL_DIR");
+        // SGL_TTS_CANARY_MODEL=chatterbox-turbo picks another registry entry (default Kokoro).
+        let spec = std::env::var("SGL_TTS_CANARY_MODEL")
+            .ok()
+            .and_then(|id| model_by_id(&id))
+            .unwrap_or(&MODELS[0]);
         let engine =
-            TtsEngine::production(std::path::Path::new(&model), std::path::Path::new(&python))
+            TtsEngine::production(spec, std::path::Path::new(&model), std::path::Path::new(&python))
                 .await
                 .expect("production worker starts");
-        let request = SpeechRequest::parse(&canonical(
-            "This sentence was spoken by a node on the Singularity Layer grid.",
-            "am_michael",
+        let mut wire = canonical(
+            if spec.fixed_speed {
+                "This sentence was spoken by a node on the grid. [laugh] Really, it was."
+            } else {
+                "This sentence was spoken by a node on the Singularity Layer grid."
+            },
+            if spec.id == MODEL_ID { "am_michael" } else { spec.voices[0] },
             "1.00",
-        ))
-        .unwrap();
+        );
+        wire["model"] = spec.id.into();
+        wire["model_revision"] = spec.revision.into();
+        wire["model_sha256"] = spec.sha256.into();
+        let request = SpeechRequest::parse(&wire).unwrap();
         let out = engine.speak(request.clone()).await.unwrap();
         assert!(out.duration_seconds > 2.0 && out.audio.len() > 10_000);
         if let Ok(path) = std::env::var("SGL_TTS_CANARY_OUT") {

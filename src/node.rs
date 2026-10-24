@@ -1207,7 +1207,7 @@ pub async fn start(
     // so `--model-name kokoro-82m --tts-python .. --tts-model-dir ..` is enough.
     let model_path = model_path.or(
         model_name
-            .filter(|n| crate::tts::MODEL_ID.eq_ignore_ascii_case(n))
+            .filter(|n| crate::tts::is_speech_model(n))
             .and(tts_model_dir),
     );
     if let Some(path) = model_path {
@@ -1327,7 +1327,7 @@ pub async fn start(
         };
         if crate::embed_catalog::is_multimodal_embedding_model(&name)
             || crate::stt::is_stt_model(&name)
-            || crate::tts::MODEL_ID.eq_ignore_ascii_case(&name)
+            || crate::tts::is_speech_model(&name)
         {
             effective_slots = 1;
         }
@@ -2321,7 +2321,11 @@ async fn process_job(
         None
     };
     let speech_reservation = if job.job_type == "speech" {
-        let binding = (job.model.as_deref() == Some(crate::tts::MODEL_ID))
+        let binding = job
+            .model
+            .as_deref()
+            .and_then(crate::tts::model_by_id)
+            .is_some()
             .then_some(job.input_payload.as_ref())
             .flatten()
             .ok_or_else(|| "missing speech dispatch".to_string())
@@ -3029,7 +3033,9 @@ async fn execute_speech(
         .as_ref()
         .filter(|e| e.mode_label() == "tts-worker")
         .ok_or("speech_runtime_failed")?;
-    if job.model.as_deref() != Some(crate::tts::MODEL_ID) {
+    // Only the model this node's worker serves (one speech model per node).
+    let served = engine.tts_model().ok_or("speech_runtime_failed")?;
+    if job.model.as_deref() != Some(served.id) {
         return Err("speech_input_invalid".into());
     }
     let request = job
@@ -4297,6 +4303,7 @@ mod speech_binding_tests {
         let python = std::env::var("SGL_TTS_CANARY_PYTHON").expect("SGL_TTS_CANARY_PYTHON");
         let model = std::env::var("SGL_TTS_CANARY_MODEL_DIR").expect("SGL_TTS_CANARY_MODEL_DIR");
         let tts = crate::tts::TtsEngine::production(
+            &crate::tts::MODELS[0],
             std::path::Path::new(&model),
             std::path::Path::new(&python),
         )
@@ -4389,6 +4396,7 @@ mod speech_binding_tests {
             serde_json::to_string(&ready.to_string()).unwrap()
         );
         let tts = crate::tts::TtsEngine::start(crate::tts::WorkerConfig {
+            model: &crate::tts::MODELS[0],
             program: "python3".into(),
             args: vec!["-u".into(), "-c".into(), script],
             startup_timeout: std::time::Duration::from_secs(10),

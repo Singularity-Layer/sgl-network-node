@@ -690,8 +690,8 @@ impl ServerEngine {
         if crate::stt::is_stt_model(&self.config.model_name) {
             return Err("whisper transcription cannot run in llama.cpp".into());
         }
-        if crate::tts::MODEL_ID.eq_ignore_ascii_case(&self.config.model_name) {
-            return Err("Kokoro speech cannot run in llama.cpp".into());
+        if crate::tts::is_speech_model(&self.config.model_name) {
+            return Err("speech models cannot run in llama.cpp".into());
         }
         // Non-reentrant: kill any existing child first so a second start() (or a manual
         // call) can never orphan a running llama-server. No-op on the initial start.
@@ -1430,7 +1430,7 @@ impl InferenceEngine {
             }
             if crate::embed_catalog::is_embedding_model(&config.model_name)
                 || crate::stt::is_stt_model(&config.model_name)
-                || crate::tts::MODEL_ID.eq_ignore_ascii_case(&config.model_name)
+                || crate::tts::is_speech_model(&config.model_name)
             {
                 return Err(
                     "a pinned llama-server cannot be used with an embedding or voice worker"
@@ -1469,14 +1469,14 @@ impl InferenceEngine {
             .map(|engine| InferenceEngine::Stt(Box::new(engine)));
         }
         // Speech (Grid TTS) gets its own supervised mlx-audio worker, also before llama.cpp.
-        if crate::tts::MODEL_ID.eq_ignore_ascii_case(&config.model_name) {
+        if let Some(tts_model) = crate::tts::model_for_name(&config.model_name) {
             let model_dir = config.tts_model_dir.as_deref().ok_or(
-                "Kokoro speech requires --tts-model-dir pointing at the pinned Kokoro-82M-bf16 folder",
+                "speech requires --tts-model-dir pointing at the pinned model folder",
             )?;
             let python = config.tts_python.as_deref().ok_or(
-                "Kokoro speech requires --tts-python pointing at the pinned mlx-audio venv interpreter",
+                "speech requires --tts-python pointing at the pinned mlx-audio venv interpreter",
             )?;
-            return crate::tts::TtsEngine::production(model_dir, python)
+            return crate::tts::TtsEngine::production(tts_model, model_dir, python)
                 .await
                 .map(|engine| InferenceEngine::Tts(Box::new(engine)));
         }
@@ -1681,6 +1681,14 @@ impl InferenceEngine {
         }
     }
 
+    /// The registry entry a speech engine serves.
+    pub fn tts_model(&self) -> Option<&'static crate::tts::SpeechModel> {
+        match self {
+            Self::Tts(e) => Some(e.model()),
+            _ => None,
+        }
+    }
+
     pub fn tts_snapshot(&self, models: &[String]) -> Option<crate::tts::ReadinessSnapshot> {
         match self {
             Self::Tts(e) => Some(e.readiness_snapshot(models)),
@@ -1694,7 +1702,7 @@ impl InferenceEngine {
     ) -> Result<crate::tts::SpeechOutput, String> {
         match self {
             Self::Tts(e) => e.speak(request).await,
-            _ => Err("speech requires a Kokoro worker node".into()),
+            _ => Err("speech requires a speech worker node".into()),
         }
     }
 

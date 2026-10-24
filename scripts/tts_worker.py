@@ -1,4 +1,4 @@
-"""Supervised Kokoro (mlx-audio) text-to-speech worker for the Grid `speech-v1` lane.
+"""Supervised mlx-audio text-to-speech worker (Kokoro or Chatterbox Turbo) for the Grid `speech-v1` lane.
 
 The Rust supervisor (src/tts.rs) owns this process: it writes one JSON frame per line on
 stdin and reads one JSON frame per line on stdout. Nothing else is printed to stdout.
@@ -6,7 +6,8 @@ stdin and reads one JSON frame per line on stdout. Nothing else is printed to st
 Startup:
   1. Re-hash every pinned model file against tts_model_files.json; refuse on any mismatch.
   2. Check the pinned package versions (mlx-audio, mlx, misaki).
-  3. Load Kokoro from the operator's local model directory (offline, never downloads).
+  3. Load the model named by --model-id from the operator's local directory (offline, never
+     downloads; Chatterbox's optional S3 tokenizer is only for cloning and is never fetched).
   4. Speak a fixed smoke sentence and require real, non-silent audio.
   5. Print one `ready` frame.
 
@@ -34,15 +35,37 @@ import types
 import wave
 
 PROTOCOL = "speech-v1"
-MODEL_ID = "kokoro-82m"
+# Grid speech registry (sgl-node src/tts.rs MODELS; spec GRID_TTS_MULTI_MODEL.md).
+MODELS = {
+    "kokoro-82m": {
+        "family": "kokoro",
+        "voices": ["af_heart", "af_bella", "af_nicole", "bf_emma", "af_aoede", "af_kore",
+                   "af_sarah", "am_fenrir", "am_michael", "am_puck"],
+        "smoke_voice": "af_heart",
+        "fixed_speed": False,
+        "tags": [],
+    },
+    "chatterbox-turbo": {
+        "family": "chatterbox-turbo",
+        "voices": ["aria"],
+        "smoke_voice": "aria",
+        "fixed_speed": True,
+        # Measured 2026-10-24 to change the audio; everything else is removed, never read aloud.
+        "tags": ["laugh", "chuckle", "cough", "clear throat", "groan", "shush", "dramatic", "sarcastic"],
+    },
+}
+TAG_ROOT = {
+    "laughs": "laugh", "laughing": "laugh", "chuckling": "chuckle", "chuckles": "chuckle",
+    "coughs": "cough", "coughing": "cough", "groans": "groan", "groaning": "groan",
+    "clears throat": "clear throat", "clearing throat": "clear throat",
+}
+TAG_RE = re.compile(r"\[([A-Za-z][A-Za-z ]{0,30})\]")
 RUNTIME = "mlx-audio"
 OUTPUT_FORMAT = "m4a_aac_24k_mono"
 SAMPLE_RATE = 24000
 MAX_INPUT_BYTES = 1000
 MAX_AUDIO_SECONDS = 90
 MAX_AUDIO_BYTES = 700_000
-VOICES = ["af_heart", "af_bella", "af_nicole", "bf_emma", "af_aoede", "af_kore",
-          "af_sarah", "am_fenrir", "am_michael", "am_puck"]
 PACKAGES = {"mlx-audio": "0.6.1", "mlx": "0.32.4", "misaki": "0.9.4"}
 SMOKE_TEXT = "Singularity Layer speech check."
 AFCONVERT = "/usr/bin/afconvert"
@@ -156,13 +179,29 @@ def install_espeak_stub():
     misaki.espeak = stub
 
 
-def synthesize(model, model_dir, text, voice, speed):
+def apply_tags(spec, text):
+    """[tag] -> the model's own tag if it performs it, else removed. Never read aloud."""
+    allowed = set(spec["tags"])
+
+    def swap(m):
+        root = " ".join(m.group(1).lower().split())
+        root = TAG_ROOT.get(root, root)
+        return f"[{root}]" if root in allowed else ""
+
+    return re.sub(r"[ \t]{2,}", " ", TAG_RE.sub(swap, text)).strip()
+
+
+def synthesize(spec, model, model_dir, text, voice, speed):
     import numpy as np
 
-    # Always the pinned, verified voice file. A bare voice name makes mlx-audio fetch the
-    # voice through the Hugging Face cache, which is neither pinned nor available offline.
-    voice_path = os.path.join(model_dir, "voices", f"{voice}.safetensors")
-    chunks = list(model.generate(text=text, voice=voice_path, speed=speed, lang_code=voice[0]))
+    if spec["family"] == "kokoro":
+        # Always the pinned, verified voice file. A bare voice name makes mlx-audio fetch the
+        # voice through the Hugging Face cache, which is neither pinned nor available offline.
+        voice_path = os.path.join(model_dir, "voices", f"{voice}.safetensors")
+        chunks = list(model.generate(text=text, voice=voice_path, speed=speed, lang_code=voice[0]))
+    else:
+        # Built-in voice (conds.safetensors in the pinned folder); no reference clip on Grid.
+        chunks = list(model.generate(text=text))
     if not chunks:
         raise ValueError("no audio")
     audio = np.concatenate([np.array(c.audio).reshape(-1) for c in chunks])
@@ -199,12 +238,18 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-dir", required=True)
     parser.add_argument("--manifest", required=True)
+    parser.add_argument("--model-id", default="kokoro-82m")
     args = parser.parse_args()
+    if args.model_id not in MODELS:
+        fail("unknown model id")
+    spec = MODELS[args.model_id]
 
     if not os.path.isfile(AFCONVERT):
         fail("afconvert unavailable")
     model_dir = os.path.realpath(args.model_dir)
     manifest, manifest_sha = verify_model(model_dir, args.manifest)
+    if manifest.get("model_id") != args.model_id:
+        fail("manifest is for a different model")
     runtime_revision = check_packages()
     install_espeak_stub()
     from mlx_audio.tts.utils import load_model
@@ -214,7 +259,7 @@ def main():
 
     import numpy as np
 
-    smoke = synthesize(model, model_dir, SMOKE_TEXT, "af_heart", 1.0)
+    smoke = synthesize(spec, model, model_dir, SMOKE_TEXT, spec["smoke_voice"], 1.0)
     seconds = len(smoke) / SAMPLE_RATE
     if not (0.8 <= seconds <= 10.0) or float(np.sqrt(np.mean(smoke ** 2))) < 0.005:
         fail("smoke audio implausible")
@@ -227,10 +272,10 @@ def main():
         "protocol": PROTOCOL,
         "runtime": RUNTIME,
         "runtime_revision": runtime_revision,
-        "model_id": MODEL_ID,
+        "model_id": args.model_id,
         "model_revision": manifest["model_revision"],
         "model_sha256": manifest_sha,
-        "voices": VOICES,
+        "voices": spec["voices"],
         "output_format": OUTPUT_FORMAT,
         "max_input_bytes": MAX_INPUT_BYTES,
         "max_audio_seconds": MAX_AUDIO_SECONDS,
@@ -259,14 +304,19 @@ def main():
         except Exception:  # noqa: BLE001
             reject()
             continue
-        if (frame.get("protocol") != PROTOCOL or voice not in VOICES
+        if (frame.get("protocol") != PROTOCOL or voice not in spec["voices"]
                 or not (1 <= len(text_bytes) <= MAX_INPUT_BYTES) or "\x00" in text
                 or not text.strip() or not (0.5 <= speed <= 2.0)
+                or (spec["fixed_speed"] and frame.get("speed") != "1.00")
                 or hashlib.sha256(text_bytes).hexdigest() != frame.get("text_sha256")):
             reject()
             continue
+        spoken = apply_tags(spec, text)
+        if not re.search(r"[A-Za-z0-9]", TAG_RE.sub("", spoken)):
+            reject()  # only tags or symbols: nothing to say
+            continue
         try:
-            audio = synthesize(model, model_dir, text, voice, speed)
+            audio = synthesize(spec, model, model_dir, spoken, voice, speed)
         except Exception:  # noqa: BLE001
             reject()  # unspeakable text (e.g. only symbols) is the caller's input
             continue
