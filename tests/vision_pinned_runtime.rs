@@ -36,6 +36,8 @@ async fn pinned_qwen_vision_answers_an_image() {
         stt_whisper_sha256: None,
         stt_python: None,
         stt_smoke_dir: None,
+        tts_python: None,
+        tts_model_dir: None,
         model_path: PathBuf::from(model),
         model_name: "qwen2.5-vl-3b".into(),
         port: 0,

@@ -29,6 +29,8 @@ pub struct ServiceStartOptions {
     pub stt_whisper_sha256: Option<String>,
     pub stt_python: Option<String>,
     pub stt_smoke_dir: Option<String>,
+    pub tts_python: Option<String>,
+    pub tts_model_dir: Option<String>,
     pub systemone_sidecar_url: Option<String>,
     /// Vision (multimodal) models: path to the mmproj GGUF, baked into the service so the
     /// background node serves images across restarts. None for text/embedding models.
@@ -87,6 +89,14 @@ impl ServiceStartOptions {
         if let Some(smoke) = &self.stt_smoke_dir {
             args.push("--stt-smoke-dir".into());
             args.push(smoke.clone());
+        }
+        if let Some(python) = &self.tts_python {
+            args.push("--tts-python".into());
+            args.push(python.clone());
+        }
+        if let Some(dir) = &self.tts_model_dir {
+            args.push("--tts-model-dir".into());
+            args.push(dir.clone());
         }
         if let Some(url) = &self.systemone_sidecar_url {
             args.push("--systemone-sidecar-url".into());
@@ -813,6 +823,8 @@ mod embedding_service_tests {
             stt_whisper_sha256: None,
             stt_python: None,
             stt_smoke_dir: None,
+            tts_python: None,
+            tts_model_dir: None,
             systemone_sidecar_url: None,
             mmproj_path: None,
             image_max_tokens: None,
@@ -861,6 +873,8 @@ mod embedding_service_tests {
             stt_whisper_sha256: Some(crate::stt::MACOS_AARCH64_RUNTIME_SHA256.into()),
             stt_python: Some("/owned/stt/python3".into()),
             stt_smoke_dir: Some("/owned/stt/approved-smoke".into()),
+            tts_python: None,
+            tts_model_dir: None,
             systemone_sidecar_url: None,
             mmproj_path: None,
             image_max_tokens: None,

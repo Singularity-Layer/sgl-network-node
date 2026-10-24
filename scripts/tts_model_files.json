@@ -1,0 +1,69 @@
+{
+  "model_id": "kokoro-82m",
+  "repository": "mlx-community/Kokoro-82M-bf16",
+  "model_revision": "a71e4d38b236d968966a2002c4c895dbd12b1c3c",
+  "model_sha256": "cccd8451bb6755bbc9e41fdb705391c0f15fc17b68f55b3b680d5f73e7041ddf",
+  "license": "Apache-2.0",
+  "files": [
+    {
+      "path": "config.json",
+      "bytes": 2351,
+      "sha256": "5abb01e2403b072bf03d04fde160443e209d7a0dad49a423be15196b9b43c17f"
+    },
+    {
+      "path": "kokoro-v1_0.safetensors",
+      "bytes": 327115152,
+      "sha256": "4e9ecdf03b8b6cf906070390237feda473dc13327cb8d56a43deaa374c02acd8"
+    },
+    {
+      "path": "voices/af_aoede.safetensors",
+      "bytes": 522320,
+      "sha256": "23809148777f2a2378983dd856bc14b9c261018279f916f98c23d86e844409a5"
+    },
+    {
+      "path": "voices/af_bella.safetensors",
+      "bytes": 522320,
+      "sha256": "112d310468cbb3cf23404d3d0b50ad3adf017b87bf38bf9edd15f4ad572df6a3"
+    },
+    {
+      "path": "voices/af_heart.safetensors",
+      "bytes": 522320,
+      "sha256": "2c1c733b0e6576c810e268d3e440c21dea4e0f0131a3ba4cfc98d7fe6136d094"
+    },
+    {
+      "path": "voices/af_kore.safetensors",
+      "bytes": 522320,
+      "sha256": "c491174280cb1ad25210a842f2f34b46a9ef904ec6f6a8e784839531795fa278"
+    },
+    {
+      "path": "voices/af_nicole.safetensors",
+      "bytes": 522320,
+      "sha256": "574656386022c81a029e9a72558191925f44c3de2dad2fa2e45751938557d062"
+    },
+    {
+      "path": "voices/af_sarah.safetensors",
+      "bytes": 522320,
+      "sha256": "4940072182542f54c1035d1daf4c1cf3136ca9baa9ac57c8e006b4befcc50be6"
+    },
+    {
+      "path": "voices/am_fenrir.safetensors",
+      "bytes": 522320,
+      "sha256": "9abed964b906c4cae6f404d9849e76260689aea862bc6ca85fc3f5207ba96538"
+    },
+    {
+      "path": "voices/am_michael.safetensors",
+      "bytes": 522320,
+      "sha256": "3940147ded35deba0bb52e8132f89b719298e0520258c34584358aa5a24da2ea"
+    },
+    {
+      "path": "voices/am_puck.safetensors",
+      "bytes": 522320,
+      "sha256": "9a8c2e56413bd2063f814cb4c3885fc425876157369117c3f8258d03c8a9ad89"
+    },
+    {
+      "path": "voices/bf_emma.safetensors",
+      "bytes": 522320,
+      "sha256": "8878a75a6661305849eeb1d6293a7177250193616e161b4c3100636434dfe69f"
+    }
+  ]
+}

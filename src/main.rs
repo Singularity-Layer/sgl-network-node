@@ -21,6 +21,7 @@ mod stt;
 mod tee;
 mod telemetry;
 mod toolcall;
+mod tts;
 mod update;
 mod ws;
 
@@ -133,6 +134,14 @@ enum Commands {
         /// Release-integrator-approved audio.wav + smoke.json startup fixture directory.
         #[arg(long)]
         stt_smoke_dir: Option<String>,
+
+        /// Python of the pinned mlx-audio venv for the Grid speech worker (kokoro-82m).
+        #[arg(long)]
+        tts_python: Option<String>,
+
+        /// Folder with the pinned Kokoro-82M-bf16 model files (Grid speech worker).
+        #[arg(long)]
+        tts_model_dir: Option<String>,
 
         /// System One sidecar base URL (for Laya/Jev-compatible typed decision models).
         /// When set without --model-path, the node advertises --model-name or convaiinnovations/laya.
@@ -312,6 +321,14 @@ enum ServiceAction {
         #[arg(long)]
         stt_smoke_dir: Option<String>,
 
+        /// Python of the pinned mlx-audio venv for the Grid speech worker (kokoro-82m).
+        #[arg(long)]
+        tts_python: Option<String>,
+
+        /// Folder with the pinned Kokoro-82M-bf16 model files (Grid speech worker).
+        #[arg(long)]
+        tts_model_dir: Option<String>,
+
         /// System One sidecar base URL (for Laya/Jev-compatible typed decision models).
         #[arg(long)]
         systemone_sidecar_url: Option<String>,
@@ -452,6 +469,8 @@ async fn main() {
             stt_whisper_sha256,
             stt_python,
             stt_smoke_dir,
+            tts_python,
+            tts_model_dir,
             systemone_sidecar_url,
             mmproj_path,
             image_max_tokens,
@@ -500,6 +519,8 @@ async fn main() {
                 stt_whisper_sha256.as_deref(),
                 stt_python.as_deref(),
                 stt_smoke_dir.as_deref(),
+                tts_python.as_deref(),
+                tts_model_dir.as_deref(),
                 systemone_sidecar_url.as_deref(),
                 mmproj_path.as_deref(),
                 image_max_tokens,
@@ -595,6 +616,8 @@ async fn main() {
                     stt_whisper_sha256,
                     stt_python,
                     stt_smoke_dir,
+                    tts_python,
+                    tts_model_dir,
                     systemone_sidecar_url,
                     mmproj_path,
                     image_max_tokens,
@@ -616,6 +639,8 @@ async fn main() {
                         stt_whisper_sha256,
                         stt_python,
                         stt_smoke_dir,
+                        tts_python,
+                        tts_model_dir,
                         systemone_sidecar_url: systemone_sidecar_url.or_else(|| {
                             std::env::var("SGL_SYSTEMONE_SIDECAR_URL")
                                 .ok()

@@ -152,6 +152,8 @@ async fn explicit_runtime_requirement_cannot_fall_through_to_chat_or_gguf() {
         stt_whisper_sha256: None,
         stt_python: None,
         stt_smoke_dir: None,
+        tts_python: None,
+        tts_model_dir: None,
         model_path: "/missing/eg2/snapshot".into(),
         model_name: "embeddinggemma-2".into(),
         port: 8081,

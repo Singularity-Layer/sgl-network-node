@@ -25,6 +25,15 @@ MODEL_ID = "whisper-1"
 MODEL_FILE = "ggml-small.bin"
 MODEL_REVISION = "5359861c739e955e79d9a303bcbc70fb988958b1"
 MODEL_SHA256 = "1be3a9b2063867b937e64e2ec7483364a79917e157fa98c5d94b5c1fffea987b"
+# Grid STT model registry (same repo revision, same whisper.cpp runtime). `--model-id` picks one;
+# the default keeps whisper-1 byte-for-byte as before.
+MODELS = {
+    "whisper-1": ("ggml-small.bin", MODEL_SHA256),
+    "whisper-large-v3-turbo": (
+        "ggml-large-v3-turbo.bin",
+        "1fc70f774d38eb169993ac391eea357ef47c88757ef72ee5943879b7e8e2bc69",
+    ),
+}
 RUNTIME = "whisper.cpp"
 RUNTIME_REVISION = "d1be6fde11ac6e0407606b4e42fe72d34add8037"
 RUNTIME_BINARY_SHA256 = "4ac1f78373fa19037ff036c66586db2b775e0b21785c320953a1960bcb425405"
@@ -58,12 +67,15 @@ def file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def verify_install(model_path: Path) -> tuple[int, str]:
+def verify_install(model_path: Path, model_id: str = MODEL_ID) -> tuple[int, str]:
+    if model_id not in MODELS:
+        raise RuntimeError("model id is not in the pinned registry")
+    model_file, model_sha256 = MODELS[model_id]
     manifest_path = Path(__file__).resolve().parent / "whisper_model_files.json"
     with manifest_path.open("r", encoding="utf-8") as handle:
         manifest = json.load(handle)
     entries = {name: (size, digest) for name, size, digest in manifest}
-    expected = entries.get(MODEL_FILE)
+    expected = entries.get(model_file)
     if expected is None:
         raise RuntimeError("model manifest is missing the pinned whisper model")
     size, digest = expected
@@ -72,7 +84,7 @@ def verify_install(model_path: Path) -> tuple[int, str]:
     stat = model_path.stat()
     if stat.st_size != size:
         raise RuntimeError("whisper model file size does not match the pin")
-    if file_sha256(model_path) != digest or digest != MODEL_SHA256:
+    if file_sha256(model_path) != digest or digest != model_sha256:
         raise RuntimeError("whisper model file hash does not match the pin")
     return size, digest
 
@@ -178,8 +190,10 @@ class Runtime:
         whisper_bin: Path,
         whisper_sha256: str,
         smoke_dir: Path,
+        model_id: str = MODEL_ID,
     ):
-        self._model_bytes, self._model_sha256 = verify_install(model_path)
+        self._model_id = model_id
+        self._model_bytes, self._model_sha256 = verify_install(model_path, model_id)
         self._runtime_bytes, self._runtime_sha256 = verify_runtime(
             whisper_bin, whisper_sha256
         )
@@ -300,6 +314,7 @@ def main() -> int:
     parser.add_argument("--whisper-bin", required=True)
     parser.add_argument("--whisper-sha256", required=True)
     parser.add_argument("--smoke-dir", required=True)
+    parser.add_argument("--model-id", default=MODEL_ID)
     args = parser.parse_args()
 
     # Route library/native stdout away from the protocol channel.
@@ -316,6 +331,7 @@ def main() -> int:
             Path(args.whisper_bin),
             args.whisper_sha256,
             Path(args.smoke_dir),
+            args.model_id,
         )
     except Exception:
         try:
@@ -336,7 +352,7 @@ def main() -> int:
                 "model_bytes": runtime._model_bytes,
                 "runtime_binary_sha256": runtime._runtime_sha256,
                 "runtime_binary_bytes": runtime._runtime_bytes,
-                "model_id": MODEL_ID,
+                "model_id": runtime._model_id,
                 "audio_format": "pcm_s16le_16k_mono",
                 "max_duration_seconds": MAX_DURATION_SECONDS,
                 "smoke_transcript": runtime._smoke_transcript,

@@ -40,6 +40,7 @@ fn worker(body: &str) -> WorkerConfig {
         "smoke_transcript":"and so my fellow americans ask not what your country can do for you"
     });
     WorkerConfig {
+        model: &sgl_node::stt::MODELS[0],
         program: "python3".into(),
         args: vec![
             "-u".into(),
@@ -217,6 +218,7 @@ async fn production_worker_real_canary() {
     let model = std::env::var("SGL_STT_CANARY_MODEL").expect("SGL_STT_CANARY_MODEL");
     let smoke = std::env::var("SGL_STT_CANARY_SMOKE").expect("SGL_STT_CANARY_SMOKE");
     let engine = SttEngine::production(
+        &sgl_node::stt::MODELS[0],
         std::path::Path::new(&model),
         std::path::Path::new(&whisper),
         &{

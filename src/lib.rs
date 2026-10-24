@@ -6,6 +6,7 @@
 pub mod eg2;
 pub mod embedding_input;
 pub mod stt;
+pub mod tts;
 
 #[cfg(feature = "inprocess")]
 pub mod embed;

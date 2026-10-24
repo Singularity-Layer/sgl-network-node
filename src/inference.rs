@@ -329,6 +329,10 @@ pub struct InferenceEngineConfig {
     pub stt_python: Option<PathBuf>,
     /// Explicit release-integrator-approved known-audio fixture directory.
     pub stt_smoke_dir: Option<PathBuf>,
+    /// Interpreter of the pinned mlx-audio venv for the speech worker (Grid TTS).
+    pub tts_python: Option<PathBuf>,
+    /// Local folder holding the pinned Kokoro-82M-bf16 files.
+    pub tts_model_dir: Option<PathBuf>,
     /// Explicit, pinned llama-server contract. When present, discovery is disabled.
     pub llama_server: Option<ExplicitLlamaServer>,
     pub model_path: PathBuf,
@@ -683,8 +687,11 @@ impl ServerEngine {
         if crate::embed_catalog::is_multimodal_embedding_model(&self.config.model_name) {
             return Err("EmbeddingGemma 2 cannot run in llama.cpp".into());
         }
-        if crate::stt::MODEL_ID.eq_ignore_ascii_case(&self.config.model_name) {
+        if crate::stt::is_stt_model(&self.config.model_name) {
             return Err("whisper transcription cannot run in llama.cpp".into());
+        }
+        if crate::tts::is_speech_model(&self.config.model_name) {
+            return Err("speech models cannot run in llama.cpp".into());
         }
         // Non-reentrant: kill any existing child first so a second start() (or a manual
         // call) can never orphan a running llama-server. No-op on the initial start.
@@ -1358,6 +1365,7 @@ impl EngineMode {
 pub enum InferenceEngine {
     MultimodalEmbed(crate::eg2::Eg2Engine),
     Stt(Box<crate::stt::SttEngine>),
+    Tts(Box<crate::tts::TtsEngine>),
     Server(ServerEngine),
     #[cfg(feature = "inprocess")]
     InProcess(crate::inprocess::InProcessEngine),
@@ -1385,6 +1393,7 @@ impl InferenceEngine {
         match self {
             InferenceEngine::MultimodalEmbed(_) => "embedding-worker",
             InferenceEngine::Stt(_) => "stt-worker",
+            InferenceEngine::Tts(_) => "tts-worker",
             InferenceEngine::Server(_) => "server",
             #[cfg(feature = "inprocess")]
             InferenceEngine::InProcess(_) => "inprocess",
@@ -1406,6 +1415,7 @@ impl InferenceEngine {
         match self {
             InferenceEngine::MultimodalEmbed(_) => "metal",
             InferenceEngine::Stt(_) => "unknown",
+            InferenceEngine::Tts(_) => "metal",
             InferenceEngine::Server(e) => *e.accelerator.lock().unwrap_or_else(|p| p.into_inner()),
             #[cfg(feature = "inprocess")]
             _ => crate::telemetry::inprocess_accelerator(gpu_layers),
@@ -1419,7 +1429,8 @@ impl InferenceEngine {
                 return Err("a pinned llama-server requires the server engine".to_string());
             }
             if crate::embed_catalog::is_embedding_model(&config.model_name)
-                || crate::stt::MODEL_ID.eq_ignore_ascii_case(&config.model_name)
+                || crate::stt::is_stt_model(&config.model_name)
+                || crate::tts::is_speech_model(&config.model_name)
             {
                 return Err(
                     "a pinned llama-server cannot be used with an embedding or voice worker"
@@ -1437,14 +1448,17 @@ impl InferenceEngine {
             .map(InferenceEngine::MultimodalEmbed);
         }
         // Transcription gets its own supervised worker before any llama.cpp path.
-        if crate::stt::MODEL_ID.eq_ignore_ascii_case(&config.model_name) {
+        if crate::stt::is_stt_model(&config.model_name) {
             let whisper = config.stt_whisper.as_deref().ok_or(
                 "whisper transcription requires --stt-whisper for its pinned runtime binary",
             )?;
             let whisper_sha256 = config.stt_whisper_sha256.as_deref().ok_or(
                 "whisper transcription requires --stt-whisper-sha256 for its pinned runtime binary",
             )?;
+            let stt_model = crate::stt::model_for_name(&config.model_name)
+                .ok_or("unknown transcription model")?;
             return crate::stt::SttEngine::production(
+                stt_model,
                 &config.model_path,
                 whisper,
                 whisper_sha256,
@@ -1453,6 +1467,18 @@ impl InferenceEngine {
             )
             .await
             .map(|engine| InferenceEngine::Stt(Box::new(engine)));
+        }
+        // Speech (Grid TTS) gets its own supervised mlx-audio worker, also before llama.cpp.
+        if let Some(tts_model) = crate::tts::model_for_name(&config.model_name) {
+            let model_dir = config.tts_model_dir.as_deref().ok_or(
+                "speech requires --tts-model-dir pointing at the pinned model folder",
+            )?;
+            let python = config.tts_python.as_deref().ok_or(
+                "speech requires --tts-python pointing at the pinned mlx-audio venv interpreter",
+            )?;
+            return crate::tts::TtsEngine::production(tts_model, model_dir, python)
+                .await
+                .map(|engine| InferenceEngine::Tts(Box::new(engine)));
         }
         // Embedding models get the dedicated pooling engine regardless of `--engine` (they can't
         // run through the chat path). Only available on an `inprocess` build.
@@ -1524,6 +1550,7 @@ impl InferenceEngine {
         match self {
             InferenceEngine::MultimodalEmbed(e) => e.is_healthy(),
             InferenceEngine::Stt(e) => e.is_healthy(),
+            InferenceEngine::Tts(e) => e.is_healthy(),
             InferenceEngine::Server(e) => e.is_healthy().await,
             #[cfg(feature = "inprocess")]
             InferenceEngine::InProcess(e) => e.is_healthy(),
@@ -1539,6 +1566,7 @@ impl InferenceEngine {
         match self {
             InferenceEngine::MultimodalEmbed(_) => false,
             InferenceEngine::Stt(_) => false,
+            InferenceEngine::Tts(_) => false,
             InferenceEngine::Server(_) => false,
             #[cfg(feature = "inprocess")]
             InferenceEngine::InProcess(e) => e.backend_failed(),
@@ -1552,6 +1580,7 @@ impl InferenceEngine {
         match self {
             InferenceEngine::MultimodalEmbed(_) => true,
             InferenceEngine::Stt(_) => false,
+            InferenceEngine::Tts(_) => false,
             // Server engine in --embedding mode (the non-`inprocess`/Windows path).
             InferenceEngine::Server(e) => e.is_embedding(),
             #[cfg(feature = "inprocess")]
@@ -1569,6 +1598,7 @@ impl InferenceEngine {
         match self {
             InferenceEngine::MultimodalEmbed(_) => false,
             InferenceEngine::Stt(_) => false,
+            InferenceEngine::Tts(_) => false,
             InferenceEngine::Server(e) => e.is_vision(),
             #[cfg(all(feature = "inprocess", feature = "vision"))]
             InferenceEngine::InProcess(e) => e.is_vision(),
@@ -1589,6 +1619,7 @@ impl InferenceEngine {
         match self {
             InferenceEngine::MultimodalEmbed(_) => false,
             InferenceEngine::Stt(_) => false,
+            InferenceEngine::Tts(_) => false,
             InferenceEngine::Server(e) => !e.is_embedding(),
             #[cfg(all(feature = "inprocess", feature = "vision"))]
             InferenceEngine::InProcess(e) => e.tool_format().supports_tools(),
@@ -1605,6 +1636,7 @@ impl InferenceEngine {
         match self {
             InferenceEngine::MultimodalEmbed(e) => e.capabilities().map(|c| c.embedding_dim),
             InferenceEngine::Stt(_) => None,
+            InferenceEngine::Tts(_) => None,
             InferenceEngine::Server(e) => e.embedding_dim(),
             #[cfg(feature = "inprocess")]
             InferenceEngine::Embed(e) => Some(e.dim()),
@@ -1634,10 +1666,43 @@ impl InferenceEngine {
         }
     }
 
+    /// The registry entry a transcription engine serves.
+    pub fn stt_model(&self) -> Option<&'static crate::stt::SttModel> {
+        match self {
+            Self::Stt(e) => Some(e.model()),
+            _ => None,
+        }
+    }
+
     pub fn stt_snapshot(&self, models: &[String]) -> Option<crate::stt::ReadinessSnapshot> {
         match self {
             Self::Stt(e) => Some(e.readiness_snapshot(models)),
             _ => None,
+        }
+    }
+
+    /// The registry entry a speech engine serves.
+    pub fn tts_model(&self) -> Option<&'static crate::tts::SpeechModel> {
+        match self {
+            Self::Tts(e) => Some(e.model()),
+            _ => None,
+        }
+    }
+
+    pub fn tts_snapshot(&self, models: &[String]) -> Option<crate::tts::ReadinessSnapshot> {
+        match self {
+            Self::Tts(e) => Some(e.readiness_snapshot(models)),
+            _ => None,
+        }
+    }
+
+    pub async fn speak(
+        &self,
+        request: crate::tts::SpeechRequest,
+    ) -> Result<crate::tts::SpeechOutput, String> {
+        match self {
+            Self::Tts(e) => e.speak(request).await,
+            _ => Err("speech requires a speech worker node".into()),
         }
     }
 
@@ -1667,6 +1732,7 @@ impl InferenceEngine {
         match self {
             InferenceEngine::MultimodalEmbed(e) => e.stop(),
             InferenceEngine::Stt(e) => e.stop(),
+            InferenceEngine::Tts(e) => e.stop(),
             InferenceEngine::Server(e) => e.stop(),
             #[cfg(feature = "inprocess")]
             InferenceEngine::InProcess(_) => { /* worker stops when the engine is dropped */ }
@@ -1688,6 +1754,7 @@ impl InferenceEngine {
                 Err("use typed multimodal embedding dispatch".into())
             }
             InferenceEngine::Stt(_) => Err("this node is a transcription node".into()),
+            InferenceEngine::Tts(_) => Err("this node is a speech node".into()),
             InferenceEngine::Server(e) => e.embed(inputs, input_type, dimensions).await,
             #[cfg(feature = "inprocess")]
             InferenceEngine::Embed(e) => e.embed(inputs, input_type, dimensions).await,
@@ -1700,6 +1767,7 @@ impl InferenceEngine {
         match self {
             InferenceEngine::MultimodalEmbed(e) => e.restart().await,
             InferenceEngine::Stt(e) => e.restart().await,
+            InferenceEngine::Tts(e) => e.restart().await,
             InferenceEngine::Server(e) => e.restart().await,
             // In-process: there is no child process to restart — the engine IS this process,
             // and a wedged native llama.cpp call can never be recovered from Rust. The node
@@ -1735,6 +1803,7 @@ impl InferenceEngine {
         match self {
             InferenceEngine::MultimodalEmbed(_) => self.restart().await,
             InferenceEngine::Stt(_) => self.restart().await,
+            InferenceEngine::Tts(_) => self.restart().await,
             InferenceEngine::Server(e) => e.restart_no_swap().await,
             #[cfg(feature = "inprocess")]
             InferenceEngine::InProcess(_) => self.restart().await,
@@ -1758,6 +1827,7 @@ impl InferenceEngine {
             InferenceEngine::Stt(_) => {
                 Err("this node serves transcription, not chat completions".into())
             }
+            InferenceEngine::Tts(_) => Err("this node serves speech, not chat completions".into()),
             InferenceEngine::Server(e) => {
                 e.chat_completion(messages, temperature, max_tokens, tools, tool_choice)
                     .await
@@ -1820,6 +1890,7 @@ impl InferenceEngine {
             InferenceEngine::Stt(_) => {
                 Err("this node serves transcription, not chat completions".into())
             }
+            InferenceEngine::Tts(_) => Err("this node serves speech, not chat completions".into()),
             InferenceEngine::Server(e) => {
                 e.chat_completion_stream(messages, tools, tool_choice, temperature, max_tokens, tx)
                     .await
@@ -2043,6 +2114,8 @@ mod explicit_llama_server_tests {
             port: 8081,
             threads: 1,
             gpu_layers: 0,
+            tts_python: None,
+            tts_model_dir: None,
             context_size: 4096,
             batch_size: 1,
             parallel_slots: 1,
