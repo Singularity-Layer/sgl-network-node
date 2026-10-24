@@ -261,7 +261,11 @@ impl ReservationBinding {
         let model = model_by_id(&binding.model).ok_or("speech reservation binding invalid")?;
         if binding.protocol != PROTOCOL
             || !canonical_uuid(&binding.request_id)
-            || !model.pins_match(&binding.model, &binding.model_revision, &binding.model_sha256)
+            || !model.pins_match(
+                &binding.model,
+                &binding.model_revision,
+                &binding.model_sha256,
+            )
             || !model.voice_ok(&binding.voice)
             || !model.speed_ok(&binding.speed)
             || binding.input_bytes == 0
@@ -295,7 +299,13 @@ impl SpeechRequest {
             return Err("speech request id invalid".into());
         }
         let model = model_by_id(&request.model)
-            .filter(|m| m.pins_match(&request.model, &request.model_revision, &request.model_sha256))
+            .filter(|m| {
+                m.pins_match(
+                    &request.model,
+                    &request.model_revision,
+                    &request.model_sha256,
+                )
+            })
             .ok_or("speech model binding mismatch")?;
         if !model.voice_ok(&request.voice) || !model.speed_ok(&request.speed) {
             return Err("speech voice or speed invalid".into());
@@ -1248,18 +1258,33 @@ mod tests {
         let turbo = embedded_manifest(&MODELS[1]).unwrap();
         assert_eq!(turbo.files.len(), 9);
         assert!(turbo.files.iter().any(|f| f.path == "conds.safetensors"));
-        assert_eq!(model_for_name("Chatterbox-Turbo").map(|m| m.id), Some("chatterbox-turbo"));
+        assert_eq!(
+            model_for_name("Chatterbox-Turbo").map(|m| m.id),
+            Some("chatterbox-turbo")
+        );
         assert!(is_speech_model("kokoro-82m") && !is_speech_model("whisper-1"));
     }
 
     #[test]
     fn chatterbox_binding_is_its_own_pins_voice_and_fixed_speed() {
         let sha = MODELS[1].sha256;
-        assert!(ReservationBinding::parse_dispatch(&chatterbox_dispatch("aria", "1.00", sha)).is_ok());
-        assert!(ReservationBinding::parse_dispatch(&chatterbox_dispatch("aria", "1.25", sha)).is_err());
-        assert!(ReservationBinding::parse_dispatch(&chatterbox_dispatch("af_heart", "1.00", sha)).is_err());
+        assert!(
+            ReservationBinding::parse_dispatch(&chatterbox_dispatch("aria", "1.00", sha)).is_ok()
+        );
+        assert!(
+            ReservationBinding::parse_dispatch(&chatterbox_dispatch("aria", "1.25", sha)).is_err()
+        );
+        assert!(
+            ReservationBinding::parse_dispatch(&chatterbox_dispatch("af_heart", "1.00", sha))
+                .is_err()
+        );
         // Mixed pins (chatterbox id with Kokoro's manifest digest) never pass.
-        assert!(ReservationBinding::parse_dispatch(&chatterbox_dispatch("aria", "1.00", MODEL_SHA256)).is_err());
+        assert!(ReservationBinding::parse_dispatch(&chatterbox_dispatch(
+            "aria",
+            "1.00",
+            MODEL_SHA256
+        ))
+        .is_err());
         // Kokoro voices stay Kokoro-only and keep their speed range.
         let mut kokoro = chatterbox_dispatch("aria", "1.50", MODEL_SHA256);
         kokoro["speech_reservation"]["model"] = MODEL_ID.into();
@@ -1556,17 +1581,24 @@ for line in sys.stdin:
             .ok()
             .and_then(|id| model_by_id(&id))
             .unwrap_or(&MODELS[0]);
-        let engine =
-            TtsEngine::production(spec, std::path::Path::new(&model), std::path::Path::new(&python))
-                .await
-                .expect("production worker starts");
+        let engine = TtsEngine::production(
+            spec,
+            std::path::Path::new(&model),
+            std::path::Path::new(&python),
+        )
+        .await
+        .expect("production worker starts");
         let mut wire = canonical(
             if spec.fixed_speed {
                 "This sentence was spoken by a node on the grid. [laugh] Really, it was."
             } else {
                 "This sentence was spoken by a node on the Singularity Layer grid."
             },
-            if spec.id == MODEL_ID { "am_michael" } else { spec.voices[0] },
+            if spec.id == MODEL_ID {
+                "am_michael"
+            } else {
+                spec.voices[0]
+            },
             "1.00",
         );
         wire["model"] = spec.id.into();
