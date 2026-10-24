@@ -1326,7 +1326,7 @@ pub async fn start(
             }
         };
         if crate::embed_catalog::is_multimodal_embedding_model(&name)
-            || crate::stt::MODEL_ID.eq_ignore_ascii_case(&name)
+            || crate::stt::is_stt_model(&name)
             || crate::tts::MODEL_ID.eq_ignore_ascii_case(&name)
         {
             effective_slots = 1;
@@ -2297,7 +2297,7 @@ async fn process_job(
     tracing::info!("Processing job {} (type: {})", job.id, job.job_type);
 
     let transcription_reservation = if job.job_type == "transcription" {
-        if job.model.as_deref() != Some(crate::stt::MODEL_ID) {
+        if job.model.as_deref().and_then(crate::stt::model_by_id).is_none() {
             let _ = client
                 .fail_job(&job.id, "transcription_input_invalid")
                 .await;
@@ -3107,9 +3107,15 @@ async fn execute_transcription(
             .ok_or("Job has no input payload")?;
         let audio = crate::stt::AudioRequest::parse(payload)
             .map_err(|_| "transcription_input_invalid".to_string())?;
+        // The job's model must be exactly the model this node serves: a Turbo job never runs on
+        // a Small node (or vice versa), even though both share one protocol.
+        let served = engine
+            .stt_model()
+            .ok_or("this node is not a transcription node")?;
         if !reservation.matches(&audio)
             || audio.request_id != job.id
             || job.model.as_deref() != Some(audio.model.as_str())
+            || audio.model != served.id
         {
             return Err("transcription_input_invalid".into());
         }
@@ -3123,9 +3129,9 @@ async fn execute_transcription(
             "protocol": crate::stt::PROTOCOL,
             "request_id": request_id,
             "job_id": job.id,
-            "model": crate::stt::MODEL_ID,
+            "model": served.id,
             "model_revision": model_revision,
-            "model_sha256": crate::stt::MODEL_SHA256,
+            "model_sha256": served.sha256,
             "sample_count": sample_count,
             "text": out.text,
             "language": out.language,
@@ -4129,6 +4135,7 @@ mod transcription_binding_tests {
             serde_json::to_string(&ready.to_string()).unwrap()
         );
         let stt = crate::stt::SttEngine::start(crate::stt::WorkerConfig {
+            model: &crate::stt::MODELS[0],
             program: "python3".into(),
             args: vec!["-u".into(), "-c".into(), script],
             startup_timeout: std::time::Duration::from_secs(10),
@@ -4201,6 +4208,62 @@ mod transcription_binding_tests {
         let french_out = execute_transcription(&engine, &job, &french).await.unwrap();
         assert_eq!(french_out["language_hint"], "fr");
         assert_eq!(french_out["language"], "en");
+    }
+}
+
+#[cfg(test)]
+mod stt_model_binding_tests {
+    use super::*;
+
+    /// A Turbo job must never run on a node that serves Whisper Small.
+    #[tokio::test]
+    async fn turbo_job_is_refused_by_a_small_node() {
+        let ready = serde_json::json!({
+            "type":"ready", "protocol":crate::stt::PROTOCOL, "runtime":crate::stt::RUNTIME,
+            "runtime_revision":crate::stt::RUNTIME_REVISION, "model_revision":crate::stt::MODEL_REVISION,
+            "model_sha256":crate::stt::MODEL_SHA256, "model_bytes":crate::stt::MODEL_BYTES,
+            "runtime_binary_sha256":"11".repeat(32), "runtime_binary_bytes":123,
+            "model_id":crate::stt::MODEL_ID, "audio_format":"pcm_s16le_16k_mono",
+            "max_duration_seconds":60, "smoke_transcript":"and so my fellow americans ask not what your country can do for you",
+        });
+        let script = format!(
+            "import sys,json\nprint({},flush=True)\nfor line in sys.stdin:\n r=json.loads(line)\n print(json.dumps({{'type':'result','request_id':r['request_id'],'text':'hello','language':'en','duration_seconds':0.2,'segments':[]}}),flush=True)",
+            serde_json::to_string(&ready.to_string()).unwrap()
+        );
+        let stt = crate::stt::SttEngine::start(crate::stt::WorkerConfig {
+            model: &crate::stt::MODELS[0],
+            program: "python3".into(),
+            args: vec!["-u".into(), "-c".into(), script],
+            startup_timeout: std::time::Duration::from_secs(10),
+            request_timeout: std::time::Duration::from_secs(5),
+            expected_runtime_sha256: "11".repeat(32),
+            expected_runtime_bytes: 123,
+        })
+        .await
+        .unwrap();
+        let engine = Some(Arc::new(InferenceEngine::Stt(Box::new(stt))));
+        let turbo = &crate::stt::MODELS[1];
+        use base64::Engine;
+        let request_id = "00000000-0000-4000-8000-000000000001";
+        let payload = serde_json::json!({
+            "protocol":crate::stt::PROTOCOL,"request_id":request_id,"model":turbo.id,
+            "model_revision":crate::stt::MODEL_REVISION,"model_sha256":turbo.sha256,"language":"auto",
+            "audio":{"format":"pcm_s16le","sample_rate":16000,"channels":1,"bits_per_sample":16,"sample_count":1600,"data":base64::engine::general_purpose::STANDARD.encode(vec![0u8;3200])},
+        });
+        let reservation: crate::stt::ReservationBinding = serde_json::from_value(serde_json::json!({
+            "protocol":crate::stt::PROTOCOL,"request_id":request_id,"model":turbo.id,
+            "model_revision":crate::stt::MODEL_REVISION,"model_sha256":turbo.sha256,"language":"auto","sample_count":1600,
+        })).unwrap();
+        let job = PendingJob {
+            id: request_id.into(),
+            job_type: "transcription".into(),
+            model: Some(turbo.id.into()),
+            input_payload: Some(payload),
+        };
+        assert_eq!(
+            execute_transcription(&engine, &job, &reservation).await.unwrap_err(),
+            "transcription_input_invalid"
+        );
     }
 }
 

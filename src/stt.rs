@@ -14,6 +14,50 @@ pub const MODEL_REPOSITORY: &str = "ggerganov/whisper.cpp";
 pub const MODEL_REVISION: &str = "5359861c739e955e79d9a303bcbc70fb988958b1";
 pub const MODEL_SHA256: &str = "1be3a9b2063867b937e64e2ec7483364a79917e157fa98c5d94b5c1fffea987b";
 pub const MODEL_BYTES: u64 = 487_601_967;
+
+/// One pinned Grid STT model. Every entry shares MODEL_REVISION, the runtime and the protocol.
+#[derive(Debug, PartialEq, Eq)]
+pub struct SttModel {
+    pub id: &'static str,
+    pub file: &'static str,
+    pub sha256: &'static str,
+    pub bytes: u64,
+}
+
+/// Grid STT registry. Entry 0 is whisper-1 and must stay exactly as above.
+pub const MODELS: [SttModel; 2] = [
+    SttModel {
+        id: MODEL_ID,
+        file: MODEL_FILE,
+        sha256: MODEL_SHA256,
+        bytes: MODEL_BYTES,
+    },
+    SttModel {
+        id: "whisper-large-v3-turbo",
+        file: "ggml-large-v3-turbo.bin",
+        sha256: "1fc70f774d38eb169993ac391eea357ef47c88757ef72ee5943879b7e8e2bc69",
+        bytes: 1_624_555_275,
+    },
+];
+
+/// Exact (wire) lookup.
+pub fn model_by_id(id: &str) -> Option<&'static SttModel> {
+    MODELS.iter().find(|m| m.id == id)
+}
+
+/// Operator-facing lookup for `--model-name` (case-insensitive, like the rest of the CLI).
+pub fn model_for_name(name: &str) -> Option<&'static SttModel> {
+    MODELS.iter().find(|m| m.id.eq_ignore_ascii_case(name))
+}
+
+pub fn is_stt_model(name: &str) -> bool {
+    model_for_name(name).is_some()
+}
+
+/// The model id and sha256 must name the same registry entry.
+fn pinned_pair(model: &str, sha256: &str) -> bool {
+    model_by_id(model).is_some_and(|m| m.sha256 == sha256)
+}
 pub const RUNTIME: &str = "whisper.cpp";
 pub const RUNTIME_REVISION: &str = "d1be6fde11ac6e0407606b4e42fe72d34add8037";
 pub const RUNTIME_TAG: &str = "v1.9.5";
@@ -51,6 +95,8 @@ const SUPPORTED_LANGUAGES: &[&str] = &[
 
 #[derive(Clone)]
 pub struct WorkerConfig {
+    /// The registry entry this worker must report and serve.
+    pub model: &'static SttModel,
     pub program: String,
     pub args: Vec<String>,
     pub startup_timeout: Duration,
@@ -259,9 +305,8 @@ impl ReservationBinding {
         let binding = dispatch.transcription_reservation;
         if binding.protocol != PROTOCOL
             || !canonical_uuid(&binding.request_id)
-            || binding.model != MODEL_ID
+            || !pinned_pair(&binding.model, &binding.model_sha256)
             || binding.model_revision != MODEL_REVISION
-            || binding.model_sha256 != MODEL_SHA256
             || binding.sample_count == 0
             || binding.sample_count > MAX_SAMPLES as u64
             || !valid_language(&binding.language)
@@ -296,9 +341,8 @@ impl AudioRequest {
         if !canonical_uuid(&request.request_id) {
             return Err("transcription request id invalid".into());
         }
-        if request.model != MODEL_ID
+        if !pinned_pair(&request.model, &request.model_sha256)
             || request.model_revision != MODEL_REVISION
-            || request.model_sha256 != MODEL_SHA256
         {
             return Err("transcription model binding mismatch".into());
         }
@@ -456,6 +500,7 @@ impl SttEngine {
     /// Explicit model and whisper.cpp binary are required. The worker script ships in the
     /// binary; the model file and runtime stay operator-owned and read-only.
     pub async fn production(
+        model: &'static SttModel,
         model_path: &std::path::Path,
         whisper: &std::path::Path,
         expected_runtime_sha256: &str,
@@ -481,7 +526,7 @@ impl SttEngine {
                 "whisper runtime pin is not in the approved {RUNTIME_TAG} platform manifest"
             ));
         }
-        verify_file(model_path, MODEL_BYTES, MODEL_SHA256, MODEL_FILE)?;
+        verify_file(model_path, model.bytes, model.sha256, model.file)?;
         verify_file(
             whisper,
             MACOS_AARCH64_RUNTIME_BYTES,
@@ -501,6 +546,7 @@ impl SttEngine {
         }
         let assets = materialize_assets()?;
         let config = WorkerConfig {
+            model,
             program,
             args: vec![
                 "-I".into(),
@@ -528,6 +574,8 @@ impl SttEngine {
                     .to_str()
                     .ok_or("whisper smoke path is not UTF-8")?
                     .into(),
+                "--model-id".into(),
+                model.id.into(),
             ],
             startup_timeout: Duration::from_secs(180),
             request_timeout: Duration::from_secs(120),
@@ -570,6 +618,10 @@ impl SttEngine {
 
     pub fn is_healthy(&self) -> bool {
         self.healthy.load(Ordering::Acquire) && !self.stopped.load(Ordering::Acquire)
+    }
+    /// The registry entry this engine serves.
+    pub fn model(&self) -> &'static SttModel {
+        self.config.model
     }
     pub fn capabilities(&self) -> Option<Capabilities> {
         if self.is_healthy() {
@@ -852,6 +904,7 @@ fn supervise(
                 &frame,
                 &config.expected_runtime_sha256,
                 config.expected_runtime_bytes,
+                config.model,
             )
         });
     match startup {
@@ -939,6 +992,7 @@ fn validate_ready(
     frame: &[u8],
     expected_runtime_sha256: &str,
     expected_runtime_bytes: u64,
+    model: &'static SttModel,
 ) -> Result<Capabilities, String> {
     let ready: Ready =
         serde_json::from_slice(frame).map_err(|_| "invalid transcription readiness")?;
@@ -947,12 +1001,12 @@ fn validate_ready(
         || ready.runtime != RUNTIME
         || ready.runtime_revision != RUNTIME_REVISION
         || ready.model_revision != MODEL_REVISION
-        || ready.model_sha256 != MODEL_SHA256
-        || ready.model_bytes != MODEL_BYTES
+        || ready.model_sha256 != model.sha256
+        || ready.model_bytes != model.bytes
         || ready.runtime_binary_sha256 != expected_runtime_sha256
         || ready.runtime_binary_bytes != expected_runtime_bytes
         || expected_runtime_bytes == 0
-        || ready.model_id != MODEL_ID
+        || ready.model_id != model.id
         || ready.audio_format != "pcm_s16le_16k_mono"
         || ready.max_duration_seconds != MAX_DURATION_SECONDS
         || ready.smoke_transcript.len() < 20
@@ -971,7 +1025,7 @@ fn validate_ready(
     Ok(Capabilities {
         transcription_ready: true,
         transcription_protocol: PROTOCOL.into(),
-        transcription_models: vec![MODEL_ID.into()],
+        transcription_models: vec![model.id.into()],
         transcription_runtime: RUNTIME.into(),
         runtime_revision: ready.runtime_revision,
         model_revision: ready.model_revision,
@@ -1213,6 +1267,7 @@ mod tests {
             std::env::temp_dir().join(format!("sgl-stt-pin-test-{:016x}", rand::random::<u64>()));
         std::fs::write(&path, b"unapproved artifact").unwrap();
         let result = SttEngine::production(
+            &MODELS[0],
             &path,
             &path,
             &"11".repeat(32),
@@ -1374,5 +1429,70 @@ mod tests {
 
         response.text = "x".repeat(MAX_TEXT_BYTES + 1);
         assert!(validate_output(&response, 80_000).is_err());
+    }
+}
+
+#[cfg(test)]
+mod multi_model_tests {
+    use super::*;
+
+    #[test]
+    fn registry_keeps_whisper_1_first_and_exact() {
+        assert_eq!(MODELS[0].id, MODEL_ID);
+        assert_eq!(MODELS[0].sha256, MODEL_SHA256);
+        assert_eq!(MODELS[0].bytes, MODEL_BYTES);
+        assert_eq!(model_by_id("whisper-large-v3-turbo").unwrap().bytes, 1_624_555_275);
+        assert!(model_by_id("Whisper-1").is_none(), "wire ids are exact");
+        assert!(model_for_name("WHISPER-LARGE-V3-TURBO").is_some(), "CLI names are not");
+        let manifest: Vec<(String, u64, String)> =
+            serde_json::from_slice(include_bytes!("../scripts/whisper_model_files.json")).unwrap();
+        for model in &MODELS {
+            assert!(manifest
+                .iter()
+                .any(|(f, b, s)| f == model.file && *b == model.bytes && s == model.sha256));
+        }
+    }
+
+    #[test]
+    fn id_and_hash_must_name_the_same_model() {
+        let turbo = &MODELS[1];
+        let mut binding = serde_json::json!({
+            "protocol": PROTOCOL, "request_id": "3f1c2a54-9b7e-4d21-8c3a-0f6e5d4c3b2a",
+            "model": turbo.id, "model_revision": MODEL_REVISION, "model_sha256": turbo.sha256,
+            "language": "auto", "sample_count": 1600,
+        });
+        let dispatch = |b: &serde_json::Value| serde_json::json!({"enc": {}, "transcription_reservation": b});
+        assert!(ReservationBinding::parse_dispatch(&dispatch(&binding)).is_ok());
+        binding["model_sha256"] = serde_json::json!(MODEL_SHA256);
+        assert!(
+            ReservationBinding::parse_dispatch(&dispatch(&binding)).is_err(),
+            "turbo id with small's hash is refused"
+        );
+        binding["model"] = serde_json::json!("whisper-medium");
+        assert!(ReservationBinding::parse_dispatch(&dispatch(&binding)).is_err());
+    }
+
+    #[test]
+    fn readiness_is_bound_to_the_configured_model() {
+        let ready = |model: &SttModel| {
+            serde_json::to_vec(&serde_json::json!({
+                "type": "ready", "protocol": PROTOCOL, "runtime": RUNTIME,
+                "runtime_revision": RUNTIME_REVISION, "model_revision": MODEL_REVISION,
+                "model_sha256": model.sha256, "model_bytes": model.bytes,
+                "runtime_binary_sha256": "11".repeat(32), "runtime_binary_bytes": 1,
+                "model_id": model.id, "audio_format": "pcm_s16le_16k_mono",
+                "max_duration_seconds": MAX_DURATION_SECONDS,
+                "smoke_transcript": "and so my fellow americans ask not what your country can do",
+            }))
+            .unwrap()
+        };
+        let turbo = &MODELS[1];
+        let cap = validate_ready(&ready(turbo), &"11".repeat(32), 1, turbo).unwrap();
+        assert_eq!(cap.transcription_models, vec![turbo.id.to_string()]);
+        assert_eq!(cap.model_sha256, turbo.sha256);
+        assert!(
+            validate_ready(&ready(&MODELS[0]), &"11".repeat(32), 1, turbo).is_err(),
+            "a worker reporting Small cannot start a Turbo engine"
+        );
     }
 }

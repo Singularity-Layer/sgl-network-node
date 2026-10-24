@@ -687,7 +687,7 @@ impl ServerEngine {
         if crate::embed_catalog::is_multimodal_embedding_model(&self.config.model_name) {
             return Err("EmbeddingGemma 2 cannot run in llama.cpp".into());
         }
-        if crate::stt::MODEL_ID.eq_ignore_ascii_case(&self.config.model_name) {
+        if crate::stt::is_stt_model(&self.config.model_name) {
             return Err("whisper transcription cannot run in llama.cpp".into());
         }
         if crate::tts::MODEL_ID.eq_ignore_ascii_case(&self.config.model_name) {
@@ -1429,7 +1429,7 @@ impl InferenceEngine {
                 return Err("a pinned llama-server requires the server engine".to_string());
             }
             if crate::embed_catalog::is_embedding_model(&config.model_name)
-                || crate::stt::MODEL_ID.eq_ignore_ascii_case(&config.model_name)
+                || crate::stt::is_stt_model(&config.model_name)
                 || crate::tts::MODEL_ID.eq_ignore_ascii_case(&config.model_name)
             {
                 return Err(
@@ -1448,14 +1448,17 @@ impl InferenceEngine {
             .map(InferenceEngine::MultimodalEmbed);
         }
         // Transcription gets its own supervised worker before any llama.cpp path.
-        if crate::stt::MODEL_ID.eq_ignore_ascii_case(&config.model_name) {
+        if crate::stt::is_stt_model(&config.model_name) {
             let whisper = config.stt_whisper.as_deref().ok_or(
                 "whisper transcription requires --stt-whisper for its pinned runtime binary",
             )?;
             let whisper_sha256 = config.stt_whisper_sha256.as_deref().ok_or(
                 "whisper transcription requires --stt-whisper-sha256 for its pinned runtime binary",
             )?;
+            let stt_model = crate::stt::model_for_name(&config.model_name)
+                .ok_or("unknown transcription model")?;
             return crate::stt::SttEngine::production(
+                stt_model,
                 &config.model_path,
                 whisper,
                 whisper_sha256,
@@ -1659,6 +1662,14 @@ impl InferenceEngine {
     pub fn stt_capabilities(&self) -> Option<crate::stt::Capabilities> {
         match self {
             Self::Stt(e) => e.capabilities(),
+            _ => None,
+        }
+    }
+
+    /// The registry entry a transcription engine serves.
+    pub fn stt_model(&self) -> Option<&'static crate::stt::SttModel> {
+        match self {
+            Self::Stt(e) => Some(e.model()),
             _ => None,
         }
     }
