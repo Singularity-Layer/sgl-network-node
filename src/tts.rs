@@ -391,9 +391,11 @@ pub fn result_plaintext(job_id: &str, request: &SpeechRequest, output: &SpeechOu
         protocol: PROTOCOL,
         request_id: &request.request_id,
         job_id,
-        model: MODEL_ID,
-        model_revision: MODEL_REVISION,
-        model_sha256: MODEL_SHA256,
+        // The request's own (registry-validated) model, never a hardcoded one: a chatterbox
+        // result stamped with Kokoro's pins is rejected by every client.
+        model: &request.model,
+        model_revision: &request.model_revision,
+        model_sha256: &request.model_sha256,
         voice: &request.voice,
         speed: &request.speed,
         input_bytes: request.text.len(),
@@ -1292,6 +1294,31 @@ mod tests {
         assert!(ReservationBinding::parse_dispatch(&kokoro).is_err());
         kokoro["speech_reservation"]["voice"] = "af_heart".into();
         assert!(ReservationBinding::parse_dispatch(&kokoro).is_ok());
+    }
+
+    #[test]
+    fn result_header_names_the_model_that_spoke() {
+        // Regression: v1.10.5 stamped every result with Kokoro's pins, so clients rejected
+        // chatterbox-turbo audio as a binding mismatch (caught by the live private canary).
+        for m in &MODELS {
+            let mut wire = canonical("Hi there.", m.voices[0], "1.00");
+            wire["model"] = m.id.into();
+            wire["model_revision"] = m.revision.into();
+            wire["model_sha256"] = m.sha256.into();
+            let request = SpeechRequest::parse(&wire).unwrap();
+            let output = SpeechOutput {
+                audio: vec![1, 2, 3],
+                duration_seconds: 1.0,
+                sha256: "ab".repeat(32),
+            };
+            let plain = result_plaintext("job-1", &request, &output);
+            let line = plain.split(|b| *b == b'\n').next().unwrap();
+            let header: serde_json::Value = serde_json::from_slice(line).unwrap();
+            assert_eq!(header["model"], m.id);
+            assert_eq!(header["model_revision"], m.revision);
+            assert_eq!(header["model_sha256"], m.sha256);
+            assert_eq!(header["voice"], m.voices[0]);
+        }
     }
 
     #[test]
