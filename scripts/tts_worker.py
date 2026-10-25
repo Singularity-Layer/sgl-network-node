@@ -318,7 +318,20 @@ def main():
         try:
             audio = synthesize(spec, model, model_dir, spoken, voice, speed)
         except Exception:  # noqa: BLE001
-            reject()  # unspeakable text (e.g. only symbols) is the caller's input
+            # Unspeakable input, or a broken runtime (out of memory, Metal error, corrupted
+            # state)? Ask the model for the known-good smoke sentence. If it cannot say that
+            # either, the node is faulty: fail() exits the worker, the node reports
+            # speech_runtime_failed and the orchestrator's circuit breaker benches it. Before,
+            # every synthesis exception was filed as the caller's invalid input and a broken
+            # node kept being picked.
+            try:
+                probe = synthesize(spec, model, model_dir, SMOKE_TEXT, spec["smoke_voice"], 1.0)
+                runtime_ok = len(probe) / SAMPLE_RATE >= 0.5
+            except Exception:  # noqa: BLE001
+                runtime_ok = False
+            if not runtime_ok:
+                fail("synthesis failed and the health probe failed")
+            reject()  # the runtime is fine, so the caller's text was unspeakable
             continue
         seconds = len(audio) / SAMPLE_RATE
         if seconds > MAX_AUDIO_SECONDS:
