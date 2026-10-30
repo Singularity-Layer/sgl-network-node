@@ -210,6 +210,30 @@ pub fn sign_keybind_v1(
     Some(bs58::encode(sk.sign(&blob).to_bytes()).into_string())
 }
 
+/// Mac step 1 (2026-10-30): the canonical "sebind" blob tying the node's Secure Enclave
+/// P-256 key to its ed25519 identity. BOTH keys sign the same blob: ed25519 says "this enclave
+/// key is mine", the enclave signature proves the node holds that enclave key.
+///
+/// Blob = b"SGL-NODE-SEBIND-v1" || 0x00 || node_id(16) || ed25519_pub(32) || se_pub(65, X9.63)
+/// Returns (blob, ed25519 signature bs58), or None if node_id isn't a UUID or se_pub is not a
+/// 65-byte uncompressed point.
+pub fn sebind_v1(secret: &[u8; 32], node_id: &str, se_pub: &[u8]) -> Option<(Vec<u8>, String)> {
+    if se_pub.len() != 65 || se_pub[0] != 0x04 {
+        return None;
+    }
+    let node_id_bytes = uuid_to_bytes(node_id)?;
+    let sk = SigningKey::from_bytes(secret);
+    let ed25519_pub = sk.verifying_key().to_bytes();
+    let mut blob = Vec::with_capacity(18 + 1 + 16 + 32 + 65);
+    blob.extend_from_slice(b"SGL-NODE-SEBIND-v1");
+    blob.push(0x00);
+    blob.extend_from_slice(&node_id_bytes);
+    blob.extend_from_slice(&ed25519_pub);
+    blob.extend_from_slice(se_pub);
+    let sig = bs58::encode(sk.sign(&blob).to_bytes()).into_string();
+    Some((blob, sig))
+}
+
 /// Parse a UUID string (dashed or not) into its 16 raw bytes.
 fn uuid_to_bytes(s: &str) -> Option<[u8; 16]> {
     let hex: String = s.chars().filter(|c| *c != '-').collect();
