@@ -6,6 +6,8 @@ mod embed;
 mod embed_catalog;
 mod embedding_input;
 mod encryption;
+mod image;
+mod image_job;
 mod inference;
 #[cfg(feature = "inprocess")]
 mod inprocess;
@@ -142,6 +144,14 @@ enum Commands {
         /// Folder with the pinned Kokoro-82M-bf16 model files (Grid speech worker).
         #[arg(long)]
         tts_model_dir: Option<String>,
+
+        /// Python of the pinned mflux venv for the Grid image worker (flux2-klein-4b-q4).
+        #[arg(long)]
+        image_python: Option<String>,
+
+        /// Folder with the pinned flux2-klein-4b-mflux-q4 model files (Grid image worker).
+        #[arg(long)]
+        image_model_dir: Option<String>,
 
         /// System One sidecar base URL (for Laya/Jev-compatible typed decision models).
         /// When set without --model-path, the node advertises --model-name or convaiinnovations/laya.
@@ -329,6 +339,14 @@ enum ServiceAction {
         #[arg(long)]
         tts_model_dir: Option<String>,
 
+        /// Python of the pinned mflux venv for the Grid image worker (flux2-klein-4b-q4).
+        #[arg(long)]
+        image_python: Option<String>,
+
+        /// Folder with the pinned flux2-klein-4b-mflux-q4 model files (Grid image worker).
+        #[arg(long)]
+        image_model_dir: Option<String>,
+
         /// System One sidecar base URL (for Laya/Jev-compatible typed decision models).
         #[arg(long)]
         systemone_sidecar_url: Option<String>,
@@ -471,6 +489,8 @@ async fn main() {
             stt_smoke_dir,
             tts_python,
             tts_model_dir,
+            image_python,
+            image_model_dir,
             systemone_sidecar_url,
             mmproj_path,
             image_max_tokens,
@@ -521,6 +541,8 @@ async fn main() {
                 stt_smoke_dir.as_deref(),
                 tts_python.as_deref(),
                 tts_model_dir.as_deref(),
+                image_python.as_deref(),
+                image_model_dir.as_deref(),
                 systemone_sidecar_url.as_deref(),
                 mmproj_path.as_deref(),
                 image_max_tokens,
@@ -618,6 +640,8 @@ async fn main() {
                     stt_smoke_dir,
                     tts_python,
                     tts_model_dir,
+                    image_python,
+                    image_model_dir,
                     systemone_sidecar_url,
                     mmproj_path,
                     image_max_tokens,
@@ -641,6 +665,8 @@ async fn main() {
                         stt_smoke_dir,
                         tts_python,
                         tts_model_dir,
+                        image_python,
+                        image_model_dir,
                         systemone_sidecar_url: systemone_sidecar_url.or_else(|| {
                             std::env::var("SGL_SYSTEMONE_SIDECAR_URL")
                                 .ok()

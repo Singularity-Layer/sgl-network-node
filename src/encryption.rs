@@ -150,6 +150,23 @@ pub fn unseal_input(
             parsed.client_response_pubkey,
         );
     }
+    // Image prompts: the same strict v2/base64 envelope, their own small cap, one lane only.
+    let image = payload.get("image_reservation").is_some();
+    if image {
+        if transcription || speech || multimodal {
+            return Err("ambiguous sealed media lane".into());
+        }
+        let parsed: TranscriptionEnvelope =
+            serde_json::from_value(enc.clone()).map_err(|_| "invalid image input envelope")?;
+        if parsed.algorithm != ALGO_V2 || parsed.encoding != "base64" {
+            return Err("invalid image input envelope".into());
+        }
+        let _ = (
+            parsed.ciphertext,
+            parsed.client_ephemeral_pubkey,
+            parsed.client_response_pubkey,
+        );
+    }
     let encoded_cap = if multimodal {
         32 * 1024 * 1024 + 256
     } else if transcription {
@@ -157,6 +174,8 @@ pub fn unseal_input(
         8 * 1024 * 1024 + 4096
     } else if speech {
         crate::tts::MAX_SEALED_INPUT.div_ceil(3) * 4
+    } else if image {
+        crate::image::MAX_SEALED_INPUT.div_ceil(3) * 4
     } else {
         MAX_SEALED_B58_LEN
     };
@@ -202,6 +221,9 @@ pub fn unseal_input(
     if speech && ciphertext.len() > crate::tts::MAX_SEALED_INPUT {
         return Err("speech ciphertext exceeds decoded limit".into());
     }
+    if image && ciphertext.len() > crate::image::MAX_SEALED_INPUT {
+        return Err("image ciphertext exceeds decoded limit".into());
+    }
     let ephemeral = bs58_to_32(ephemeral_b58)?;
     let response_pub = bs58_to_32(response_b58)?;
 
@@ -237,6 +259,9 @@ pub fn unseal_input(
     }
     if speech && inner.get("protocol").and_then(|v| v.as_str()) != Some(crate::tts::PROTOCOL) {
         return Err("sealed speech protocol mismatch".into());
+    }
+    if image && inner.get("protocol").and_then(|v| v.as_str()) != Some(crate::image::PROTOCOL) {
+        return Err("sealed image protocol mismatch".into());
     }
     Ok((inner, Some(response_pub), version))
 }

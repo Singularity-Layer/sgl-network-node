@@ -333,6 +333,10 @@ pub struct InferenceEngineConfig {
     pub tts_python: Option<PathBuf>,
     /// Local folder holding the pinned Kokoro-82M-bf16 files.
     pub tts_model_dir: Option<PathBuf>,
+    /// Interpreter of the pinned mflux venv for the Grid image worker.
+    pub image_python: Option<PathBuf>,
+    /// Local folder holding the pinned flux2-klein-4b-mflux-q4 files.
+    pub image_model_dir: Option<PathBuf>,
     /// Explicit, pinned llama-server contract. When present, discovery is disabled.
     pub llama_server: Option<ExplicitLlamaServer>,
     pub model_path: PathBuf,
@@ -692,6 +696,9 @@ impl ServerEngine {
         }
         if crate::tts::is_speech_model(&self.config.model_name) {
             return Err("speech models cannot run in llama.cpp".into());
+        }
+        if crate::image::is_image_model(&self.config.model_name) {
+            return Err("image models cannot run in llama.cpp".into());
         }
         // Non-reentrant: kill any existing child first so a second start() (or a manual
         // call) can never orphan a running llama-server. No-op on the initial start.
@@ -1366,6 +1373,7 @@ pub enum InferenceEngine {
     MultimodalEmbed(crate::eg2::Eg2Engine),
     Stt(Box<crate::stt::SttEngine>),
     Tts(Box<crate::tts::TtsEngine>),
+    Image(Box<crate::image::ImageEngine>),
     Server(ServerEngine),
     #[cfg(feature = "inprocess")]
     InProcess(crate::inprocess::InProcessEngine),
@@ -1394,6 +1402,7 @@ impl InferenceEngine {
             InferenceEngine::MultimodalEmbed(_) => "embedding-worker",
             InferenceEngine::Stt(_) => "stt-worker",
             InferenceEngine::Tts(_) => "tts-worker",
+            InferenceEngine::Image(_) => crate::image::ENGINE_LABEL,
             InferenceEngine::Server(_) => "server",
             #[cfg(feature = "inprocess")]
             InferenceEngine::InProcess(_) => "inprocess",
@@ -1416,6 +1425,7 @@ impl InferenceEngine {
             InferenceEngine::MultimodalEmbed(_) => "metal",
             InferenceEngine::Stt(_) => "unknown",
             InferenceEngine::Tts(_) => "metal",
+            InferenceEngine::Image(_) => "metal",
             InferenceEngine::Server(e) => *e.accelerator.lock().unwrap_or_else(|p| p.into_inner()),
             #[cfg(feature = "inprocess")]
             _ => crate::telemetry::inprocess_accelerator(gpu_layers),
@@ -1431,6 +1441,7 @@ impl InferenceEngine {
             if crate::embed_catalog::is_embedding_model(&config.model_name)
                 || crate::stt::is_stt_model(&config.model_name)
                 || crate::tts::is_speech_model(&config.model_name)
+                || crate::image::is_image_model(&config.model_name)
             {
                 return Err(
                     "a pinned llama-server cannot be used with an embedding or voice worker"
@@ -1479,6 +1490,18 @@ impl InferenceEngine {
             return crate::tts::TtsEngine::production(tts_model, model_dir, python)
                 .await
                 .map(|engine| InferenceEngine::Tts(Box::new(engine)));
+        }
+        // Text-to-image (Grid image) gets its own supervised mflux worker, also before llama.cpp.
+        if crate::image::is_image_model(&config.model_name) {
+            let model_dir = config.image_model_dir.as_deref().ok_or(
+                "image generation requires --image-model-dir pointing at the pinned model folder",
+            )?;
+            let python = config.image_python.as_deref().ok_or(
+                "image generation requires --image-python pointing at the pinned mflux venv interpreter",
+            )?;
+            return crate::image::ImageEngine::production(model_dir, python)
+                .await
+                .map(|engine| InferenceEngine::Image(Box::new(engine)));
         }
         // Embedding models get the dedicated pooling engine regardless of `--engine` (they can't
         // run through the chat path). Only available on an `inprocess` build.
@@ -1551,6 +1574,7 @@ impl InferenceEngine {
             InferenceEngine::MultimodalEmbed(e) => e.is_healthy(),
             InferenceEngine::Stt(e) => e.is_healthy(),
             InferenceEngine::Tts(e) => e.is_healthy(),
+            InferenceEngine::Image(e) => e.is_healthy(),
             InferenceEngine::Server(e) => e.is_healthy().await,
             #[cfg(feature = "inprocess")]
             InferenceEngine::InProcess(e) => e.is_healthy(),
@@ -1567,6 +1591,7 @@ impl InferenceEngine {
             InferenceEngine::MultimodalEmbed(_) => false,
             InferenceEngine::Stt(_) => false,
             InferenceEngine::Tts(_) => false,
+            InferenceEngine::Image(_) => false,
             InferenceEngine::Server(_) => false,
             #[cfg(feature = "inprocess")]
             InferenceEngine::InProcess(e) => e.backend_failed(),
@@ -1581,6 +1606,7 @@ impl InferenceEngine {
             InferenceEngine::MultimodalEmbed(_) => true,
             InferenceEngine::Stt(_) => false,
             InferenceEngine::Tts(_) => false,
+            InferenceEngine::Image(_) => false,
             // Server engine in --embedding mode (the non-`inprocess`/Windows path).
             InferenceEngine::Server(e) => e.is_embedding(),
             #[cfg(feature = "inprocess")]
@@ -1599,6 +1625,7 @@ impl InferenceEngine {
             InferenceEngine::MultimodalEmbed(_) => false,
             InferenceEngine::Stt(_) => false,
             InferenceEngine::Tts(_) => false,
+            InferenceEngine::Image(_) => false,
             InferenceEngine::Server(e) => e.is_vision(),
             #[cfg(all(feature = "inprocess", feature = "vision"))]
             InferenceEngine::InProcess(e) => e.is_vision(),
@@ -1620,6 +1647,7 @@ impl InferenceEngine {
             InferenceEngine::MultimodalEmbed(_) => false,
             InferenceEngine::Stt(_) => false,
             InferenceEngine::Tts(_) => false,
+            InferenceEngine::Image(_) => false,
             InferenceEngine::Server(e) => !e.is_embedding(),
             #[cfg(all(feature = "inprocess", feature = "vision"))]
             InferenceEngine::InProcess(e) => e.tool_format().supports_tools(),
@@ -1637,6 +1665,7 @@ impl InferenceEngine {
             InferenceEngine::MultimodalEmbed(e) => e.capabilities().map(|c| c.embedding_dim),
             InferenceEngine::Stt(_) => None,
             InferenceEngine::Tts(_) => None,
+            InferenceEngine::Image(_) => None,
             InferenceEngine::Server(e) => e.embedding_dim(),
             #[cfg(feature = "inprocess")]
             InferenceEngine::Embed(e) => Some(e.dim()),
@@ -1696,6 +1725,23 @@ impl InferenceEngine {
         }
     }
 
+    pub fn image_snapshot(&self, models: &[String]) -> Option<crate::image::ReadinessSnapshot> {
+        match self {
+            Self::Image(e) => Some(e.readiness_snapshot(models)),
+            _ => None,
+        }
+    }
+
+    pub async fn generate_image(
+        &self,
+        request: crate::image::ImageRequest,
+    ) -> Result<crate::image::ImageOutput, String> {
+        match self {
+            Self::Image(e) => e.generate(request).await,
+            _ => Err("image_runtime_failed".into()),
+        }
+    }
+
     pub async fn speak(
         &self,
         request: crate::tts::SpeechRequest,
@@ -1733,6 +1779,7 @@ impl InferenceEngine {
             InferenceEngine::MultimodalEmbed(e) => e.stop(),
             InferenceEngine::Stt(e) => e.stop(),
             InferenceEngine::Tts(e) => e.stop(),
+            InferenceEngine::Image(e) => e.stop(),
             InferenceEngine::Server(e) => e.stop(),
             #[cfg(feature = "inprocess")]
             InferenceEngine::InProcess(_) => { /* worker stops when the engine is dropped */ }
@@ -1755,6 +1802,7 @@ impl InferenceEngine {
             }
             InferenceEngine::Stt(_) => Err("this node is a transcription node".into()),
             InferenceEngine::Tts(_) => Err("this node is a speech node".into()),
+            InferenceEngine::Image(_) => Err("this node is an image node".into()),
             InferenceEngine::Server(e) => e.embed(inputs, input_type, dimensions).await,
             #[cfg(feature = "inprocess")]
             InferenceEngine::Embed(e) => e.embed(inputs, input_type, dimensions).await,
@@ -1768,6 +1816,7 @@ impl InferenceEngine {
             InferenceEngine::MultimodalEmbed(e) => e.restart().await,
             InferenceEngine::Stt(e) => e.restart().await,
             InferenceEngine::Tts(e) => e.restart().await,
+            InferenceEngine::Image(e) => e.restart().await,
             InferenceEngine::Server(e) => e.restart().await,
             // In-process: there is no child process to restart — the engine IS this process,
             // and a wedged native llama.cpp call can never be recovered from Rust. The node
@@ -1804,6 +1853,7 @@ impl InferenceEngine {
             InferenceEngine::MultimodalEmbed(_) => self.restart().await,
             InferenceEngine::Stt(_) => self.restart().await,
             InferenceEngine::Tts(_) => self.restart().await,
+            InferenceEngine::Image(_) => self.restart().await,
             InferenceEngine::Server(e) => e.restart_no_swap().await,
             #[cfg(feature = "inprocess")]
             InferenceEngine::InProcess(_) => self.restart().await,
@@ -1828,6 +1878,9 @@ impl InferenceEngine {
                 Err("this node serves transcription, not chat completions".into())
             }
             InferenceEngine::Tts(_) => Err("this node serves speech, not chat completions".into()),
+            InferenceEngine::Image(_) => {
+                Err("this node serves images, not chat completions".into())
+            }
             InferenceEngine::Server(e) => {
                 e.chat_completion(messages, temperature, max_tokens, tools, tool_choice)
                     .await
@@ -1891,6 +1944,9 @@ impl InferenceEngine {
                 Err("this node serves transcription, not chat completions".into())
             }
             InferenceEngine::Tts(_) => Err("this node serves speech, not chat completions".into()),
+            InferenceEngine::Image(_) => {
+                Err("this node serves images, not chat completions".into())
+            }
             InferenceEngine::Server(e) => {
                 e.chat_completion_stream(messages, tools, tool_choice, temperature, max_tokens, tx)
                     .await
@@ -2116,6 +2172,8 @@ mod explicit_llama_server_tests {
             gpu_layers: 0,
             tts_python: None,
             tts_model_dir: None,
+            image_python: None,
+            image_model_dir: None,
             context_size: 4096,
             batch_size: 1,
             parallel_slots: 1,

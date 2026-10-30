@@ -5,6 +5,7 @@
 
 pub mod eg2;
 pub mod embedding_input;
+pub mod image;
 pub mod stt;
 pub mod tts;
 

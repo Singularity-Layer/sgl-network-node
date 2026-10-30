@@ -1125,6 +1125,8 @@ pub async fn start(
     stt_smoke_dir: Option<&str>,
     tts_python: Option<&str>,
     tts_model_dir: Option<&str>,
+    image_python: Option<&str>,
+    image_model_dir: Option<&str>,
     systemone_sidecar_url: Option<&str>,
     mmproj_path: Option<&str>,
     image_max_tokens: Option<u32>,
@@ -1205,11 +1207,13 @@ pub async fn start(
 
     // A speech node has no single model file: its pinned folder doubles as the model path,
     // so `--model-name kokoro-82m --tts-python .. --tts-model-dir ..` is enough.
-    let model_path = model_path.or(
-        model_name
+    let model_path = model_path
+        .or(model_name
             .filter(|n| crate::tts::is_speech_model(n))
-            .and(tts_model_dir),
-    );
+            .and(tts_model_dir))
+        .or(model_name
+            .filter(|n| crate::image::is_image_model(n))
+            .and(image_model_dir));
     if let Some(path) = model_path {
         let name = model_name.map(|s| s.to_string()).unwrap_or_else(|| {
             Path::new(path)
@@ -1328,10 +1332,14 @@ pub async fn start(
         if crate::embed_catalog::is_multimodal_embedding_model(&name)
             || crate::stt::is_stt_model(&name)
             || crate::tts::is_speech_model(&name)
+            || crate::image::is_image_model(&name)
         {
             effective_slots = 1;
         }
         wedge_ms = wedge_timeout_ms(&model_pb);
+        if crate::image::is_image_model(&name) {
+            wedge_ms = wedge_ms.max(crate::image::WEDGE_MS);
+        }
         // llama-server divides its total `-c` across slots, so pass slots × context_size
         // to keep each slot at the operator's configured per-request context.
         let per_slot_ctx = if gguf_systemone {
@@ -1357,6 +1365,8 @@ pub async fn start(
             stt_smoke_dir: stt_smoke_dir.map(PathBuf::from),
             tts_python: tts_python.map(PathBuf::from),
             tts_model_dir: tts_model_dir.map(PathBuf::from),
+            image_python: image_python.map(PathBuf::from),
+            image_model_dir: image_model_dir.map(PathBuf::from),
             model_path: model_pb,
             model_name: name.clone(),
             port: inference_port,
@@ -1583,13 +1593,30 @@ pub async fn start(
                         "max_concurrent_jobs":1})
                 }) as Arc<dyn Fn() -> serde_json::Value + Send + Sync>
             });
+        let image_heartbeat = engine
+            .as_ref()
+            .filter(|e| e.mode_label() == crate::image::ENGINE_LABEL)
+            .map(|eng| {
+                crate::image_job::ws_heartbeat(
+                    eng.clone(),
+                    models.clone(),
+                    node_enc_pubkey.clone(),
+                    keybind_sig.clone(),
+                    key_version_opt,
+                    rc.load_factor(),
+                    Arc::clone(&active_jobs),
+                )
+            });
         tokio::spawn(async move {
             crate::ws::run(
                 base,
                 node_id,
                 client_ws,
                 st,
-                stt_heartbeat.or(tts_heartbeat).or(embedding_heartbeat),
+                stt_heartbeat
+                    .or(tts_heartbeat)
+                    .or(image_heartbeat)
+                    .or(embedding_heartbeat),
                 move |job| {
                     maybe_spawn_job(
                         job,
@@ -1682,6 +1709,11 @@ pub async fn start(
         .is_some_and(|e| e.mode_label() == "tts-worker")
     {
         Some("speech")
+    } else if engine
+        .as_ref()
+        .is_some_and(|e| e.mode_label() == crate::image::ENGINE_LABEL)
+    {
+        Some("image")
     } else if embed_dim.is_some() {
         Some("embedding")
     } else {
@@ -1943,6 +1975,7 @@ pub async fn start(
                 } else if eng.mode_label() == "embedding-worker"
                     || eng.mode_label() == "stt-worker"
                     || eng.mode_label() == "tts-worker"
+                    || eng.mode_label() == crate::image::ENGINE_LABEL
                 {
                     Vec::new() // dedicated worker readiness has no transient grace period
                 } else {
@@ -1983,11 +2016,25 @@ pub async fn start(
                     key_version_opt,
                 )
             });
+        let image_snapshot = engine.as_ref().and_then(|e| e.image_snapshot(&models));
+        let image_capabilities = image_snapshot
+            .as_ref()
+            .and_then(|s| s.capabilities.clone())
+            .map(|c| {
+                c.bind_heartbeat(
+                    1u32.saturating_sub(active_jobs.load(Ordering::Relaxed)),
+                    &node_enc_pubkey,
+                    keybind_sig.as_deref(),
+                    key_version_opt,
+                )
+            });
         let advertised: Vec<String> = if let Some(snapshot) = embedding_snapshot {
             snapshot.available_models
         } else if let Some(snapshot) = stt_snapshot {
             snapshot.available_models
         } else if let Some(snapshot) = tts_snapshot {
+            snapshot.available_models
+        } else if let Some(snapshot) = image_snapshot {
             snapshot.available_models
         } else if empty_quarantined {
             Vec::new()
@@ -2017,6 +2064,11 @@ pub async fn start(
                 t.runtime = crate::tts::RUNTIME;
             }
         }
+        if node_engine == Some(crate::image::ENGINE_LABEL) {
+            if let Some(t) = &mut heartbeat_telemetry {
+                t.runtime = crate::image::RUNTIME;
+            }
+        }
 
         match client
             .heartbeat(
@@ -2040,6 +2092,7 @@ pub async fn start(
                 embedding_capabilities,
                 stt_capabilities,
                 tts_capabilities,
+                image_capabilities,
             )
             .await
         {
@@ -2295,6 +2348,9 @@ async fn process_job(
     telemetry: &crate::telemetry::Telemetry,
 ) {
     tracing::info!("Processing job {} (type: {})", job.id, job.job_type);
+    if job.job_type == "image" {
+        return crate::image_job::process(client, engine, job, node_secret, telemetry).await;
+    }
 
     let transcription_reservation = if job.job_type == "transcription" {
         if job.model.as_deref().and_then(crate::stt::model_by_id).is_none() {
@@ -2600,7 +2656,7 @@ async fn process_job(
 /// The orchestrator verifies transcription completions in a distinct signature
 /// domain. Every other buffered encrypted result keeps the existing `sealed`
 /// domain for backward compatibility.
-fn sign_sealed_result_envelope(
+pub(crate) fn sign_sealed_result_envelope(
     node_secret: &[u8; 32],
     job_type: &str,
     job_id: &str,
@@ -2609,6 +2665,7 @@ fn sign_sealed_result_envelope(
     let kind = match job_type {
         "transcription" => "transcription",
         "speech" => "speech",
+        "image" => "image",
         _ => "sealed",
     };
     crate::crypto::sign_result_envelope(node_secret, job_id, kind, ciphertext)
