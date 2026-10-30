@@ -30,7 +30,7 @@ fn main() {
             return;
         }
     };
-    let min_os = env::var("MACOSX_DEPLOYMENT_TARGET").unwrap_or_else(|_| "12.0".to_string());
+    let min_os = env::var("MACOSX_DEPLOYMENT_TARGET").unwrap_or_else(|_| "11.0".to_string()); // = Rust's aarch64-apple-darwin default
     let lib = out.join("libsglenclave.a");
 
     let status = Command::new("xcrun")
