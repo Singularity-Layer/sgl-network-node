@@ -1465,6 +1465,14 @@ pub async fn start(
         }
     }
 
+    // Mac step 1 (2026-10-30): Secure Enclave identity key, made once and reported on every
+    // heartbeat. Record-only: None on any machine without an enclave, or on any failure, and
+    // the node serves exactly as before. Kill switch: SGL_SE_IDENTITY=0.
+    let se_identity = crate::se_identity::load_or_create(config_dir, &node_secret, &cfg.node_id);
+    if let Some(se) = &se_identity {
+        tracing::info!("Secure Enclave identity key: {}", se.public_key);
+    }
+
     // sha256 of the running binary, computed ONCE (reading the whole exe every
     // heartbeat would be wasteful — it can't change under a live process). Sent on
     // every heartbeat so the orchestrator tracks the build that's actually serving
@@ -2040,6 +2048,7 @@ pub async fn start(
                 embedding_capabilities,
                 stt_capabilities,
                 tts_capabilities,
+                se_identity.as_ref(),
             )
             .await
         {

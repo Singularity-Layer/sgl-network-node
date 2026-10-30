@@ -13,6 +13,7 @@ mod multimodal;
 mod node;
 mod orchestrator;
 mod runtime_hardening;
+mod se_identity;
 mod service;
 mod setup;
 mod stream_relay;

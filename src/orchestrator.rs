@@ -138,6 +138,15 @@ struct HeartbeatRequest {
     // coalescing, so a changing value would force a DB write every beat). See telemetry.rs.
     #[serde(skip_serializing_if = "Option::is_none")]
     telemetry: Option<crate::telemetry::HeartbeatTelemetry>,
+    // Mac step 1 (2026-10-30): Secure Enclave identity key + its two bind signatures (see
+    // se_identity.rs). Record-only on the orchestrator; omitted entirely when absent, so an
+    // orchestrator that does not know these fields ignores them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    se_public_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    se_bind_signature: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    se_bind_ed25519_signature: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -493,6 +502,7 @@ impl OrchestratorClient {
         embedding: Option<crate::eg2::Capabilities>,
         stt: Option<crate::stt::Capabilities>,
         tts: Option<crate::tts::Capabilities>,
+        se: Option<&crate::se_identity::SeIdentity>,
     ) -> Result<HeartbeatResponse, String> {
         let url = format!("{}/grid/nodes/heartbeat", self.base_url);
         let token = self.get_token()?;
@@ -532,6 +542,9 @@ impl OrchestratorClient {
             binary_hash,
             max_concurrent_jobs,
             telemetry,
+            se_public_key: se.map(|s| s.public_key.clone()),
+            se_bind_signature: se.map(|s| s.bind_signature.clone()),
+            se_bind_ed25519_signature: se.map(|s| s.bind_ed25519_signature.clone()),
         };
 
         let resp = self
@@ -934,6 +947,10 @@ mod heartbeat_wire_tests {
             binary_hash: None,
             max_concurrent_jobs: 2,
             telemetry,
+            // None: the key list below also proves these are omitted when absent.
+            se_public_key: None,
+            se_bind_signature: None,
+            se_bind_ed25519_signature: None,
         })
         .unwrap()
     }
