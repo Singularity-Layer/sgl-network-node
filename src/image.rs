@@ -49,10 +49,15 @@ const MAX_WORKER_INPUT_FRAME: usize = 8 * 1024;
 const MAX_OUTPUT_FRAME: u64 = 8 * 1024 * 1024 + 64 * 1024;
 const REPLAY_CACHE_SIZE: usize = 65_536;
 const REPLAY_WINDOW: Duration = Duration::from_secs(24 * 60 * 60);
-/// Crash-loop guard: at most this many non-timeout restarts in any rolling hour. A worker
-/// killed because one request ran past REQUEST_TIMEOUT is relaunched outside this budget, so a
-/// few slow jobs can never leave the node permanently de-advertised.
+/// Crash-loop guard: at most this many non-timeout restarts in any rolling hour.
 const MAX_RESTARTS_PER_WINDOW: usize = 3;
+/// A worker killed because a request ran past REQUEST_TIMEOUT has its own, separate budget, so
+/// a few slow jobs never spend the crash budget and never strand the node de-advertised...
+const MAX_TIMEOUT_RELAUNCHES_PER_WINDOW: usize = 6;
+/// ...but a worker that passes its smoke image and then hangs on every real request is parked
+/// (stays de-advertised until the node process restarts) after this many consecutive timeouts
+/// with no successful image in between.
+const MAX_CONSECUTIVE_TIMEOUTS: u32 = 3;
 const RESTART_WINDOW: Duration = Duration::from_secs(60 * 60);
 const TIMED_OUT: &str = "image worker timed out";
 const INPUT_TIMED_OUT: &str = "image worker input timed out";
@@ -542,9 +547,10 @@ struct Job {
     reply: tokio::sync::oneshot::Sender<Result<ImageOutput, String>>,
 }
 
-/// Request ids this node has already SERVED (24 h window) plus the ones in flight. An id is
-/// recorded as served only after a successful generation, so a runtime failure or a timeout
-/// never turns the client's retry into a false replay.
+/// Request ids this node has already SERVED (24 h window) plus the ones in flight. Defence in
+/// depth only: node.rs `SeenJobs` already refuses a re-delivered job id, so a failed job is not
+/// retried on this node today. An id is recorded as served only after a successful generation,
+/// so if a failed id ever does reach the engine again it is not misreported as a replay.
 struct SeenRequestIds {
     set: std::collections::HashSet<String>,
     order: std::collections::VecDeque<(String, Instant)>,
@@ -617,15 +623,19 @@ impl Drop for ReplayClaim<'_> {
     }
 }
 
-/// Rolling-window crash-loop budget. Records the restart when it is allowed.
-fn restart_allowed(history: &mut std::collections::VecDeque<Instant>, now: Instant) -> bool {
+/// Rolling-window restart budget. Records the restart when it is allowed.
+fn restart_allowed(
+    history: &mut std::collections::VecDeque<Instant>,
+    now: Instant,
+    max: usize,
+) -> bool {
     while history
         .front()
         .is_some_and(|at| now.duration_since(*at) >= RESTART_WINDOW)
     {
         history.pop_front();
     }
-    if history.len() >= MAX_RESTARTS_PER_WINDOW {
+    if history.len() >= max {
         return false;
     }
     history.push_back(now);
@@ -637,6 +647,10 @@ pub struct ImageEngine {
     config: WorkerConfig,
     restart_lock: tokio::sync::Mutex<()>,
     restart_history: Mutex<std::collections::VecDeque<Instant>>,
+    timeout_history: Mutex<std::collections::VecDeque<Instant>>,
+    consecutive_timeouts: std::sync::atomic::AtomicU32,
+    /// Hung on every real request: never relaunched again in this process.
+    parked: AtomicBool,
     /// Set by the supervisor when the last fault was a request timeout.
     timed_out: Arc<AtomicBool>,
     assets: Option<PrivateWorkerTemp>,
@@ -675,6 +689,9 @@ impl ImageEngine {
             config: saved_config,
             restart_lock: tokio::sync::Mutex::new(()),
             restart_history: Mutex::new(std::collections::VecDeque::new()),
+            timeout_history: Mutex::new(std::collections::VecDeque::new()),
+            consecutive_timeouts: std::sync::atomic::AtomicU32::new(0),
+            parked: AtomicBool::new(false),
             timed_out,
             assets: None,
             healthy,
@@ -740,21 +757,32 @@ impl ImageEngine {
         Ok(engine)
     }
 
-    /// Relaunch the worker. A worker killed for running past REQUEST_TIMEOUT is always
-    /// relaunched; any other fault spends the rolling crash-loop budget (3 per hour). A
-    /// successful relaunch repeats all startup checks.
+    /// Relaunch the worker. A worker killed for running past REQUEST_TIMEOUT spends the timeout
+    /// budget (6 per rolling hour) and is parked after 3 consecutive timeouts with no
+    /// successful image in between; any other fault spends the crash budget (3 per rolling
+    /// hour). A successful relaunch repeats all startup checks.
     pub async fn restart(&self) -> Result<(), String> {
         let _guard = self.restart_lock.lock().await;
+        if self.parked.load(Ordering::Acquire) {
+            return Err("image worker parked: it timed out on every request".into());
+        }
         let after_timeout = self.timed_out.swap(false, Ordering::AcqRel);
-        if !after_timeout
-            && !restart_allowed(
-                &mut self
-                    .restart_history
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner()),
-                Instant::now(),
-            )
-        {
+        let (history, max) = if after_timeout {
+            let consecutive = self.consecutive_timeouts.fetch_add(1, Ordering::AcqRel) + 1;
+            if consecutive >= MAX_CONSECUTIVE_TIMEOUTS {
+                self.parked.store(true, Ordering::Release);
+                self.stop();
+                return Err("image worker parked: it timed out on every request".into());
+            }
+            (&self.timeout_history, MAX_TIMEOUT_RELAUNCHES_PER_WINDOW)
+        } else {
+            (&self.restart_history, MAX_RESTARTS_PER_WINDOW)
+        };
+        if !restart_allowed(
+            &mut history.lock().unwrap_or_else(|p| p.into_inner()),
+            Instant::now(),
+            max,
+        ) {
             return Err("image worker restart budget exhausted for this hour".into());
         }
         self.stop();
@@ -835,6 +863,9 @@ impl ImageEngine {
         };
         let result = self.dispatch(request).await;
         claim.served = result.is_ok();
+        if result.is_ok() {
+            self.consecutive_timeouts.store(0, Ordering::Release);
+        }
         result
     }
 
@@ -1926,38 +1957,68 @@ mod tests {
     fn restart_budget_is_per_rolling_hour() {
         let mut history = std::collections::VecDeque::new();
         let t0 = Instant::now();
-        for i in 0..MAX_RESTARTS_PER_WINDOW as u64 {
-            assert!(restart_allowed(&mut history, t0 + Duration::from_secs(i)));
+        for i in 0..3 {
+            assert!(restart_allowed(
+                &mut history,
+                t0 + Duration::from_secs(i),
+                3
+            ));
         }
-        assert!(!restart_allowed(&mut history, t0 + Duration::from_secs(60)));
+        assert!(!restart_allowed(
+            &mut history,
+            t0 + Duration::from_secs(60),
+            3
+        ));
         assert!(
-            restart_allowed(&mut history, t0 + RESTART_WINDOW + Duration::from_secs(1)),
+            restart_allowed(
+                &mut history,
+                t0 + RESTART_WINDOW + Duration::from_secs(1),
+                3
+            ),
             "the budget refills after an hour"
         );
     }
 
     #[tokio::test]
-    async fn timeouts_relaunch_outside_the_budget_and_keep_the_id_retryable() {
-        // hang_always: every request times out. Four timeouts in a row (more than the budget
-        // of 3) must all relaunch, so slow jobs never strand the node de-advertised.
+    async fn timeouts_relaunch_outside_the_crash_budget_then_park() {
+        // hang_always passes its smoke image and then hangs on every real request.
         let (mut config, _assets) = fake_worker("hang_always");
         config.request_timeout = Duration::from_millis(1500);
         let engine = ImageEngine::start(config).await.unwrap();
         let request = ImageRequest::parse(&canonical("a red fox", 1024, 1024, Some(7))).unwrap();
-        for round in 0..4 {
+        let models = vec![MODEL_ID.to_string()];
+        for round in 1..MAX_CONSECUTIVE_TIMEOUTS {
             assert_eq!(
                 engine.generate(request.clone()).await.unwrap_err(),
                 "image_runtime_failed",
-                "round {round}: a timeout is a runtime failure, never a replay"
+                "round {round}: a timeout is a runtime failure"
             );
             assert!(!engine.is_healthy());
             engine
                 .restart()
                 .await
-                .expect("timeout relaunch is outside the budget");
+                .expect("a timeout relaunch does not spend the crash budget");
             assert!(engine.is_healthy());
         }
-        // Non-timeout faults still spend the rolling budget.
+        // The third consecutive timeout parks the worker: no relaunch, never advertised again,
+        // and later restart attempts (the node health loop keeps asking) are refused.
+        assert_eq!(
+            engine.generate(request.clone()).await.unwrap_err(),
+            "image_runtime_failed"
+        );
+        assert!(engine.restart().await.unwrap_err().contains("parked"));
+        assert!(!engine.is_healthy());
+        assert!(engine
+            .readiness_snapshot(&models)
+            .available_models
+            .is_empty());
+        assert!(engine.restart().await.unwrap_err().contains("parked"));
+    }
+
+    #[tokio::test]
+    async fn crash_restarts_spend_their_own_rolling_budget() {
+        let (config, _assets) = fake_worker("ok");
+        let engine = ImageEngine::start(config).await.unwrap();
         for _ in 0..MAX_RESTARTS_PER_WINDOW {
             engine.restart().await.unwrap();
         }
@@ -1965,7 +2026,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn retry_after_a_timeout_is_served_not_called_a_replay() {
+    async fn engine_replay_guard_does_not_mark_failed_ids() {
+        // Defence in depth: node.rs SeenJobs refuses a re-delivered job id before it reaches
+        // the engine. If one ever does, a failed id is generated, not misreported as a replay.
         let (mut config, assets) = fake_worker("hang_first");
         config.request_timeout = Duration::from_millis(1500);
         let engine = ImageEngine::start(config).await.unwrap();
