@@ -49,18 +49,25 @@ const MAX_WORKER_INPUT_FRAME: usize = 8 * 1024;
 const MAX_OUTPUT_FRAME: u64 = 8 * 1024 * 1024 + 64 * 1024;
 const REPLAY_CACHE_SIZE: usize = 65_536;
 const REPLAY_WINDOW: Duration = Duration::from_secs(24 * 60 * 60);
+/// Crash-loop guard: at most this many non-timeout restarts in any rolling hour. A worker
+/// killed because one request ran past REQUEST_TIMEOUT is relaunched outside this budget, so a
+/// few slow jobs can never leave the node permanently de-advertised.
+const MAX_RESTARTS_PER_WINDOW: usize = 3;
+const RESTART_WINDOW: Duration = Duration::from_secs(60 * 60);
+const TIMED_OUT: &str = "image worker timed out";
+const INPUT_TIMED_OUT: &str = "image worker input timed out";
 
 /// One generation, worker side.
-pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
+pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(420);
 /// Covers the worker's own re-hash of ~4.6 GB of weights, the model load and the smoke image.
-pub const STARTUP_TIMEOUT: Duration = Duration::from_secs(300);
+pub const STARTUP_TIMEOUT: Duration = Duration::from_secs(420);
 /// Orchestrator default `IMAGE_JOB_TIMEOUT_SECONDS`: the reaper fails a job still dispatched
 /// after this long.
-pub const ORCHESTRATOR_JOB_TIMEOUT: Duration = Duration::from_secs(420);
+pub const ORCHESTRATOR_JOB_TIMEOUT: Duration = Duration::from_secs(600);
 /// The node gives up on a job (generation + every completion retry) after this long from
 /// receipt. Must stay below the reaper timeout minus 60 s so a late completion can never race
 /// the reaper's hold release.
-pub const NODE_DEADLINE: Duration = Duration::from_secs(350);
+pub const NODE_DEADLINE: Duration = Duration::from_secs(480);
 /// No completion attempt starts with less than this left before the node deadline: an 8 MB
 /// upload that cannot finish in time only adds load.
 pub const UPLOAD_MARGIN: Duration = Duration::from_secs(20);
@@ -71,7 +78,7 @@ const RETRY_BASE: Duration = Duration::from_secs(1);
 const RETRY_MAX: Duration = Duration::from_secs(16);
 /// Busy/no-progress watchdog threshold for an image node. Must exceed the node deadline, or the
 /// watchdog would restart a worker that is legitimately generating or uploading.
-pub const WEDGE_MS: u64 = 600_000;
+pub const WEDGE_MS: u64 = 720_000;
 
 const _: () = assert!(NODE_DEADLINE.as_secs() + 60 < ORCHESTRATOR_JOB_TIMEOUT.as_secs());
 const _: () =
@@ -535,9 +542,13 @@ struct Job {
     reply: tokio::sync::oneshot::Sender<Result<ImageOutput, String>>,
 }
 
+/// Request ids this node has already SERVED (24 h window) plus the ones in flight. An id is
+/// recorded as served only after a successful generation, so a runtime failure or a timeout
+/// never turns the client's retry into a false replay.
 struct SeenRequestIds {
     set: std::collections::HashSet<String>,
     order: std::collections::VecDeque<(String, Instant)>,
+    pending: std::collections::HashSet<String>,
 }
 
 impl SeenRequestIds {
@@ -545,11 +556,11 @@ impl SeenRequestIds {
         Self {
             set: std::collections::HashSet::new(),
             order: std::collections::VecDeque::new(),
+            pending: std::collections::HashSet::new(),
         }
     }
 
-    fn insert(&mut self, request_id: &str) -> bool {
-        let now = Instant::now();
+    fn expire(&mut self, now: Instant) {
         while self
             .order
             .front()
@@ -559,25 +570,75 @@ impl SeenRequestIds {
                 self.set.remove(&expired);
             }
         }
-        if self.set.contains(request_id) {
+    }
+
+    /// Claim an id for one generation. False when it was already served or is in flight.
+    fn begin(&mut self, request_id: &str) -> bool {
+        self.expire(Instant::now());
+        if self.set.contains(request_id) || self.pending.contains(request_id) {
             return false;
         }
+        self.pending.insert(request_id.to_string());
+        true
+    }
+
+    /// Release the claim; record the id as served only when the generation succeeded.
+    fn finish(&mut self, request_id: &str, served: bool) {
+        self.pending.remove(request_id);
+        if !served {
+            return;
+        }
+        let now = Instant::now();
+        self.expire(now);
         if self.order.len() >= REPLAY_CACHE_SIZE {
             if let Some((expired, _)) = self.order.pop_front() {
                 self.set.remove(&expired);
             }
         }
-        self.set.insert(request_id.to_string());
-        self.order.push_back((request_id.to_string(), now));
-        true
+        if self.set.insert(request_id.to_string()) {
+            self.order.push_back((request_id.to_string(), now));
+        }
     }
+}
+
+/// Releases a replay claim even when the generating future is dropped mid-flight.
+struct ReplayClaim<'a> {
+    seen: &'a Mutex<SeenRequestIds>,
+    request_id: String,
+    served: bool,
+}
+
+impl Drop for ReplayClaim<'_> {
+    fn drop(&mut self) {
+        self.seen
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .finish(&self.request_id, self.served);
+    }
+}
+
+/// Rolling-window crash-loop budget. Records the restart when it is allowed.
+fn restart_allowed(history: &mut std::collections::VecDeque<Instant>, now: Instant) -> bool {
+    while history
+        .front()
+        .is_some_and(|at| now.duration_since(*at) >= RESTART_WINDOW)
+    {
+        history.pop_front();
+    }
+    if history.len() >= MAX_RESTARTS_PER_WINDOW {
+        return false;
+    }
+    history.push_back(now);
+    true
 }
 
 pub struct ImageEngine {
     tx: Mutex<Option<mpsc::SyncSender<Job>>>,
     config: WorkerConfig,
     restart_lock: tokio::sync::Mutex<()>,
-    restarts: AtomicU64,
+    restart_history: Mutex<std::collections::VecDeque<Instant>>,
+    /// Set by the supervisor when the last fault was a request timeout.
+    timed_out: Arc<AtomicBool>,
     assets: Option<PrivateWorkerTemp>,
     healthy: Arc<AtomicBool>,
     stopped: Arc<AtomicBool>,
@@ -595,10 +656,11 @@ impl ImageEngine {
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
         let healthy = Arc::new(AtomicBool::new(false));
         let stopped = Arc::new(AtomicBool::new(false));
-        let (h, stop) = (healthy.clone(), stopped.clone());
+        let timed_out = Arc::new(AtomicBool::new(false));
+        let (h, stop, late) = (healthy.clone(), stopped.clone(), timed_out.clone());
         let handle = std::thread::Builder::new()
             .name("image-supervisor".into())
-            .spawn(move || supervise(config, rx, ready_tx, h, stop))
+            .spawn(move || supervise(config, rx, ready_tx, h, stop, late))
             .map_err(|_| "could not start image supervisor")?;
         let capabilities = match ready_rx.await {
             Ok(Ok(ready)) => ready,
@@ -612,7 +674,8 @@ impl ImageEngine {
             tx: Mutex::new(Some(tx)),
             config: saved_config,
             restart_lock: tokio::sync::Mutex::new(()),
-            restarts: AtomicU64::new(0),
+            restart_history: Mutex::new(std::collections::VecDeque::new()),
+            timed_out,
             assets: None,
             healthy,
             stopped,
@@ -677,21 +740,33 @@ impl ImageEngine {
         Ok(engine)
     }
 
-    /// Lifetime budget avoids crash loops. A successful relaunch repeats all startup checks.
+    /// Relaunch the worker. A worker killed for running past REQUEST_TIMEOUT is always
+    /// relaunched; any other fault spends the rolling crash-loop budget (3 per hour). A
+    /// successful relaunch repeats all startup checks.
     pub async fn restart(&self) -> Result<(), String> {
         let _guard = self.restart_lock.lock().await;
-        if self.restarts.fetch_add(1, Ordering::AcqRel) >= 3 {
-            return Err("image worker restart budget exhausted".into());
+        let after_timeout = self.timed_out.swap(false, Ordering::AcqRel);
+        if !after_timeout
+            && !restart_allowed(
+                &mut self
+                    .restart_history
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner()),
+                Instant::now(),
+            )
+        {
+            return Err("image worker restart budget exhausted for this hour".into());
         }
         self.stop();
         self.stopped.store(false, Ordering::Release);
         let (tx, rx) = mpsc::sync_channel(1);
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
         let (healthy, stopped) = (self.healthy.clone(), self.stopped.clone());
+        let late = self.timed_out.clone();
         let config = self.config.clone();
         let handle = std::thread::Builder::new()
             .name("image-supervisor".into())
-            .spawn(move || supervise(config, rx, ready_tx, healthy, stopped))
+            .spawn(move || supervise(config, rx, ready_tx, healthy, stopped, late))
             .map_err(|_| "could not restart image supervisor")?;
         *self.worker.lock().unwrap_or_else(|p| p.into_inner()) = Some(handle);
         match ready_rx.await {
@@ -749,10 +824,21 @@ impl ImageEngine {
             .seen_request_ids
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .insert(&request.request_id)
+            .begin(&request.request_id)
         {
             return Err("image_input_invalid".into());
         }
+        let mut claim = ReplayClaim {
+            seen: &self.seen_request_ids,
+            request_id: request.request_id.clone(),
+            served: false,
+        };
+        let result = self.dispatch(request).await;
+        claim.served = result.is_ok();
+        result
+    }
+
+    async fn dispatch(&self, request: ImageRequest) -> Result<ImageOutput, String> {
         let seed = request.seed.unwrap_or_else(rand::random::<u32>);
         let (reply, receive) = tokio::sync::oneshot::channel();
         let job = Job {
@@ -1004,6 +1090,7 @@ fn supervise(
     ready: tokio::sync::oneshot::Sender<Result<Capabilities, String>>,
     healthy: Arc<AtomicBool>,
     stopped: Arc<AtomicBool>,
+    timed_out: Arc<AtomicBool>,
 ) {
     let temporary = match PrivateWorkerTemp::create() {
         Ok(tmp) => tmp,
@@ -1093,7 +1180,10 @@ fn supervise(
         ) {
             Ok(output) => Ok(output),
             Err(WorkerFailure::InvalidInput) => Err("image_input_invalid".into()),
-            Err(WorkerFailure::Fatal(_reason)) => {
+            Err(WorkerFailure::Fatal(reason)) => {
+                if reason == TIMED_OUT || reason == INPUT_TIMED_OUT {
+                    timed_out.store(true, Ordering::Release);
+                }
                 healthy.store(false, Ordering::Release);
                 Err("image_runtime_failed".into())
             }
@@ -1139,7 +1229,7 @@ fn receive_frame(
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            return Err("image worker timed out".into());
+            return Err(TIMED_OUT.into());
         }
         match frames.recv_timeout(remaining.min(Duration::from_millis(25))) {
             Ok(frame) => return Ok(frame),
@@ -1218,7 +1308,7 @@ fn run_job(
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            return Err("image worker input timed out".into());
+            return Err(INPUT_TIMED_OUT.into());
         }
         match ack_rx.recv_timeout(remaining.min(Duration::from_millis(25))) {
             Ok(true) => break,
@@ -1787,9 +1877,10 @@ mod tests {
             Some((Duration::ZERO, COMPLETE_HTTP_TIMEOUT))
         );
         // Near the deadline the attempt timeout shrinks to what is left.
-        let (wait, timeout) = plan_completion_attempt(Duration::from_secs(300), 2).unwrap();
+        let late = NODE_DEADLINE - Duration::from_secs(50);
+        let (wait, timeout) = plan_completion_attempt(late, 2).unwrap();
         assert_eq!(wait, Duration::from_secs(2));
-        assert_eq!(timeout, NODE_DEADLINE - Duration::from_secs(302));
+        assert_eq!(timeout, Duration::from_secs(48));
         // No attempt starts inside the upload margin, or after the deadline.
         let edge = NODE_DEADLINE - UPLOAD_MARGIN;
         assert!(plan_completion_attempt(edge, 0).is_some());
@@ -1815,12 +1906,94 @@ mod tests {
     }
 
     #[test]
+    fn replay_claims_only_stick_after_success() {
+        let mut seen = SeenRequestIds::new();
+        assert!(seen.begin(RID));
+        assert!(
+            !seen.begin(RID),
+            "in flight: a concurrent duplicate is refused"
+        );
+        seen.finish(RID, false);
+        assert!(
+            seen.begin(RID),
+            "a failed generation leaves the id retryable"
+        );
+        seen.finish(RID, true);
+        assert!(!seen.begin(RID), "a served id is a replay");
+    }
+
+    #[test]
+    fn restart_budget_is_per_rolling_hour() {
+        let mut history = std::collections::VecDeque::new();
+        let t0 = Instant::now();
+        for i in 0..MAX_RESTARTS_PER_WINDOW as u64 {
+            assert!(restart_allowed(&mut history, t0 + Duration::from_secs(i)));
+        }
+        assert!(!restart_allowed(&mut history, t0 + Duration::from_secs(60)));
+        assert!(
+            restart_allowed(&mut history, t0 + RESTART_WINDOW + Duration::from_secs(1)),
+            "the budget refills after an hour"
+        );
+    }
+
+    #[tokio::test]
+    async fn timeouts_relaunch_outside_the_budget_and_keep_the_id_retryable() {
+        // hang_always: every request times out. Four timeouts in a row (more than the budget
+        // of 3) must all relaunch, so slow jobs never strand the node de-advertised.
+        let (mut config, _assets) = fake_worker("hang_always");
+        config.request_timeout = Duration::from_millis(1500);
+        let engine = ImageEngine::start(config).await.unwrap();
+        let request = ImageRequest::parse(&canonical("a red fox", 1024, 1024, Some(7))).unwrap();
+        for round in 0..4 {
+            assert_eq!(
+                engine.generate(request.clone()).await.unwrap_err(),
+                "image_runtime_failed",
+                "round {round}: a timeout is a runtime failure, never a replay"
+            );
+            assert!(!engine.is_healthy());
+            engine
+                .restart()
+                .await
+                .expect("timeout relaunch is outside the budget");
+            assert!(engine.is_healthy());
+        }
+        // Non-timeout faults still spend the rolling budget.
+        for _ in 0..MAX_RESTARTS_PER_WINDOW {
+            engine.restart().await.unwrap();
+        }
+        assert!(engine.restart().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn retry_after_a_timeout_is_served_not_called_a_replay() {
+        let (mut config, assets) = fake_worker("hang_first");
+        config.request_timeout = Duration::from_millis(1500);
+        let engine = ImageEngine::start(config).await.unwrap();
+        let request = ImageRequest::parse(&canonical("a red fox", 1024, 1024, Some(7))).unwrap();
+        assert_eq!(
+            engine.generate(request.clone()).await.unwrap_err(),
+            "image_runtime_failed"
+        );
+        engine.restart().await.unwrap();
+        assert!(assets.0.join(".fake-hung").exists());
+        let out = engine.generate(request.clone()).await.unwrap();
+        assert_eq!(png_dimensions(&out.png), Some((1024, 1024)));
+        assert_eq!(
+            engine.generate(request).await.unwrap_err(),
+            "image_input_invalid",
+            "once served, the same id is a replay"
+        );
+    }
+
+    #[test]
     fn deadlines_are_ordered() {
         assert!(NODE_DEADLINE.as_secs() < ORCHESTRATOR_JOB_TIMEOUT.as_secs() - 60);
         assert!(REQUEST_TIMEOUT < NODE_DEADLINE);
         assert!(WEDGE_MS > NODE_DEADLINE.as_millis() as u64);
-        assert_eq!(STARTUP_TIMEOUT, Duration::from_secs(300));
-        assert_eq!(REQUEST_TIMEOUT, Duration::from_secs(300));
+        assert_eq!(STARTUP_TIMEOUT, Duration::from_secs(420));
+        assert_eq!(REQUEST_TIMEOUT, Duration::from_secs(420));
+        assert_eq!(NODE_DEADLINE, Duration::from_secs(480));
+        assert_eq!(ORCHESTRATOR_JOB_TIMEOUT, Duration::from_secs(600));
     }
 
     #[test]

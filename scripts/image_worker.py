@@ -25,7 +25,8 @@ scheduler="flow_match_euler_discrete"); the PIL image is written as PNG.
 FAKE mode (tests only): SGL_IMAGE_WORKER_FAKE=<mode> skips the model and mflux entirely and
 answers with a tiny, valid, solid-colour PNG of the requested size. The Rust supervisor removes
 this variable from the environment of every production worker and refuses a `ready` frame that
-says `fake: true` unless the test harness asked for it. Modes: ok, invalid, lie, crash, hang.
+says `fake: true` unless the test harness asked for it. Modes: ok, invalid, lie, crash, hang,
+hang_always (alias of hang), hang_first (hangs once per model dir, then serves).
 """
 
 import argparse
@@ -201,11 +202,15 @@ class Engine:
 
 
 class FakeEngine:
-    def __init__(self, mode):
+    def __init__(self, mode, model_dir):
         self.mode = mode
+        self.marker = os.path.join(model_dir, ".fake-hung")
 
     def generate(self, prompt, width, height, seed):
-        if self.mode == "hang":
+        if self.mode in ("hang", "hang_always"):
+            time.sleep(3600)
+        if self.mode == "hang_first" and not os.path.exists(self.marker):
+            open(self.marker, "w").close()
             time.sleep(3600)
         if self.mode == "crash":
             fail("fake crash")
@@ -238,7 +243,7 @@ def main():
         with open(args.manifest, "r", encoding="utf-8") as f:
             manifest = json.load(f)
         digest = manifest_digest(manifest["files"])
-        engine = FakeEngine(FAKE)
+        engine = FakeEngine(FAKE, args.model_dir)
         smoke = solid_png(SMOKE_SIZE[0], SMOKE_SIZE[1], (1, 2, 3))
     else:
         model_dir = os.path.realpath(args.model_dir)
