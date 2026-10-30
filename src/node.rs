@@ -1468,7 +1468,27 @@ pub async fn start(
     // Mac step 1 (2026-10-30): Secure Enclave identity key, made once and reported on every
     // heartbeat. Record-only: None on any machine without an enclave, or on any failure, and
     // the node serves exactly as before. Kill switch: SGL_SE_IDENTITY=0.
-    let se_identity = crate::se_identity::load_or_create(config_dir, &node_secret, &cfg.node_id);
+    // Off the startup path with a hard deadline: a stalled Security service or file read must
+    // never keep a node from serving. On timeout it just runs without the key this session.
+    let se_identity = {
+        let dir = config_dir.to_path_buf();
+        let secret = node_secret;
+        let node_id = cfg.node_id.clone();
+        let task = tokio::task::spawn_blocking(move || {
+            crate::se_identity::load_or_create(&dir, &secret, &node_id)
+        });
+        match tokio::time::timeout(std::time::Duration::from_secs(5), task).await {
+            Ok(Ok(v)) => v,
+            Ok(Err(e)) => {
+                tracing::warn!("Secure Enclave identity task failed ({e}); continuing without it");
+                None
+            }
+            Err(_) => {
+                tracing::warn!("Secure Enclave identity timed out after 5s; continuing without it");
+                None
+            }
+        }
+    };
     if let Some(se) = &se_identity {
         tracing::info!("Secure Enclave identity key: {}", se.public_key);
     }
