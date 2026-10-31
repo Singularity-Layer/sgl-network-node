@@ -31,6 +31,8 @@ pub struct ServiceStartOptions {
     pub stt_smoke_dir: Option<String>,
     pub tts_python: Option<String>,
     pub tts_model_dir: Option<String>,
+    pub image_python: Option<String>,
+    pub image_model_dir: Option<String>,
     pub systemone_sidecar_url: Option<String>,
     /// Vision (multimodal) models: path to the mmproj GGUF, baked into the service so the
     /// background node serves images across restarts. None for text/embedding models.
@@ -96,6 +98,14 @@ impl ServiceStartOptions {
         }
         if let Some(dir) = &self.tts_model_dir {
             args.push("--tts-model-dir".into());
+            args.push(dir.clone());
+        }
+        if let Some(python) = &self.image_python {
+            args.push("--image-python".into());
+            args.push(python.clone());
+        }
+        if let Some(dir) = &self.image_model_dir {
+            args.push("--image-model-dir".into());
             args.push(dir.clone());
         }
         if let Some(url) = &self.systemone_sidecar_url {
@@ -825,6 +835,8 @@ mod embedding_service_tests {
             stt_smoke_dir: None,
             tts_python: None,
             tts_model_dir: None,
+            image_python: None,
+            image_model_dir: None,
             systemone_sidecar_url: None,
             mmproj_path: None,
             image_max_tokens: None,
@@ -875,6 +887,8 @@ mod embedding_service_tests {
             stt_smoke_dir: Some("/owned/stt/approved-smoke".into()),
             tts_python: None,
             tts_model_dir: None,
+            image_python: None,
+            image_model_dir: None,
             systemone_sidecar_url: None,
             mmproj_path: None,
             image_max_tokens: None,

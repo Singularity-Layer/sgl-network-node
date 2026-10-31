@@ -148,6 +148,8 @@ struct NodeCapabilities {
     stt: Option<crate::stt::Capabilities>,
     #[serde(rename = "speech", skip_serializing_if = "Option::is_none")]
     tts: Option<crate::tts::Capabilities>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    image: Option<crate::image::Capabilities>,
     streaming: bool,
     // This build forwards `tools` on the STREAM path and emits tool-call deltas. A routing
     // hint only — correctness comes from the per-chunk `fmt` tag, so a stale value here can
@@ -182,6 +184,7 @@ fn eg2_capabilities(embedding: Option<crate::eg2::Capabilities>) -> NodeCapabili
         embedding,
         stt: None,
         tts: None,
+        image: None,
         streaming: false,
         streaming_tools: false,
         context_size: 8192,
@@ -203,6 +206,7 @@ fn stt_node_capabilities(stt: Option<crate::stt::Capabilities>) -> NodeCapabilit
         embedding: None,
         stt,
         tts: None,
+        image: None,
         streaming: false,
         streaming_tools: false,
         context_size: 0,
@@ -219,6 +223,7 @@ fn tts_node_capabilities(tts: Option<crate::tts::Capabilities>) -> NodeCapabilit
         embedding: None,
         stt: None,
         tts,
+        image: None,
         streaming: false,
         streaming_tools: false,
         context_size: 0,
@@ -229,6 +234,29 @@ fn tts_node_capabilities(tts: Option<crate::tts::Capabilities>) -> NodeCapabilit
     }
 }
 
+fn image_node_capabilities(image: Option<crate::image::Capabilities>) -> NodeCapabilities {
+    let ready = image.is_some();
+    NodeCapabilities {
+        embedding: None,
+        stt: None,
+        tts: None,
+        image,
+        streaming: false,
+        streaming_tools: false,
+        context_size: 0,
+        kind: ready.then(|| "image".into()),
+        dim: None,
+        vision: None,
+        engine: Some(crate::image::ENGINE_LABEL.into()),
+    }
+}
+
+/// Image (Grid text-to-image) manifest, nested under `capabilities.image`; gone the moment the
+/// worker dies.
+pub fn image_capability_wire(image: Option<crate::image::Capabilities>) -> serde_json::Value {
+    serde_json::to_value(image_node_capabilities(image)).expect("finite capability manifest")
+}
+
 /// Speech (Grid TTS) manifest, nested under `capabilities.speech`; gone the moment the worker dies.
 pub fn tts_capability_wire(tts: Option<crate::tts::Capabilities>) -> serde_json::Value {
     serde_json::to_value(tts_node_capabilities(tts)).expect("finite capability manifest")
@@ -237,6 +265,15 @@ pub fn tts_capability_wire(tts: Option<crate::tts::Capabilities>) -> serde_json:
 /// Both heartbeat transports use one manifest and remove it immediately on worker death.
 pub fn stt_capability_wire(stt: Option<crate::stt::Capabilities>) -> serde_json::Value {
     serde_json::to_value(stt_node_capabilities(stt)).expect("finite capability manifest")
+}
+
+/// Outcome of one completion attempt that did not succeed.
+#[derive(Debug)]
+pub enum CompletionAttemptError {
+    /// Network error, timeout, 5xx, 408 or 429: worth another attempt before the deadline.
+    Retryable(String),
+    /// The orchestrator refused this completion for good.
+    Permanent(String),
 }
 
 #[derive(Deserialize)]
@@ -493,6 +530,7 @@ impl OrchestratorClient {
         embedding: Option<crate::eg2::Capabilities>,
         stt: Option<crate::stt::Capabilities>,
         tts: Option<crate::tts::Capabilities>,
+        image: Option<crate::image::Capabilities>,
     ) -> Result<HeartbeatResponse, String> {
         let url = format!("{}/grid/nodes/heartbeat", self.base_url);
         let token = self.get_token()?;
@@ -509,11 +547,14 @@ impl OrchestratorClient {
                 stt_node_capabilities(stt)
             } else if engine == Some("tts-worker") {
                 tts_node_capabilities(tts)
+            } else if engine == Some(crate::image::ENGINE_LABEL) {
+                image_node_capabilities(image)
             } else {
                 NodeCapabilities {
                     embedding,
                     stt: None,
                     tts: None,
+                    image: None,
                     streaming,
                     // Honest capability, passed in by the caller from the ENGINE'S OWN answer.
                     // It was briefly hardcoded false for in-process (which then could not do tool
@@ -768,6 +809,44 @@ impl OrchestratorClient {
         self.post_complete(job_id, body).await
     }
 
+    /// One image completion attempt (`image_job.rs` drives the retries). The body carries the
+    /// sealed PNG (up to ~8.4 MB), so the per-request `timeout` replaces the client's 30 s
+    /// default. Server-side the completion is one idempotent transaction, so repeating an
+    /// attempt whose response was lost is safe.
+    pub async fn complete_image_attempt(
+        &self,
+        job_id: &str,
+        body: &serde_json::Value,
+        timeout: Duration,
+    ) -> Result<(), CompletionAttemptError> {
+        let url = format!("{}/grid/jobs/{}/complete", self.base_url, enc_seg(job_id));
+        let token = self
+            .get_token()
+            .map_err(CompletionAttemptError::Permanent)?;
+        let resp = self
+            .client
+            .post(&url)
+            .timeout(timeout)
+            .header("X-Node-Auth", token)
+            .json(body)
+            .send()
+            .await
+            .map_err(|e| {
+                CompletionAttemptError::Retryable(format!("Job completion failed: {e}"))
+            })?;
+        let status = resp.status();
+        if status.is_success() {
+            return Ok(());
+        }
+        let text = resp.text().await.unwrap_or_default();
+        let message = format!("Job completion failed ({status}): {text}");
+        if crate::image::completion_status_retryable(status.as_u16()) {
+            Err(CompletionAttemptError::Retryable(message))
+        } else {
+            Err(CompletionAttemptError::Permanent(message))
+        }
+    }
+
     /// Post one sealed stream chunk to the orchestrator, which relays it to the
     /// waiting client over SSE. `ephemeral_public_key` is sent only on seq 0 (the
     /// client derives the stream output key from it). On the final chunk, `usage`
@@ -922,6 +1001,7 @@ mod heartbeat_wire_tests {
                 embedding: None,
                 stt: None,
                 tts: None,
+                image: None,
                 streaming: true,
                 streaming_tools: true,
                 context_size: 4096,
@@ -1103,5 +1183,25 @@ mod embedding_capability_tests {
         assert!(wire.get("transcription").is_none());
         assert!(tts_capability_wire(None).get("speech").is_none());
         assert!(tts_capability_wire(None).get("kind").is_none());
+    }
+
+    #[test]
+    fn image_manifest_is_nested_and_dropped_when_unready() {
+        let cap = crate::image::base_capabilities(crate::image::RUNTIME_REVISION.into())
+            .bind_heartbeat(1, "encryption-key", Some("signature"), Some(1));
+        let wire = image_capability_wire(Some(cap));
+        assert_eq!(wire["kind"], "image");
+        assert_eq!(wire["engine"], "image-worker");
+        assert_eq!(wire["image"]["kind"], "image");
+        assert_eq!(wire["image"]["engine"], "image-worker");
+        assert_eq!(wire["image"]["image_ready"], true);
+        assert_eq!(wire["image"]["image_models"][0], crate::image::MODEL_ID);
+        assert_eq!(wire["image"]["free_slots"], 1);
+        assert_eq!(wire["streaming"], false);
+        assert!(wire.get("speech").is_none() && wire.get("transcription").is_none());
+        let gone = image_capability_wire(None);
+        assert!(gone.get("image").is_none());
+        assert!(gone.get("kind").is_none());
+        assert_eq!(gone["engine"], "image-worker");
     }
 }
