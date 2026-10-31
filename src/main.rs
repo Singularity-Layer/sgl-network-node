@@ -270,18 +270,25 @@ enum Commands {
 #[derive(Subcommand)]
 enum PriceAction {
     /// Show your per-model prices, the platform suggested rate, and the band.
-    Show,
-    /// Set a custom price for a model (USD per 1M tokens).
+    Show {
+        /// Print only the raw media-model price JSON (for the desktop app)
+        #[arg(long)]
+        json: bool,
+    },
+    /// Set a custom price for a model (USD per 1M tokens, or a multiplier for media models).
     Set {
         /// Model id you serve (e.g. "llama-3.2-3b")
         #[arg(long)]
         model: String,
         /// Input (prompt) price, USD per 1M tokens
-        #[arg(long)]
-        input: f64,
+        #[arg(long, requires = "output", conflicts_with = "multiplier")]
+        input: Option<f64>,
         /// Output (completion) price, USD per 1M tokens
-        #[arg(long)]
-        output: f64,
+        #[arg(long, requires = "input", conflicts_with = "multiplier")]
+        output: Option<f64>,
+        /// Media models: price multiplier on the reference price, 0.5 to 2.0 (1.0 = reference)
+        #[arg(long, required_unless_present = "input")]
+        multiplier: Option<f64>,
     },
     /// Reset a model back to the platform suggested price.
     Reset {
@@ -599,14 +606,25 @@ async fn main() {
         }
         Commands::Price { action } => {
             let result = match action {
-                PriceAction::Show => node::show_prices(&config_dir, &cli.orchestrator_url).await,
+                PriceAction::Show { json } => {
+                    node::show_prices(&config_dir, &cli.orchestrator_url, json).await
+                }
                 PriceAction::Set {
                     model,
                     input,
                     output,
-                } => {
-                    node::set_price(&config_dir, &cli.orchestrator_url, &model, input, output).await
-                }
+                    multiplier,
+                } => match (multiplier, input, output) {
+                    (Some(m), _, _) => {
+                        node::set_media_price(&config_dir, &cli.orchestrator_url, &model, m).await
+                    }
+                    (None, Some(i), Some(o)) => {
+                        node::set_price(&config_dir, &cli.orchestrator_url, &model, i, o).await
+                    }
+                    _ => {
+                        Err("Pass --input and --output, or --multiplier for a media model.".into())
+                    }
+                },
                 PriceAction::Reset { model } => {
                     node::reset_price(&config_dir, &cli.orchestrator_url, &model).await
                 }
