@@ -713,6 +713,62 @@ impl OrchestratorClient {
         Ok(())
     }
 
+    /// Fetch this node's media-model prices (public endpoint).
+    pub async fn get_media_prices(&self, node_id: &str) -> Result<serde_json::Value, String> {
+        let url = format!(
+            "{}/grid/nodes/{}/media-prices",
+            self.base_url,
+            enc_seg(node_id)
+        );
+        let resp = self
+            .client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| format!("Media price fetch failed: {e}"))?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            return Err(format!("Media price fetch failed ({status}): {text}"));
+        }
+        resp.json()
+            .await
+            .map_err(|e| format!("Bad media price response: {e}"))
+    }
+
+    /// Set (`price_mult_ppm`) or reset a media model's price multiplier (X-Node-Auth).
+    pub async fn post_media_price(
+        &self,
+        node_id: &str,
+        model: &str,
+        price_mult_ppm: Option<i64>,
+    ) -> Result<serde_json::Value, String> {
+        let url = format!(
+            "{}/grid/nodes/{}/media-prices",
+            self.base_url,
+            enc_seg(node_id)
+        );
+        let token = self.get_token()?;
+        let body = match price_mult_ppm {
+            Some(ppm) => serde_json::json!({ "model": model, "price_mult_ppm": ppm }),
+            None => serde_json::json!({ "model": model, "reset": true }),
+        };
+        let resp = self
+            .client
+            .post(&url)
+            .header("X-Node-Auth", token)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| format!("Media price update failed: {e}"))?;
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(map_media_price_error(status.as_u16(), &text));
+        }
+        serde_json::from_str(&text).map_err(|e| format!("Bad media price response: {e}"))
+    }
+
     pub async fn verify_attestation(
         &self,
         node_id: &str,
@@ -1203,5 +1259,52 @@ mod embedding_capability_tests {
         assert!(gone.get("image").is_none());
         assert!(gone.get("kind").is_none());
         assert_eq!(gone["engine"], "image-worker");
+    }
+}
+
+/// Turn a media-price POST failure into a short human message.
+fn map_media_price_error(status: u16, body: &str) -> String {
+    let v: serde_json::Value = serde_json::from_str(body).unwrap_or_default();
+    let code = v.get("code").and_then(|c| c.as_str()).unwrap_or("");
+    match (status, code) {
+        (403, "provider_price_disabled") => {
+            "Provider prices are not switched on yet for this model.".to_string()
+        }
+        (429, "cooldown") => "Changed too recently, try again in a minute.".to_string(),
+        _ => {
+            let msg = v.get("error").and_then(|e| e.as_str()).unwrap_or(body);
+            format!("Media price update failed ({status}): {msg}")
+        }
+    }
+}
+
+#[cfg(test)]
+mod media_price_tests {
+    use super::*;
+
+    #[test]
+    fn maps_disabled_and_cooldown() {
+        assert_eq!(
+            map_media_price_error(403, r#"{"code":"provider_price_disabled","error":"x"}"#),
+            "Provider prices are not switched on yet for this model."
+        );
+        assert_eq!(
+            map_media_price_error(429, r#"{"code":"cooldown"}"#),
+            "Changed too recently, try again in a minute."
+        );
+    }
+
+    #[test]
+    fn maps_other_errors_with_message_or_raw_body() {
+        assert_eq!(
+            map_media_price_error(400, r#"{"error":"out of band"}"#),
+            "Media price update failed (400): out of band"
+        );
+        assert_eq!(
+            map_media_price_error(401, "nope"),
+            "Media price update failed (401): nope"
+        );
+        // 403 without the disabled code is an auth failure, not the lane message.
+        assert!(map_media_price_error(403, r#"{"error":"bad token"}"#).contains("bad token"));
     }
 }

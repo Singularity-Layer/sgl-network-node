@@ -2207,9 +2207,18 @@ pub async fn set_off_grid(
 }
 
 /// Show this node's per-model pricing (custom vs platform suggested, + the band).
-pub async fn show_prices(config_dir: &Path, orchestrator_url: &str) -> Result<(), String> {
+pub async fn show_prices(
+    config_dir: &Path,
+    orchestrator_url: &str,
+    json: bool,
+) -> Result<(), String> {
     let cfg = config::load_config(config_dir)?;
     let client = OrchestratorClient::new(orchestrator_url, Some(cfg.auth_token.clone()));
+    if json {
+        let raw = client.get_media_prices(&cfg.node_id).await?;
+        println!("{raw}");
+        return Ok(());
+    }
     let data = client.get_prices(&cfg.node_id).await?;
     let prices = data
         .get("prices")
@@ -2218,6 +2227,7 @@ pub async fn show_prices(config_dir: &Path, orchestrator_url: &str) -> Result<()
         .unwrap_or_default();
     if prices.is_empty() {
         println!("This node isn't serving any models yet.");
+        print_media_prices(&client, &cfg.node_id).await;
         return Ok(());
     }
     println!("Per-model pricing (USD per 1M tokens):\n");
@@ -2240,7 +2250,143 @@ pub async fn show_prices(config_dir: &Path, orchestrator_url: &str) -> Result<()
             g(r, "outputPerM"),
         );
     }
+    print_media_prices(&client, &cfg.node_id).await;
     Ok(())
+}
+
+/// One media model row from GET media-prices (only what the CLI prints).
+#[derive(Debug, PartialEq)]
+struct MediaPriceRow {
+    model: String,
+    kind: String,
+    enabled: bool,
+    mult_ppm: i64,
+    custom: bool,
+    reference_micro: Option<i64>,
+    price_micro: Option<i64>,
+}
+
+/// Parse the media-prices GET body; malformed entries are skipped.
+fn parse_media_prices(data: &serde_json::Value) -> Vec<MediaPriceRow> {
+    let micro = |v: Option<&serde_json::Value>| -> Option<i64> {
+        let ex = v?.get("examples")?.as_array()?;
+        let hit = ex
+            .iter()
+            .find(|e| e.get("label").and_then(|l| l.as_str()) == Some("1024x1024"))
+            .or_else(|| ex.first())?;
+        hit.get("price_micro_usd")
+            .or_else(|| hit.get("micro_usd"))
+            .and_then(|n| n.as_i64())
+    };
+    data.get("prices")
+        .and_then(|p| p.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|p| {
+                    let model = p.get("model")?.as_str()?.to_string();
+                    let eff = p.get("effective");
+                    Some(MediaPriceRow {
+                        model,
+                        kind: p
+                            .get("kind")
+                            .and_then(|k| k.as_str())
+                            .unwrap_or("media")
+                            .to_string(),
+                        enabled: p.get("enabled").and_then(|e| e.as_bool()).unwrap_or(false),
+                        mult_ppm: eff
+                            .and_then(|e| e.get("price_mult_ppm"))
+                            .and_then(|n| n.as_i64())
+                            .unwrap_or(1_000_000),
+                        custom: p.get("custom").map(|c| !c.is_null()).unwrap_or(false),
+                        reference_micro: micro(p.get("reference")),
+                        price_micro: micro(eff),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Convert a human multiplier (0.5 to 2.0) to parts per million, bounds-checked.
+fn multiplier_to_ppm(multiplier: f64) -> Result<i64, String> {
+    if !multiplier.is_finite() {
+        return Err("Multiplier must be a number between 0.5 and 2.0.".to_string());
+    }
+    let ppm = (multiplier * 1_000_000.0).round() as i64;
+    if !(500_000..=2_000_000).contains(&ppm) {
+        return Err(format!(
+            "Multiplier {multiplier} is outside the allowed range of 0.5 to 2.0."
+        ));
+    }
+    Ok(ppm)
+}
+
+fn fmt_micro_usd(micro: Option<i64>) -> String {
+    match micro {
+        Some(m) => format!("${:.4}", m as f64 / 1_000_000.0),
+        None => "n/a".to_string(),
+    }
+}
+
+/// Print the media section of `sgl price show`. Never fails the command.
+async fn print_media_prices(client: &OrchestratorClient, node_id: &str) {
+    let Ok(data) = client.get_media_prices(node_id).await else {
+        return;
+    };
+    let rows = parse_media_prices(&data);
+    if rows.is_empty() {
+        return;
+    }
+    println!("\nMedia models (price per 1024x1024 image):\n");
+    for r in rows {
+        println!(
+            "  {:<20} {:<6} reference {}   yours x{:.2} = {}  [{}]{}",
+            r.model,
+            r.kind,
+            fmt_micro_usd(r.reference_micro),
+            r.mult_ppm as f64 / 1_000_000.0,
+            fmt_micro_usd(r.price_micro),
+            if r.custom { "custom" } else { "suggested" },
+            if r.enabled {
+                ""
+            } else {
+                "   (provider prices are not enabled yet)"
+            },
+        );
+    }
+}
+
+/// Set a media model's price multiplier (0.5 to 2.0 on the reference price).
+pub async fn set_media_price(
+    config_dir: &Path,
+    orchestrator_url: &str,
+    model: &str,
+    multiplier: f64,
+) -> Result<(), String> {
+    let ppm = multiplier_to_ppm(multiplier)?;
+    let cfg = config::load_config(config_dir)?;
+    let client = OrchestratorClient::new(orchestrator_url, Some(cfg.auth_token.clone()));
+    let resp = client
+        .post_media_price(&cfg.node_id, model, Some(ppm))
+        .await?;
+    let price = parse_post_example(&resp);
+    println!(
+        "✅ Price set for {model}: x{:.2}, 1024x1024 now {}. You keep 80% ({}).",
+        ppm as f64 / 1_000_000.0,
+        fmt_micro_usd(price),
+        fmt_micro_usd(price.map(|p| p * 4 / 5)),
+    );
+    Ok(())
+}
+
+/// The 1024x1024 (else first) `price_micro_usd` from a POST response.
+fn parse_post_example(resp: &serde_json::Value) -> Option<i64> {
+    let ex = resp.get("examples")?.as_array()?;
+    let hit = ex
+        .iter()
+        .find(|e| e.get("label").and_then(|l| l.as_str()) == Some("1024x1024"))
+        .or_else(|| ex.first())?;
+    hit.get("price_micro_usd").and_then(|n| n.as_i64())
 }
 
 /// Set a custom per-token price for a model (USD per 1M tokens). Band-enforced server-side.
@@ -2268,7 +2414,17 @@ pub async fn reset_price(
 ) -> Result<(), String> {
     let cfg = config::load_config(config_dir)?;
     let client = OrchestratorClient::new(orchestrator_url, Some(cfg.auth_token.clone()));
-    client.reset_price(&cfg.node_id, model).await?;
+    // A model the media-prices route lists is a media model; anything else (or a
+    // failed lookup) takes the original chat reset.
+    let is_media = match client.get_media_prices(&cfg.node_id).await {
+        Ok(d) => parse_media_prices(&d).iter().any(|r| r.model == model),
+        Err(_) => false,
+    };
+    if is_media {
+        client.post_media_price(&cfg.node_id, model, None).await?;
+    } else {
+        client.reset_price(&cfg.node_id, model).await?;
+    }
     println!("✅ {model} reset to the platform suggested price.");
     Ok(())
 }
@@ -4526,5 +4682,71 @@ mod speech_binding_tests {
             execute_speech(&None, &job, &reservation).await.unwrap_err(),
             "speech_runtime_failed"
         );
+    }
+}
+
+#[cfg(test)]
+mod media_price_cli_tests {
+    use super::*;
+
+    #[test]
+    fn multiplier_converts_and_rounds() {
+        assert_eq!(multiplier_to_ppm(1.0), Ok(1_000_000));
+        assert_eq!(multiplier_to_ppm(1.25), Ok(1_250_000));
+        assert_eq!(multiplier_to_ppm(0.5), Ok(500_000));
+        assert_eq!(multiplier_to_ppm(2.0), Ok(2_000_000));
+        assert_eq!(multiplier_to_ppm(1.0000004), Ok(1_000_000));
+        assert_eq!(multiplier_to_ppm(1.0000006), Ok(1_000_001));
+        // 1.1 * 1e6 is 1100000.0000000002 in f64; rounding must absorb it.
+        assert_eq!(multiplier_to_ppm(1.1), Ok(1_100_000));
+    }
+
+    #[test]
+    fn multiplier_rejects_out_of_bounds_and_non_finite() {
+        assert!(multiplier_to_ppm(0.49).is_err());
+        assert!(multiplier_to_ppm(2.01).is_err());
+        assert!(multiplier_to_ppm(0.0).is_err());
+        assert!(multiplier_to_ppm(-1.0).is_err());
+        assert!(multiplier_to_ppm(f64::NAN).is_err());
+        assert!(multiplier_to_ppm(f64::INFINITY).is_err());
+    }
+
+    #[test]
+    fn parses_media_prices_body() {
+        let body = serde_json::json!({
+            "node_id": "n",
+            "prices": [
+                {
+                    "model": "flux", "kind": "image", "enabled": false,
+                    "reference": {"examples": [{"label": "512x512", "micro_usd": 1}, {"label": "1024x1024", "micro_usd": 6292}]},
+                    "custom": {"price_mult_ppm": 1250000, "updated_at": "t"},
+                    "effective": {"price_mult_ppm": 1250000, "examples": [{"label": "1024x1024", "reference_micro_usd": 6292, "price_micro_usd": 7865}]}
+                },
+                {"kind": "image"}
+            ]
+        });
+        let rows = parse_media_prices(&body);
+        assert_eq!(
+            rows,
+            vec![MediaPriceRow {
+                model: "flux".into(),
+                kind: "image".into(),
+                enabled: false,
+                mult_ppm: 1_250_000,
+                custom: true,
+                reference_micro: Some(6292),
+                price_micro: Some(7865),
+            }]
+        );
+        assert!(parse_media_prices(&serde_json::json!({})).is_empty());
+    }
+
+    #[test]
+    fn parses_post_example_and_formats() {
+        let resp = serde_json::json!({"examples": [{"label": "1024x1024", "price_micro_usd": 7865}]});
+        assert_eq!(parse_post_example(&resp), Some(7865));
+        assert_eq!(parse_post_example(&serde_json::json!({})), None);
+        assert_eq!(fmt_micro_usd(Some(6292)), "$0.0063");
+        assert_eq!(fmt_micro_usd(None), "n/a");
     }
 }
