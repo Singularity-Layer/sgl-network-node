@@ -636,7 +636,14 @@ async fn main() {
         }
         Commands::Attest => {
             if let Err(e) = node::attest(&config_dir, &cli.orchestrator_url).await {
-                tracing::error!("Attestation failed: {e}");
+                // The orchestrator rejects the node's signature when the key on this machine is not the
+                // key it registered (for example after two overlapping logins). Say what to do.
+                let hint = if e.contains("Signature verification failed") {
+                    "\n  The key saved on this machine does not match the key registered for this node. Log out in the Singularity Node app (or delete node.json in the sgl-node config folder) and link the node again with `sgl login`. Your stake is not affected."
+                } else {
+                    ""
+                };
+                tracing::error!("Attestation failed: {e}{hint}");
                 std::process::exit(1);
             }
         }
