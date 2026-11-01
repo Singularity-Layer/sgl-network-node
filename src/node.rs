@@ -781,6 +781,71 @@ pub async fn init(
 }
 
 /// `sgl login` — browser device-authorization flow.
+/// A login in progress holds this lock (a file in the config dir). Before it existed, a second
+/// `sgl login` overwrote the key file the first was about to register: the first login, approved in the
+/// browser, then registered its own (older) key while the file held the newer one, and the node could
+/// never sign anything the Grid accepted. A lock older than the device-auth session is a crash leftover.
+const LOGIN_LOCK_STALE_SECS: u64 = 20 * 60;
+
+struct LoginLock {
+    path: PathBuf,
+}
+
+impl LoginLock {
+    fn acquire(config_dir: &Path) -> Result<Self, String> {
+        crate::crypto::create_secure_dir(config_dir)?;
+        let path = config_dir.join("login.lock");
+        for _ in 0..2 {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(mut file) => {
+                    use std::io::Write;
+                    let _ = writeln!(file, "{}", std::process::id());
+                    return Ok(Self { path });
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let age = std::fs::metadata(&path)
+                        .and_then(|m| m.modified())
+                        .ok()
+                        .and_then(|t| t.elapsed().ok())
+                        .map(|d| d.as_secs())
+                        .unwrap_or(u64::MAX);
+                    if age > LOGIN_LOCK_STALE_SECS {
+                        let _ = std::fs::remove_file(&path);
+                        continue;
+                    }
+                    return Err(format!(
+                        "Another login is already in progress (started {age}s ago). Finish it in your browser, or wait a few minutes for it to expire."
+                    ));
+                }
+                Err(e) => return Err(format!("Couldn't start login: {e}")),
+            }
+        }
+        Err("Couldn't take the login lock. Try again.".to_string())
+    }
+}
+
+impl Drop for LoginLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Save the key ONLY after the Grid accepted this exact public key, then read it back and require the
+/// same key. A mismatch here is the failure that used to surface later as "Signature verification
+/// failed" on every attest and result.
+fn save_registered_keypair(keypair: &NodeKeypair, kp_path: &Path) -> Result<(), String> {
+    keypair.save(kp_path)?;
+    let reloaded = NodeKeypair::load(kp_path)?;
+    if reloaded.public_key_bs58() != keypair.public_key_bs58() {
+        return Err("The saved node key does not match the key that was registered. Run `sgl logout`, then `sgl login` again.".to_string());
+    }
+    Ok(())
+}
+
 pub async fn login(
     config_dir: &Path,
     orchestrator_url: &str,
@@ -795,13 +860,22 @@ pub async fn login(
         ));
     }
 
+    let _login_lock = LoginLock::acquire(config_dir)?;
+    // Re-check under the lock: another login may have finished between the first check and now.
+    if cfg_path.exists() {
+        return Err(format!(
+            "Node already initialized. Config at: {}",
+            cfg_path.display()
+        ));
+    }
+
     let caps = tee::detect();
     tee::print_capabilities(&caps);
     println!();
 
+    // The key lives in memory until the Grid has registered it (see save_registered_keypair).
     let keypair = NodeKeypair::generate();
     let kp_path = config::keypair_path(config_dir);
-    keypair.save(&kp_path)?;
     let public_key = keypair.public_key_bs58();
 
     let client = OrchestratorClient::new(orchestrator_url, None);
@@ -875,6 +949,7 @@ pub async fn login(
         )
         .await?;
 
+    save_registered_keypair(&keypair, &kp_path)?;
     let node_config = NodeConfig {
         node_id: registration.node_id,
         auth_token: registration.auth_token,
@@ -916,12 +991,19 @@ pub async fn login_headless(
         return Err("Provision code and wallet must be non-empty.".to_string());
     }
 
+    let _login_lock = LoginLock::acquire(config_dir)?;
+    if cfg_path.exists() {
+        return Err(format!(
+            "Node already initialized. Config at: {}",
+            cfg_path.display()
+        ));
+    }
+
     let caps = tee::detect();
     tee::print_capabilities(&caps);
 
     let keypair = NodeKeypair::generate();
     let kp_path = config::keypair_path(config_dir);
-    keypair.save(&kp_path)?;
     let public_key = keypair.public_key_bs58();
 
     let client = OrchestratorClient::new(orchestrator_url, None);
@@ -930,6 +1012,7 @@ pub async fn login_headless(
         .register(wallet, Some(code), tee_type, models, &public_key, &caps)
         .await?;
 
+    save_registered_keypair(&keypair, &kp_path)?;
     let node_config = NodeConfig {
         node_id: registration.node_id,
         auth_token: registration.auth_token,
@@ -4748,5 +4831,60 @@ mod media_price_cli_tests {
         assert_eq!(parse_post_example(&serde_json::json!({})), None);
         assert_eq!(fmt_micro_usd(Some(6292)), "$0.0063");
         assert_eq!(fmt_micro_usd(None), "n/a");
+    }
+}
+
+#[cfg(test)]
+mod login_race_tests {
+    use super::*;
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("sgl-login-{tag}-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn a_second_login_is_refused_while_the_first_is_waiting() {
+        let dir = temp_dir("lock");
+        let first = LoginLock::acquire(&dir).expect("first login takes the lock");
+        let second = LoginLock::acquire(&dir);
+        assert!(second.is_err(), "a second login must not run at the same time");
+        assert!(second.err().unwrap().contains("already in progress"));
+        drop(first);
+        assert!(LoginLock::acquire(&dir).is_ok(), "the lock is released when the login ends");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_crashed_logins_old_lock_does_not_block_forever() {
+        let dir = temp_dir("stale");
+        let lock_path = dir.join("login.lock");
+        std::fs::write(&lock_path, "99999\n").unwrap();
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(LOGIN_LOCK_STALE_SECS + 60);
+        let file = std::fs::OpenOptions::new().write(true).open(&lock_path).unwrap();
+        file.set_modified(old).unwrap();
+        assert!(LoginLock::acquire(&dir).is_ok(), "a lock older than the login session is a leftover");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_saved_key_is_the_registered_key_and_nothing_is_written_before_registration() {
+        let dir = temp_dir("key");
+        let kp_path = config::keypair_path(&dir);
+        let registered = NodeKeypair::generate();
+        // Generating a key (what login does first) must not touch the disk.
+        let _other = NodeKeypair::generate();
+        assert!(!kp_path.exists(), "no key file may exist until the Grid registered the key");
+        save_registered_keypair(&registered, &kp_path).expect("saves and verifies");
+        assert_eq!(
+            NodeKeypair::load(&kp_path).unwrap().public_key_bs58(),
+            registered.public_key_bs58()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
