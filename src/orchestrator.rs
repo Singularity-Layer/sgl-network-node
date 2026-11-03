@@ -963,6 +963,10 @@ impl OrchestratorClient {
             body["result_envelope_signature"] = serde_json::Value::String(sig);
             body["result_envelope_version"] = serde_json::Value::String("v1".to_string());
         }
+        // Mac step 2: countersign only the FINAL chunk, so streaming speed is untouched.
+        if is_final {
+            crate::se_identity::attach_countersign(&mut body).await;
+        }
 
         let resp = self
             .client
@@ -1008,7 +1012,9 @@ impl OrchestratorClient {
         Ok(())
     }
 
-    async fn post_complete(&self, job_id: &str, body: serde_json::Value) -> Result<(), String> {
+    async fn post_complete(&self, job_id: &str, mut body: serde_json::Value) -> Result<(), String> {
+        // Mac step 2: shadow-only enclave countersignature (no-op without an enclave).
+        crate::se_identity::attach_countersign(&mut body).await;
         let url = format!("{}/grid/jobs/{}/complete", self.base_url, enc_seg(job_id));
         let token = self.get_token()?;
 

@@ -22,6 +22,16 @@ pub struct SeIdentity {
 
 const BLOB_FILE: &str = "se_identity.key";
 
+/// Mac step 2 (2026-11-03): the enclave key blob, kept once load_or_create succeeded, so result
+/// envelopes can be countersigned. Empty = no enclave identity this session.
+static RUNTIME_BLOB: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+/// Consecutive countersign failures/timeouts. At COUNTERSIGN_MAX_FAILURES the countersign is
+/// switched off for the rest of the session, so a misbehaving enclave can never slow results.
+static COUNTERSIGN_FAILURES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+const COUNTERSIGN_MAX_FAILURES: u32 = 3;
+const COUNTERSIGN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+const COUNTERSIGN_PREFIX: &[u8] = b"SGL-RESULT-SE-v1\0";
+
 /// Runtime kill switch: `SGL_SE_IDENTITY=0` (or `false`/`off`) disables it entirely.
 fn disabled_by_env() -> bool {
     matches!(
@@ -71,11 +81,60 @@ pub fn load_or_create(config_dir: &Path, ed25519_secret: &[u8; 32], node_id: &st
             return None;
         }
     };
+    let _ = RUNTIME_BLOB.set(blob);
     Some(SeIdentity {
         public_key: bs58::encode(se_pub).into_string(),
         bind_signature: bs58::encode(se_sig).into_string(),
         bind_ed25519_signature: ed_sig,
     })
+}
+
+/// The message the enclave signs for a result: `"SGL-RESULT-SE-v1\0" || ed25519_sig(64)`.
+/// The ed25519 result-envelope signature already commits to the job id, kind and payload hash,
+/// so countersigning it binds the enclave key to that exact result. Must match the orchestrator's
+/// lib/seIdentity.ts. None if `ed_sig_b58` is not a 64-byte signature.
+pub fn countersign_message(ed_sig_b58: &str) -> Option<Vec<u8>> {
+    let sig = bs58::decode(ed_sig_b58).into_vec().ok().filter(|s| s.len() == 64)?;
+    let mut msg = Vec::with_capacity(COUNTERSIGN_PREFIX.len() + 64);
+    msg.extend_from_slice(COUNTERSIGN_PREFIX);
+    msg.extend_from_slice(&sig);
+    Some(msg)
+}
+
+/// Countersign a result envelope signature with the enclave key (bs58 raw r||s). Off the async
+/// runtime with a 2 s deadline; any failure is None and the result is sent exactly as before.
+pub async fn countersign(ed_sig_b58: &str) -> Option<String> {
+    use std::sync::atomic::Ordering;
+    let blob = RUNTIME_BLOB.get()?.clone();
+    if COUNTERSIGN_FAILURES.load(Ordering::Relaxed) >= COUNTERSIGN_MAX_FAILURES {
+        return None;
+    }
+    let msg = countersign_message(ed_sig_b58)?;
+    let task = tokio::task::spawn_blocking(move || enclave::sign(&blob, &msg));
+    match tokio::time::timeout(COUNTERSIGN_TIMEOUT, task).await {
+        Ok(Ok(Some(sig))) => {
+            COUNTERSIGN_FAILURES.store(0, Ordering::Relaxed);
+            Some(bs58::encode(sig).into_string())
+        }
+        _ => {
+            let n = COUNTERSIGN_FAILURES.fetch_add(1, Ordering::Relaxed) + 1;
+            if n == COUNTERSIGN_MAX_FAILURES {
+                tracing::warn!("Secure Enclave countersign failed {n} times; off for this session");
+            }
+            None
+        }
+    }
+}
+
+/// Add `result_envelope_se_signature` to a completion/chunk body that carries a
+/// `result_envelope_signature`. No-op without an enclave identity.
+pub async fn attach_countersign(body: &mut serde_json::Value) {
+    let Some(sig) = body.get("result_envelope_signature").and_then(|v| v.as_str()).map(str::to_owned) else {
+        return;
+    };
+    if let Some(se) = countersign(&sig).await {
+        body["result_envelope_se_signature"] = serde_json::Value::String(se);
+    }
 }
 
 #[cfg(sgl_se)]
@@ -156,6 +215,16 @@ mod tests {
     }
 
     #[test]
+    fn countersign_message_layout_is_fixed() {
+        let sig = bs58::encode([5u8; 64]).into_string();
+        let m = countersign_message(&sig).unwrap();
+        assert!(m.starts_with(b"SGL-RESULT-SE-v1\0"));
+        assert_eq!(m.len(), 17 + 64);
+        assert!(countersign_message("short").is_none());
+        assert!(countersign_message(&bs58::encode([5u8; 32]).into_string()).is_none());
+    }
+
+    #[test]
     fn kill_switch_returns_none() {
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("SGL_SE_IDENTITY", "0");
@@ -177,6 +246,13 @@ mod tests {
         let a = load_or_create(&dir, &[7u8; 32], NODE_ID).expect("enclave identity");
         let b = load_or_create(&dir, &[7u8; 32], NODE_ID).expect("reloaded identity");
         assert_eq!(a.public_key, b.public_key, "the saved blob must reload the same key");
+        // Countersign with the real enclave key and print a fixture for the orchestrator test.
+        let ed_sig = bs58::encode([5u8; 64]).into_string();
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let cs = rt.block_on(countersign(&ed_sig)).expect("enclave countersign");
+        if std::env::var("SGL_SE_FIXTURE").as_deref() == Ok("1") {
+            eprintln!("SE_CS_FIXTURE {{\"se_public_key\":\"{}\",\"ed_sig\":\"{ed_sig}\",\"se_sig\":\"{cs}\"}}", a.public_key);
+        }
         eprintln!("enclave_round_trip: real enclave key {}", a.public_key);
         // SGL_SE_FIXTURE=1 prints a real signed sample for the orchestrator's contract test.
         if std::env::var("SGL_SE_FIXTURE").as_deref() == Ok("1") {
