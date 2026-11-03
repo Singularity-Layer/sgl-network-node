@@ -128,6 +128,10 @@ pub async fn complete_with_retry(
     body: &serde_json::Value,
     received: Instant,
 ) -> Result<u32, String> {
+    // Mac step 2: shadow-only enclave countersignature, made once before the retries.
+    let mut signed = body.clone();
+    crate::se_identity::attach_countersign(&mut signed).await;
+    let body = &signed;
     let mut attempt = 0u32;
     let mut last = String::from("no completion attempt fit before the deadline");
     while let Some((wait, timeout)) = image::plan_completion_attempt(received.elapsed(), attempt) {
