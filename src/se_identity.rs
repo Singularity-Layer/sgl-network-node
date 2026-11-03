@@ -29,7 +29,12 @@ static RUNTIME_BLOB: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
 /// switched off for the rest of the session, so a misbehaving enclave can never slow results.
 static COUNTERSIGN_FAILURES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 const COUNTERSIGN_MAX_FAILURES: u32 = 3;
-const COUNTERSIGN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+// A signature takes ~4.5 ms; 250 ms is far above that and far below anything that matters to a
+// completion deadline (image uploads included).
+const COUNTERSIGN_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
+/// One enclave call at a time. A call that hangs keeps this set, so every later countersign is
+/// skipped instantly: hung calls cannot pile up and results are never delayed by more than one timeout.
+static COUNTERSIGN_IN_FLIGHT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 const COUNTERSIGN_PREFIX: &[u8] = b"SGL-RESULT-SE-v1\0";
 
 /// Runtime kill switch: `SGL_SE_IDENTITY=0` (or `false`/`off`) disables it entirely.
@@ -102,7 +107,8 @@ pub fn countersign_message(ed_sig_b58: &str) -> Option<Vec<u8>> {
 }
 
 /// Countersign a result envelope signature with the enclave key (bs58 raw r||s). Off the async
-/// runtime with a 2 s deadline; any failure is None and the result is sent exactly as before.
+/// runtime with a 250 ms deadline and one call at a time; any failure is None and the result is
+/// sent exactly as before.
 pub async fn countersign(ed_sig_b58: &str) -> Option<String> {
     use std::sync::atomic::Ordering;
     let blob = RUNTIME_BLOB.get()?.clone();
@@ -110,7 +116,14 @@ pub async fn countersign(ed_sig_b58: &str) -> Option<String> {
         return None;
     }
     let msg = countersign_message(ed_sig_b58)?;
-    let task = tokio::task::spawn_blocking(move || enclave::sign(&blob, &msg));
+    if COUNTERSIGN_IN_FLIGHT.swap(true, Ordering::AcqRel) {
+        return None;
+    }
+    let task = tokio::task::spawn_blocking(move || {
+        let sig = enclave::sign(&blob, &msg);
+        COUNTERSIGN_IN_FLIGHT.store(false, Ordering::Release);
+        sig
+    });
     match tokio::time::timeout(COUNTERSIGN_TIMEOUT, task).await {
         Ok(Ok(Some(sig))) => {
             COUNTERSIGN_FAILURES.store(0, Ordering::Relaxed);
