@@ -23,6 +23,13 @@ use std::path::{Path, PathBuf};
 /// while retaining the previously required Qwen3.5 and Qwen2.5-VL support.
 const LLAMA_TAG: &str = "b11719";
 
+/// Upper bound for one llama.cpp archive (the largest b11719 asset is ~31 MB).
+const LLAMA_MAX_BYTES: usize = 512 * 1024 * 1024;
+
+fn llama_url(asset_name: &str) -> String {
+    format!("https://github.com/ggml-org/llama.cpp/releases/download/{LLAMA_TAG}/{asset_name}")
+}
+
 struct Asset {
     /// Release asset filename.
     name: &'static str,
@@ -299,10 +306,7 @@ pub async fn run(cpu_only: bool) -> Result<(), String> {
         }
     }
 
-    let url = format!(
-        "https://github.com/ggml-org/llama.cpp/releases/download/{LLAMA_TAG}/{}",
-        asset.name
-    );
+    let url = llama_url(asset.name);
     println!("Downloading llama.cpp {LLAMA_TAG} ({})…", asset.name);
     let client = reqwest::Client::builder()
         .https_only(true)
@@ -310,20 +314,18 @@ pub async fn run(cpu_only: bool) -> Result<(), String> {
         .user_agent(concat!("sgl-node/", env!("CARGO_PKG_VERSION")))
         .build()
         .map_err(|e| format!("Failed to build HTTP client: {e}"))?;
-    let bytes = client
-        .get(&url)
-        .send()
+    // GitHub first, then our own mirror copy (held to the same pinned sha256), so a GitHub
+    // outage never breaks setup. Fail-closed: only bytes matching `asset.sha256` come back.
+    let bytes = crate::mirror::fetch_pinned(&client, &url, asset.sha256, asset.name, LLAMA_MAX_BYTES)
         .await
-        .map_err(|e| format!("Download failed: {e}"))?
-        .error_for_status()
-        .map_err(|e| format!("Download failed: {e}"))?
-        .bytes()
-        .await
-        .map_err(|e| format!("Download failed: {e}"))?;
-
-    // ── Fail-closed integrity check ──────────────────────────────────────────
+        .map_err(|e| {
+            format!(
+                "Could not download a verified llama.cpp archive — nothing installed.\n  {e}"
+            )
+        })?;
     let actual = sha256_hex(&bytes);
     if actual != asset.sha256 {
+        // Unreachable (fetch_pinned only returns matching bytes); kept as a last fail-closed guard.
         return Err(format!(
             "Checksum mismatch — refusing to install a tampered/corrupt archive.\n  \
              expected: {}\n  got:      {}",
@@ -572,6 +574,28 @@ mod setup_tests {
             assert_eq!(a.sha256.len(), 64, "sha256 must be 64 hex chars");
             assert!(a.sha256.chars().all(|c| c.is_ascii_hexdigit()));
             assert!(a.name.contains(LLAMA_TAG));
+        }
+    }
+
+    #[test]
+    fn this_platforms_llama_assets_have_mirror_copies() {
+        // Every pinned asset must be listed in mirror::ARTIFACTS (so it has an uploaded copy).
+        // ARTIFACTS covers all platforms; this checks the ones this build would fetch.
+        for cpu_only in [false, true] {
+            if let Some(a) = asset_for(cpu_only) {
+                let url = llama_url(a.name);
+                assert!(
+                    crate::mirror::mirror_for(&url, a.sha256).is_some(),
+                    "{url} has no mirror entry in mirror::ARTIFACTS"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn mirror_table_is_on_the_current_llama_tag() {
+        for (url, _, file) in crate::mirror::ARTIFACTS.iter().filter(|(u, _, _)| u.contains("/llama.cpp/")) {
+            assert_eq!(*url, llama_url(file), "stale llama.cpp mirror entry");
         }
     }
 

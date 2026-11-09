@@ -117,3 +117,54 @@ The public JFK test recording is attributed in `assets/whisper/README.md` and
 or public-domain assertion is made. Its startup words are `fellow`, `americans`,
 and `country`. A release candidate must also pass the real node startup canary
 with this bundled fixture before promotion.
+
+## GitHub outage mirror
+
+`sgl update`, `sgl setup` and `install.sh` try GitHub first (retrying 5xx, 429 and
+network errors after 2 s, 5 s and 10 s), then fall back to our R2 bucket
+`sgl-node-downloads`, served at `https://cloud.x402compute.cc/downloads/node/`.
+Every fallback file is checked against the same sha256 as the GitHub copy, so a
+missing or wrong mirror file fails closed. It never installs something unverified.
+Two things keep the mirror useful.
+
+### On every promote: refresh the node binaries, then publish `sgl-latest.json`
+
+Upload the five `sgl-<platform>` binaries and their `.sha256` files as described in
+"After promoting: refresh the download mirror" (PR #26). Then, **last**, publish
+the version file that `sgl update` reads when GitHub is down:
+
+```sh
+# from the sgl-network-cloud directory
+printf '{"version":"%s"}\n' "${tag#v}" > /tmp/sgl-latest.json
+npx wrangler r2 object put sgl-node-downloads/sgl-latest.json \
+  --file=/tmp/sgl-latest.json --content-type=application/json --remote
+curl -fsS https://cloud.x402compute.cc/downloads/node/sgl-latest.json
+```
+
+Publish it last, because it vouches for the binaries already uploaded. On the mirror path `sgl update`
+refuses a `sgl-latest.json` older than the running build (no downgrades). If
+GitHub's `.sha256` was readable, it also requires the mirror binary to be that
+exact build. The orchestrator allowlist check after download is unchanged.
+
+### When a pinned GitHub download changes: upload its mirror copy
+
+Pinned third-party files (today: the llama.cpp builds `sgl setup` installs) are
+mirrored content-addressed as `mirror-<first 16 hex of sha256>-<file name>`.
+When you bump `LLAMA_TAG` or any pinned hash in `src/setup.rs`:
+
+1. Update `ARTIFACTS` in `src/mirror.rs` (the setup tests fail if a pinned asset
+   is missing from it).
+2. Download each file and check its sha256 against the pin, then upload it from the
+   sgl-network-cloud directory:
+
+   ```sh
+   cargo test --bin sgl mirror::tests::print_mirror_table -- --ignored --nocapture
+   # for each row: url, sha256, mirror name
+   test "$(shasum -a 256 "$f" | cut -c1-64)" = "$sha"
+   npx wrangler r2 object put "sgl-node-downloads/$name" --file="$f" --remote
+   ```
+
+   Wrangler cannot upload files over 300 MiB. Use the R2 dashboard or S3 API for those.
+3. Prove the live copies: `cargo test --bin sgl mirror::tests::live_mirror_serves_every_artifact -- --ignored`.
+
+Keep the old mirror objects. They are immutable and content-addressed, so older nodes still pinned to them keep working.
