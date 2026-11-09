@@ -11,6 +11,7 @@ mod image_job;
 mod inference;
 #[cfg(feature = "inprocess")]
 mod inprocess;
+mod mirror;
 mod multimodal;
 mod node;
 mod orchestrator;

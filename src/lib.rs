@@ -19,6 +19,7 @@ pub mod inference;
 #[cfg(feature = "inprocess")]
 pub mod inprocess;
 pub mod multimodal;
+mod mirror;
 pub mod setup;
 // inference.rs labels its backend through it (heartbeat telemetry).
 pub mod telemetry;

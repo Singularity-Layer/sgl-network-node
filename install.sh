@@ -8,6 +8,10 @@ ASSET_NAME="sgl-darwin-arm64"           # default; overridden per-platform in ch
 INSTALL_DIR="/usr/local/bin"
 REPO="Singularity-Layer/sgl-network-node"
 RELEASES_URL="https://github.com/${REPO}/releases"
+# Our own copy of the current release (refreshed on every promote; see RELEASING.md). Used
+# only when GitHub fails. Same checksum check either way.
+MIRROR_URL="https://cloud.x402compute.cc/downloads/node"
+USE_MIRROR=0
 
 main() {
     echo ""
@@ -105,10 +109,21 @@ check_dependencies() {
 detect_latest_version() {
     echo "  Checking latest version..."
 
-    LATEST_VERSION=$(curl -sSf "https://api.github.com/repos/${REPO}/releases/latest" 2>/dev/null \
+    LATEST_VERSION=$(curl -sSf --retry 3 --retry-delay 2 "https://api.github.com/repos/${REPO}/releases/latest" 2>/dev/null \
         | grep '"tag_name"' \
         | head -1 \
         | sed 's/.*"tag_name": *"//;s/".*//' || echo "")
+
+    if [ -z "$LATEST_VERSION" ]; then
+        # GitHub is down or rate-limited: ask our mirror which release it holds.
+        MIRROR_VERSION=$(curl -sSf --retry 3 --retry-delay 2 "${MIRROR_URL}/sgl-latest.json" 2>/dev/null \
+            | sed -n 's/.*"version": *"\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\)".*/\1/p' | head -1 || echo "")
+        if [ -n "$MIRROR_VERSION" ]; then
+            LATEST_VERSION="v${MIRROR_VERSION}"
+            USE_MIRROR=1
+            echo "  GitHub unavailable; using the Singularity Layer download mirror."
+        fi
+    fi
 
     if [ -z "$LATEST_VERSION" ]; then
         LATEST_VERSION="v0.1.0"
@@ -134,7 +149,17 @@ download_binary() {
 
     echo "  Downloading ${ASSET_NAME}..."
 
-    HTTP_CODE=$(curl -sSL -w "%{http_code}" -o "$TEMP_FILE" "$DOWNLOAD_URL" 2>/dev/null || echo "000")
+    HTTP_CODE="000"
+    if [ "$USE_MIRROR" != "1" ]; then
+        HTTP_CODE=$(curl -sSL --retry 3 --retry-delay 2 -w "%{http_code}" -o "$TEMP_FILE" "$DOWNLOAD_URL" 2>/dev/null || echo "000")
+    fi
+    if [ "$HTTP_CODE" != "200" ]; then
+        # GitHub failed: take the binary AND its checksum from our mirror (never mixed).
+        [ "$USE_MIRROR" = "1" ] || echo "  GitHub download failed (HTTP ${HTTP_CODE}); trying the Singularity Layer mirror..."
+        DOWNLOAD_URL="${MIRROR_URL}/${ASSET_NAME}"
+        CHECKSUM_URL="${DOWNLOAD_URL}.sha256"
+        HTTP_CODE=$(curl -sSL --retry 3 --retry-delay 2 -w "%{http_code}" -o "$TEMP_FILE" "$DOWNLOAD_URL" 2>/dev/null || echo "000")
+    fi
 
     if [ "$HTTP_CODE" != "200" ]; then
         echo ""
@@ -154,7 +179,7 @@ download_binary() {
     # Verify the published checksum. Fail closed — never install an unverified
     # binary. The orchestrator additionally gates on a binary-hash allowlist, but
     # we refuse to install tampered bits in the first place.
-    SUM_CODE=$(curl -sSL -w "%{http_code}" -o "$TEMP_SUM" "$CHECKSUM_URL" 2>/dev/null || echo "000")
+    SUM_CODE=$(curl -sSL --retry 3 --retry-delay 2 -w "%{http_code}" -o "$TEMP_SUM" "$CHECKSUM_URL" 2>/dev/null || echo "000")
     if [ "$SUM_CODE" != "200" ]; then
         echo "  Error: checksum file not found at ${CHECKSUM_URL}."
         echo "  Refusing to install an unverified binary."

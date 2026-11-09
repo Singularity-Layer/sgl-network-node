@@ -1,7 +1,11 @@
 //! `sgl update` — self-update to the latest official release, fail-closed.
 //!
 //! Trust model (no single point of compromise):
-//!   1. The release binary + its `.sha256` come from GitHub Releases over HTTPS.
+//!   1. The release binary + its `.sha256` come from GitHub Releases over HTTPS, or, when
+//!      GitHub fails (5xx/429/network after retries, 404, bad checksum), from our R2 mirror
+//!      (`cloud.x402compute.cc/downloads/node/sgl-<platform>` + `.sha256`, version in
+//!      `sgl-latest.json`). The mirror never downgrades, and if GitHub's checksum was
+//!      readable the mirror copy must match it.
 //!   2. The downloaded bytes must hash to the published `.sha256`. (Integrity of
 //!      the download channel.)
 //!   3. INDEPENDENTLY, the hash must be on the orchestrator's binary allowlist
@@ -15,7 +19,8 @@
 //! the running executable). If the install dir needs root, we say so instead of
 //! half-installing.
 
-use sha2::{Digest, Sha256};
+use crate::mirror::{self, Failure};
+use std::future::Future;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -23,9 +28,7 @@ const REPO: &str = "Singularity-Layer/sgl-network-node";
 const USER_AGENT: &str = concat!("sgl-node/", env!("CARGO_PKG_VERSION"));
 const RELEASE_BINARY_MAX_BYTES: usize = 128 * 1024 * 1024;
 const CHECKSUM_MAX_BYTES: usize = 4 * 1024;
-const DOWNLOAD_ATTEMPTS: usize = 3;
-const DOWNLOAD_STALL_TIMEOUT: Duration = Duration::from_secs(30);
-const DOWNLOAD_RETRY_DELAY: Duration = Duration::from_millis(500);
+const METADATA_MAX_BYTES: usize = 1024 * 1024;
 
 /// Can this machine actually RUN the Vulkan (GPU) build?
 ///
@@ -100,178 +103,213 @@ fn https_client() -> Result<reqwest::Client, String> {
         .map_err(|e| format!("Failed to build HTTP client: {e}"))
 }
 
-#[derive(Clone, Copy)]
-struct DownloadPolicy {
-    max_bytes: usize,
-    attempts: usize,
-    stall_timeout: Duration,
-    retry_delay: Duration,
+/// The release we are about to verify against the allowlist.
+#[derive(Debug)]
+struct Fetched {
+    /// Release tag, e.g. `v1.12.3`.
+    tag: String,
+    /// The binary, already verified against `sha256`.
+    bin: Vec<u8>,
+    sha256: String,
+    /// "GitHub" or "the Singularity Layer mirror".
+    source: &'static str,
 }
 
-impl DownloadPolicy {
-    fn release_binary() -> Self {
+/// Where `sgl update` looks. Tests point these at scripted fakes.
+struct Sources {
+    github_latest_api: String,
+    mirror_base: String,
+}
+
+impl Sources {
+    fn live() -> Self {
         Self {
-            max_bytes: RELEASE_BINARY_MAX_BYTES,
-            attempts: DOWNLOAD_ATTEMPTS,
-            stall_timeout: DOWNLOAD_STALL_TIMEOUT,
-            retry_delay: DOWNLOAD_RETRY_DELAY,
-        }
-    }
-
-    fn checksum() -> Self {
-        Self {
-            max_bytes: CHECKSUM_MAX_BYTES,
-            ..Self::release_binary()
+            github_latest_api: format!("https://api.github.com/repos/{REPO}/releases/latest"),
+            mirror_base: mirror::MIRROR_BASE.to_string(),
         }
     }
 }
 
-enum DownloadFailure {
-    Retryable(String),
-    Permanent(String),
+/// First 64 hex chars of a `<sha256>  <name>` checksum file, lowercased; fails closed.
+fn parse_checksum(body: &[u8], label: &str) -> Result<String, String> {
+    let text = std::str::from_utf8(body)
+        .map_err(|_| format!("{label} failed: response was not valid UTF-8"))?;
+    let sha = text.split_whitespace().next().unwrap_or("").to_ascii_lowercase();
+    if !mirror::valid_sha256(&sha) {
+        return Err(format!("{label} failed: not a sha256 checksum file"));
+    }
+    Ok(sha)
 }
 
-async fn download_once(
-    client: &reqwest::Client,
-    url: &str,
-    policy: DownloadPolicy,
-) -> Result<Vec<u8>, DownloadFailure> {
-    let mut response = client
-        .get(url)
-        .header(reqwest::header::ACCEPT_ENCODING, "identity")
-        .send()
-        .await
-        .map_err(|e| DownloadFailure::Retryable(format!("request failed: {e}")))?;
+/// `1.12.3` / `v1.12.3` -> (1, 12, 3). Anything else (pre-release suffixes included) is None.
+fn parse_version(v: &str) -> Option<(u64, u64, u64)> {
+    let mut it = v.strip_prefix('v').unwrap_or(v).split('.');
+    let parsed = (
+        it.next()?.parse().ok()?,
+        it.next()?.parse().ok()?,
+        it.next()?.parse().ok()?,
+    );
+    it.next().is_none().then_some(parsed)
+}
 
-    let status = response.status();
-    if !status.is_success() {
-        let message = format!("HTTP {status}");
-        return Err(
-            if status == reqwest::StatusCode::REQUEST_TIMEOUT
-                || status == reqwest::StatusCode::TOO_MANY_REQUESTS
-                || status.is_server_error()
-            {
-                DownloadFailure::Retryable(message)
-            } else {
-                DownloadFailure::Permanent(message)
-            },
-        );
-    }
+/// What the GitHub attempt learned before it failed. A known checksum binds the mirror copy to
+/// GitHub's latest release.
+#[derive(Default)]
+struct GithubPartial {
+    sha256: Option<String>,
+}
 
-    if let Some(encoding) = response.headers().get(reqwest::header::CONTENT_ENCODING) {
-        let encoding = encoding.to_str().map_err(|_| {
-            DownloadFailure::Permanent("invalid Content-Encoding header".to_string())
-        })?;
-        if !encoding.trim().eq_ignore_ascii_case("identity") {
-            return Err(DownloadFailure::Permanent(format!(
-                "server ignored identity encoding request (Content-Encoding: {encoding})"
-            )));
-        }
-    }
+async fn fetch_from_github<F, Fut>(
+    src: &Sources,
+    asset: &str,
+    delays: &[Duration],
+    get: &mut F,
+    partial: &mut GithubPartial,
+) -> Result<Fetched, String>
+where
+    F: FnMut(String, usize) -> Fut,
+    Fut: Future<Output = Result<Vec<u8>, Failure>>,
+{
+    let meta = mirror::get_with_retry(&src.github_latest_api, METADATA_MAX_BYTES, "GitHub release lookup", delays, get).await?;
+    let rel: serde_json::Value =
+        serde_json::from_slice(&meta).map_err(|e| format!("Bad release metadata: {e}"))?;
+    let tag = rel["tag_name"].as_str().unwrap_or("unknown").to_string();
+    let assets = rel["assets"].as_array().cloned().unwrap_or_default();
+    let url_of = |name: &str| {
+        assets
+            .iter()
+            .find(|a| a["name"].as_str() == Some(name))
+            .and_then(|a| a["browser_download_url"].as_str())
+            .map(str::to_string)
+    };
+    let asset_url = url_of(asset).ok_or_else(|| format!("Release {tag} has no `{asset}` asset."))?;
+    let sum_url = url_of(&format!("{asset}.sha256")).ok_or_else(|| {
+        format!("Release {tag} has no `{asset}.sha256` checksum — refusing unverified update.")
+    })?;
+    println!("  Latest: {tag}");
 
-    let advertised_len = response.content_length();
-    if let Some(len) = advertised_len {
-        if len > policy.max_bytes as u64 {
-            return Err(DownloadFailure::Permanent(format!(
-                "Content-Length {len} exceeds {}-byte limit",
-                policy.max_bytes
-            )));
-        }
-    }
+    let sum = mirror::get_with_retry(&sum_url, CHECKSUM_MAX_BYTES, "Checksum download", delays, get).await?;
+    let expected = parse_checksum(&sum, "Checksum download")?;
+    partial.sha256 = Some(expected.clone());
 
-    let capacity = advertised_len
-        .and_then(|len| usize::try_from(len).ok())
-        .unwrap_or(0);
-    let mut body = Vec::with_capacity(capacity);
-    loop {
-        let chunk = tokio::time::timeout(policy.stall_timeout, response.chunk())
-            .await
-            .map_err(|_| {
-                DownloadFailure::Retryable(format!(
-                    "response body stalled for {} seconds",
-                    policy.stall_timeout.as_secs_f32()
-                ))
-            })?
-            .map_err(|e| DownloadFailure::Retryable(format!("response body read failed: {e}")))?;
-        let Some(chunk) = chunk else {
-            break;
-        };
-        let new_len = body
-            .len()
-            .checked_add(chunk.len())
-            .ok_or_else(|| DownloadFailure::Permanent("response size overflow".to_string()))?;
-        if new_len > policy.max_bytes {
-            return Err(DownloadFailure::Permanent(format!(
-                "response body exceeds {}-byte limit",
-                policy.max_bytes
-            )));
-        }
-        body.extend_from_slice(&chunk);
-    }
-
-    if let Some(len) = advertised_len {
-        if body.len() as u64 != len {
-            return Err(DownloadFailure::Retryable(format!(
-                "incomplete response body (expected {len} bytes, received {})",
-                body.len()
-            )));
-        }
-    }
-    if body.is_empty() {
-        return Err(DownloadFailure::Retryable(
-            "empty response body".to_string(),
+    println!("Downloading {asset}…");
+    let bin = mirror::get_with_retry(&asset_url, RELEASE_BINARY_MAX_BYTES, "Download", delays, get).await?;
+    let actual = mirror::sha256_hex(&bin);
+    if actual != expected {
+        return Err(format!(
+            "Checksum mismatch on the GitHub download (published {expected}, downloaded {actual})"
         ));
     }
-
-    Ok(body)
+    Ok(Fetched { tag, bin, sha256: actual, source: "GitHub" })
 }
 
-async fn download_bytes_with_retry(
-    client: &reqwest::Client,
-    url: &str,
-    label: &str,
-    policy: DownloadPolicy,
-) -> Result<Vec<u8>, String> {
-    if policy.attempts == 0 {
-        return Err(format!("{label} failed: retry policy has no attempts"));
+/// The mirror keeps the current release's binaries at fixed names (`sgl-<platform>` +
+/// `.sha256`, refreshed on every promote) and `sgl-latest.json` = `{"version":"X.Y.Z"}`.
+async fn fetch_from_mirror<F, Fut>(
+    src: &Sources,
+    asset: &str,
+    current_version: &str,
+    github_sha256: Option<&str>,
+    delays: &[Duration],
+    get: &mut F,
+) -> Result<Fetched, String>
+where
+    F: FnMut(String, usize) -> Fut,
+    Fut: Future<Output = Result<Vec<u8>, Failure>>,
+{
+    let base = src.mirror_base.trim_end_matches('/');
+    let latest = mirror::get_with_retry(
+        &format!("{base}/sgl-latest.json"),
+        CHECKSUM_MAX_BYTES,
+        "Mirror version check",
+        delays,
+        get,
+    )
+    .await?;
+    let latest: serde_json::Value = serde_json::from_slice(&latest)
+        .map_err(|e| format!("Mirror version check failed: bad sgl-latest.json ({e})"))?;
+    let version = latest["version"].as_str().unwrap_or("");
+    let mirror_v = parse_version(version)
+        .ok_or_else(|| format!("Mirror version check failed: bad version {version:?}"))?;
+    // Never let a stale mirror walk a node backwards (older builds stay allowlisted for a while).
+    if let Some(cur) = parse_version(current_version) {
+        if mirror_v < cur {
+            return Err(format!(
+                "the mirror is on v{version}, older than this build (v{current_version}); refusing to downgrade"
+            ));
+        }
     }
+    let tag = format!("v{version}");
+    println!("  Latest (mirror): {tag}");
 
-    for attempt in 1..=policy.attempts {
-        match download_once(client, url, policy).await {
-            Ok(body) => return Ok(body),
-            Err(DownloadFailure::Permanent(reason)) => {
-                return Err(format!("{label} failed: {reason}"));
-            }
-            Err(DownloadFailure::Retryable(reason)) if attempt == policy.attempts => {
-                return Err(format!(
-                    "{label} failed after {} attempts: {reason}",
-                    policy.attempts
-                ));
-            }
-            Err(DownloadFailure::Retryable(reason)) => {
-                eprintln!(
-                    "  {label} attempt {attempt}/{} failed ({reason}); retrying…",
-                    policy.attempts
-                );
-                tokio::time::sleep(policy.retry_delay.saturating_mul(attempt as u32)).await;
-            }
+    let sum = mirror::get_with_retry(
+        &format!("{base}/{asset}.sha256"),
+        CHECKSUM_MAX_BYTES,
+        "Mirror checksum download",
+        delays,
+        get,
+    )
+    .await?;
+    let expected = parse_checksum(&sum, "Mirror checksum download")?;
+    if let Some(gh) = github_sha256 {
+        if gh != expected {
+            return Err(format!(
+                "the mirror is not on GitHub's latest build yet (GitHub {}, mirror {}); refusing",
+                &gh[..12],
+                &expected[..12]
+            ));
         }
     }
 
-    unreachable!("non-zero retry policy must return from the attempt loop")
+    println!("Downloading {asset} from the mirror…");
+    let bin = mirror::get_with_retry(
+        &format!("{base}/{asset}"),
+        RELEASE_BINARY_MAX_BYTES,
+        "Mirror download",
+        delays,
+        get,
+    )
+    .await?;
+    let actual = mirror::sha256_hex(&bin);
+    if actual != expected {
+        return Err(format!(
+            "Checksum mismatch on the mirror download (published {expected}, downloaded {actual})"
+        ));
+    }
+    Ok(Fetched { tag, bin, sha256: actual, source: "the Singularity Layer mirror" })
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
-    let mut h = Sha256::new();
-    h.update(bytes);
-    hex::encode(h.finalize())
+/// GitHub first (each request retried on 5xx/429/network), then our mirror. Either way the
+/// binary is verified against its published sha256 here, and against the orchestrator
+/// allowlist by the caller. Fails closed: both failing returns both reasons.
+async fn fetch_release<F, Fut>(
+    src: &Sources,
+    asset: &str,
+    current_version: &str,
+    delays: &[Duration],
+    mut get: F,
+) -> Result<Fetched, String>
+where
+    F: FnMut(String, usize) -> Fut,
+    Fut: Future<Output = Result<Vec<u8>, Failure>>,
+{
+    let mut partial = GithubPartial::default();
+    let gh_err = match fetch_from_github(src, asset, delays, &mut get, &mut partial).await {
+        Ok(f) => return Ok(f),
+        Err(e) => e,
+    };
+    eprintln!("  GitHub unavailable ({gh_err}).");
+    eprintln!("  Trying the Singularity Layer download mirror…");
+    fetch_from_mirror(src, asset, current_version, partial.sha256.as_deref(), delays, &mut get)
+        .await
+        .map_err(|m| format!("Could not fetch a verified update.\n  GitHub: {gh_err}\n  Mirror: {m}"))
 }
 
 fn current_exe_hash() -> Result<(PathBuf, String), String> {
     let exe =
         std::env::current_exe().map_err(|e| format!("Cannot resolve current executable: {e}"))?;
     let bytes = std::fs::read(&exe).map_err(|e| format!("Cannot read current executable: {e}"))?;
-    let hash = sha256_hex(&bytes);
+    let hash = mirror::sha256_hex(&bytes);
     Ok((exe, hash))
 }
 
@@ -280,74 +318,21 @@ pub async fn run(orchestrator_url: &str) -> Result<(), String> {
         let asset = platform_asset()?;
         let client = https_client()?;
 
-        // ── 1. Resolve the latest release ────────────────────────────────────
+        // ── 1+2. Resolve the latest release, download + verify its checksum ──
+        // GitHub first; on failure, our R2 mirror (same checksum discipline).
         println!("Checking latest release…");
-        let rel: serde_json::Value = client
-            .get(format!(
-                "https://api.github.com/repos/{REPO}/releases/latest"
-            ))
-            .header("Accept", "application/vnd.github+json")
-            .send()
-            .await
-            .map_err(|e| format!("Failed to reach GitHub releases: {e}"))?
-            .error_for_status()
-            .map_err(|e| format!("GitHub releases lookup failed: {e}"))?
-            .json()
-            .await
-            .map_err(|e| format!("Bad release metadata: {e}"))?;
-
-        let tag = rel["tag_name"].as_str().unwrap_or("unknown").to_string();
-        let assets = rel["assets"].as_array().cloned().unwrap_or_default();
-        let asset_url = assets
-            .iter()
-            .find(|a| a["name"].as_str() == Some(asset))
-            .and_then(|a| a["browser_download_url"].as_str())
-            .ok_or_else(|| format!("Release {tag} has no `{asset}` asset."))?
-            .to_string();
-        let sum_url = assets
-            .iter()
-            .find(|a| a["name"].as_str() == Some(format!("{asset}.sha256").as_str()))
-            .and_then(|a| a["browser_download_url"].as_str())
-            .ok_or_else(|| {
-                format!(
-                    "Release {tag} has no `{asset}.sha256` checksum — refusing unverified update."
-                )
-            })?
-            .to_string();
-        println!("  Latest: {tag}");
-
-        // ── 2. Download binary + published checksum ──────────────────────────
-        println!("Downloading {asset}…");
-        let bin = download_bytes_with_retry(
-            &client,
-            &asset_url,
-            "Download",
-            DownloadPolicy::release_binary(),
+        let Fetched { tag, bin, sha256: actual, source } = fetch_release(
+            &Sources::live(),
+            asset,
+            env!("CARGO_PKG_VERSION"),
+            &mirror::RETRY_DELAYS,
+            |url, max| {
+                let client = client.clone();
+                async move { mirror::get_once(&client, &url, max, mirror::STALL_TIMEOUT).await }
+            },
         )
         .await?;
-
-        let sum_body = download_bytes_with_retry(
-            &client,
-            &sum_url,
-            "Checksum download",
-            DownloadPolicy::checksum(),
-        )
-        .await?;
-        let sum_body = std::str::from_utf8(&sum_body)
-            .map_err(|_| "Checksum download failed: response was not valid UTF-8".to_string())?;
-
-        let expected = sum_body
-            .split_whitespace()
-            .next()
-            .unwrap_or("")
-            .to_lowercase();
-        let actual = sha256_hex(&bin);
-        if expected.len() != 64 || actual != expected {
-            return Err(format!(
-                "Checksum mismatch — refusing to install.\n  published: {expected}\n  downloaded: {actual}"
-            ));
-        }
-        println!("  Checksum verified ✓ ({})", &actual[..12]);
+        println!("  Checksum verified ✓ ({}, from {source})", &actual[..12]);
 
         // ── 3. Independent allowlist check against the orchestrator ─────────
         println!("Verifying against the grid allowlist…");
@@ -442,13 +427,30 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
+    struct DownloadPolicy {
+        max_bytes: usize,
+        attempts: usize,
+        stall_timeout: Duration,
+    }
+
     fn test_policy(max_bytes: usize, attempts: usize, stall_timeout: Duration) -> DownloadPolicy {
-        DownloadPolicy {
-            max_bytes,
-            attempts,
-            stall_timeout,
-            retry_delay: Duration::ZERO,
-        }
+        DownloadPolicy { max_bytes, attempts, stall_timeout }
+    }
+
+    /// Real HTTP through the same retry loop `sgl update` uses, with zero back-off.
+    async fn download_bytes_with_retry(
+        client: &reqwest::Client,
+        url: &str,
+        label: &str,
+        policy: DownloadPolicy,
+    ) -> Result<Vec<u8>, String> {
+        let delays = vec![Duration::ZERO; policy.attempts - 1];
+        let stall = policy.stall_timeout;
+        mirror::get_with_retry(url, policy.max_bytes, label, &delays, &mut |u: String, m| {
+            let c = client.clone();
+            async move { mirror::get_once(&c, &u, m, stall).await }
+        })
+        .await
     }
 
     fn test_client() -> reqwest::Client {
@@ -585,5 +587,150 @@ mod tests {
 
         assert!(error.contains("Download failed after 2 attempts"));
         assert!(error.contains("response body stalled"));
+    }
+
+    // ── GitHub -> mirror fallback ────────────────────────────────────────────────
+
+    use crate::mirror::tests::{Fake, NO_WAIT};
+
+    const API: &str = "gh-api";
+    const GH_BIN: &str = "gh/sgl-test";
+    const GH_SUM: &str = "gh/sgl-test.sha256";
+    const M_LATEST: &str = "mirror/sgl-latest.json";
+    const M_BIN: &str = "mirror/sgl-test";
+    const M_SUM: &str = "mirror/sgl-test.sha256";
+
+    fn sources() -> Sources {
+        Sources { github_latest_api: API.into(), mirror_base: "mirror".into() }
+    }
+
+    fn release_json() -> Vec<u8> {
+        serde_json::json!({
+            "tag_name": "v1.13.0",
+            "assets": [
+                {"name": "sgl-test", "browser_download_url": GH_BIN},
+                {"name": "sgl-test.sha256", "browser_download_url": GH_SUM},
+            ]
+        })
+        .to_string()
+        .into_bytes()
+    }
+
+    fn sum_of(b: &[u8]) -> Vec<u8> {
+        format!("{}  sgl-test\n", mirror::sha256_hex(b)).into_bytes()
+    }
+
+    fn leak(v: Vec<u8>) -> &'static [u8] {
+        Box::leak(v.into_boxed_slice())
+    }
+
+    async fn run_fetch(f: &Fake, current: &str) -> Result<Fetched, String> {
+        fetch_release(&sources(), "sgl-test", current, &NO_WAIT, f.get()).await
+    }
+
+    #[tokio::test]
+    async fn github_ok_never_touches_the_mirror() {
+        let f = Fake::new(vec![
+            (API, vec![Ok(leak(release_json()))]),
+            (GH_SUM, vec![Ok(leak(sum_of(b"new-bin")))]),
+            (GH_BIN, vec![Ok(b"new-bin")]),
+        ]);
+        let got = run_fetch(&f, "1.12.3").await.unwrap();
+        assert_eq!((got.tag.as_str(), got.bin.as_slice(), got.source), ("v1.13.0", &b"new-bin"[..], "GitHub"));
+        assert!(f.calls().iter().all(|c| !c.starts_with("mirror")), "{:?}", f.calls());
+    }
+
+    #[tokio::test]
+    async fn github_5xx_retried_then_mirror_serves_the_update() {
+        let f = Fake::new(vec![
+            (API, vec![Err("503")]),
+            (M_LATEST, vec![Ok(br#"{"version":"1.13.0"}"#)]),
+            (M_SUM, vec![Ok(leak(sum_of(b"new-bin")))]),
+            (M_BIN, vec![Ok(b"new-bin")]),
+        ]);
+        let got = run_fetch(&f, "1.12.3").await.unwrap();
+        assert_eq!(got.tag, "v1.13.0");
+        assert_eq!(got.bin, b"new-bin");
+        assert_eq!(got.sha256, mirror::sha256_hex(b"new-bin"));
+        assert_eq!(got.source, "the Singularity Layer mirror");
+        // 1 try + 3 retries at GitHub, then the mirror.
+        assert_eq!(f.calls(), vec![API, API, API, API, M_LATEST, M_SUM, M_BIN]);
+    }
+
+    #[tokio::test]
+    async fn checksum_mismatch_on_github_and_mirror_fails_closed() {
+        let f = Fake::new(vec![
+            (API, vec![Ok(leak(release_json()))]),
+            (GH_SUM, vec![Ok(leak(sum_of(b"new-bin")))]),
+            (GH_BIN, vec![Ok(b"evil")]),
+            (M_LATEST, vec![Ok(br#"{"version":"1.13.0"}"#)]),
+            (M_SUM, vec![Ok(leak(sum_of(b"new-bin")))]),
+            (M_BIN, vec![Ok(b"also evil")]),
+        ]);
+        let err = run_fetch(&f, "1.12.3").await.unwrap_err();
+        assert!(err.contains("GitHub: Checksum mismatch") && err.contains("Mirror: Checksum mismatch"), "{err}");
+        // A mismatch is never retried against the same source.
+        assert_eq!(f.calls().iter().filter(|c| *c == GH_BIN).count(), 1);
+        assert_eq!(f.calls().iter().filter(|c| *c == M_BIN).count(), 1);
+    }
+
+    #[tokio::test]
+    async fn tampered_github_binary_falls_back_to_matching_mirror_copy() {
+        let f = Fake::new(vec![
+            (API, vec![Ok(leak(release_json()))]),
+            (GH_SUM, vec![Ok(leak(sum_of(b"new-bin")))]),
+            (GH_BIN, vec![Ok(b"evil")]),
+            (M_LATEST, vec![Ok(br#"{"version":"1.13.0"}"#)]),
+            (M_SUM, vec![Ok(leak(sum_of(b"new-bin")))]),
+            (M_BIN, vec![Ok(b"new-bin")]),
+        ]);
+        assert_eq!(run_fetch(&f, "1.12.3").await.unwrap().bin, b"new-bin");
+    }
+
+    #[tokio::test]
+    async fn mirror_must_match_githubs_checksum_when_github_published_one() {
+        // GitHub's binary download is down, but its checksum was readable: the mirror copy
+        // must be that exact build, not merely self-consistent.
+        let f = Fake::new(vec![
+            (API, vec![Ok(leak(release_json()))]),
+            (GH_SUM, vec![Ok(leak(sum_of(b"new-bin")))]),
+            (GH_BIN, vec![Err("502")]),
+            (M_LATEST, vec![Ok(br#"{"version":"1.13.0"}"#)]),
+            (M_SUM, vec![Ok(leak(sum_of(b"other-bin")))]),
+            (M_BIN, vec![Ok(b"other-bin")]),
+        ]);
+        let err = run_fetch(&f, "1.12.3").await.unwrap_err();
+        assert!(err.contains("not on GitHub's latest build"), "{err}");
+        assert!(!f.calls().contains(&M_BIN.to_string()));
+    }
+
+    #[tokio::test]
+    async fn stale_mirror_never_downgrades() {
+        let f = Fake::new(vec![
+            (API, vec![Err("net")]),
+            (M_LATEST, vec![Ok(br#"{"version":"1.12.2"}"#)]),
+            (M_SUM, vec![Ok(leak(sum_of(b"old-bin")))]),
+            (M_BIN, vec![Ok(b"old-bin")]),
+        ]);
+        let err = run_fetch(&f, "1.12.3").await.unwrap_err();
+        assert!(err.contains("refusing to downgrade"), "{err}");
+        assert!(!f.calls().contains(&M_BIN.to_string()));
+    }
+
+    #[tokio::test]
+    async fn missing_mirror_version_file_fails_closed() {
+        let f = Fake::new(vec![(API, vec![Err("503")]), (M_LATEST, vec![Err("404")])]);
+        let err = run_fetch(&f, "1.12.3").await.unwrap_err();
+        assert!(err.contains("GitHub:") && err.contains("Mirror: Mirror version check failed"), "{err}");
+    }
+
+    #[test]
+    fn versions_parse_strictly() {
+        assert_eq!(parse_version("v1.12.3"), Some((1, 12, 3)));
+        assert_eq!(parse_version("1.12.3"), Some((1, 12, 3)));
+        assert!(parse_version("1.12").is_none());
+        assert!(parse_version("1.12.3-rc1").is_none());
+        assert!(parse_version("1.12.3.4").is_none());
+        assert!(parse_version("1.9.99") < parse_version("1.10.0"));
     }
 }
