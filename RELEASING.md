@@ -91,6 +91,32 @@ gh release edit "$tag" --repo Singularity-Layer/sgl-network-node \
 Do not delete and recreate a draft to promote it. That would make the reviewed
 asset set ambiguous.
 
+### After promoting: refresh the download mirror
+
+The desktop app downloads the node binary from GitHub and falls back to our own
+mirror (`https://cloud.x402compute.cc/downloads/node/<asset>`, R2 bucket
+`sgl-node-downloads`) when GitHub's release downloads fail. Keep the mirror on
+the same release:
+
+```sh
+gh release download "$tag" --repo Singularity-Layer/sgl-network-node \
+  -p 'sgl-darwin-arm64*' -p 'sgl-linux-*'
+for f in sgl-darwin-arm64 sgl-linux-arm64 sgl-linux-arm64-gpu sgl-linux-x86_64 sgl-linux-x86_64-gpu; do
+  test "$(shasum -a 256 "$f" | cut -c1-64)" = "$(cut -c1-64 "$f.sha256")" || exit 1
+done
+# from the sgl-network-cloud directory (its wrangler config owns the bucket);
+# binaries first, checksums last
+for f in sgl-darwin-arm64 sgl-linux-arm64 sgl-linux-arm64-gpu sgl-linux-x86_64 sgl-linux-x86_64-gpu; do
+  npx wrangler r2 object put "sgl-node-downloads/$f" --file="$f" --remote
+done
+for f in sgl-darwin-arm64 sgl-linux-arm64 sgl-linux-arm64-gpu sgl-linux-x86_64 sgl-linux-x86_64-gpu; do
+  npx wrangler r2 object put "sgl-node-downloads/$f.sha256" --file="$f.sha256" --remote
+done
+```
+
+The Windows binary (`sgl-windows-x86_64.exe`) is a separate pinned beta track;
+leave it alone here.
+
 ## Reviewed Whisper runtime packaging
 
 `assets/whisper/runtime/macos-arm64/whisper-cli` is an explicitly reviewed
