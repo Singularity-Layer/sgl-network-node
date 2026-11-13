@@ -33,6 +33,8 @@ pub struct ServiceStartOptions {
     pub tts_model_dir: Option<String>,
     pub image_python: Option<String>,
     pub image_model_dir: Option<String>,
+    /// Grid video `--video-*` flags, already in `sgl start` form (empty when video is off).
+    pub video_args: Vec<String>,
     pub systemone_sidecar_url: Option<String>,
     /// Vision (multimodal) models: path to the mmproj GGUF, baked into the service so the
     /// background node serves images across restarts. None for text/embedding models.
@@ -108,6 +110,7 @@ impl ServiceStartOptions {
             args.push("--image-model-dir".into());
             args.push(dir.clone());
         }
+        args.extend(self.video_args.iter().cloned());
         if let Some(url) = &self.systemone_sidecar_url {
             args.push("--systemone-sidecar-url".into());
             args.push(url.clone());
@@ -837,6 +840,7 @@ mod embedding_service_tests {
             tts_model_dir: None,
             image_python: None,
             image_model_dir: None,
+            video_args: vec![],
             systemone_sidecar_url: None,
             mmproj_path: None,
             image_max_tokens: None,
@@ -889,6 +893,7 @@ mod embedding_service_tests {
             tts_model_dir: None,
             image_python: None,
             image_model_dir: None,
+            video_args: vec![],
             systemone_sidecar_url: None,
             mmproj_path: None,
             image_max_tokens: None,

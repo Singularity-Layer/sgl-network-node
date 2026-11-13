@@ -159,6 +159,8 @@ struct NodeCapabilities {
     tts: Option<crate::tts::Capabilities>,
     #[serde(skip_serializing_if = "Option::is_none")]
     image: Option<crate::image::Capabilities>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    video: Option<crate::video::Capabilities>,
     streaming: bool,
     // This build forwards `tools` on the STREAM path and emits tool-call deltas. A routing
     // hint only — correctness comes from the per-chunk `fmt` tag, so a stale value here can
@@ -194,6 +196,7 @@ fn eg2_capabilities(embedding: Option<crate::eg2::Capabilities>) -> NodeCapabili
         stt: None,
         tts: None,
         image: None,
+        video: None,
         streaming: false,
         streaming_tools: false,
         context_size: 8192,
@@ -216,6 +219,7 @@ fn stt_node_capabilities(stt: Option<crate::stt::Capabilities>) -> NodeCapabilit
         stt,
         tts: None,
         image: None,
+        video: None,
         streaming: false,
         streaming_tools: false,
         context_size: 0,
@@ -233,6 +237,7 @@ fn tts_node_capabilities(tts: Option<crate::tts::Capabilities>) -> NodeCapabilit
         stt: None,
         tts,
         image: None,
+        video: None,
         streaming: false,
         streaming_tools: false,
         context_size: 0,
@@ -250,6 +255,7 @@ fn image_node_capabilities(image: Option<crate::image::Capabilities>) -> NodeCap
         stt: None,
         tts: None,
         image,
+        video: None,
         streaming: false,
         streaming_tools: false,
         context_size: 0,
@@ -258,6 +264,30 @@ fn image_node_capabilities(image: Option<crate::image::Capabilities>) -> NodeCap
         vision: None,
         engine: Some(crate::image::ENGINE_LABEL.into()),
     }
+}
+
+fn video_node_capabilities(video: Option<crate::video::Capabilities>) -> NodeCapabilities {
+    let ready = video.is_some();
+    NodeCapabilities {
+        embedding: None,
+        stt: None,
+        tts: None,
+        image: None,
+        video,
+        streaming: false,
+        streaming_tools: false,
+        context_size: 0,
+        kind: ready.then(|| "video".into()),
+        dim: None,
+        vision: None,
+        engine: Some(crate::video::ENGINE_LABEL.into()),
+    }
+}
+
+/// Video (Grid text-to-video) manifest, nested under `capabilities.video`; gone the moment the
+/// engine is unhealthy.
+pub fn video_capability_wire(video: Option<crate::video::Capabilities>) -> serde_json::Value {
+    serde_json::to_value(video_node_capabilities(video)).expect("finite capability manifest")
 }
 
 /// Image (Grid text-to-image) manifest, nested under `capabilities.image`; gone the moment the
@@ -283,6 +313,61 @@ pub enum CompletionAttemptError {
     Retryable(String),
     /// The orchestrator refused this completion for good.
     Permanent(String),
+}
+
+/// Progress statuses that mean the job is no longer this node's to run (spec 5.3).
+pub fn progress_status_stops(status: u16) -> bool {
+    matches!(status, 404 | 409 | 410)
+}
+
+/// A request body read from a file in 256 KiB frames, never the whole file in memory. It ends
+/// with an error if the file is shorter than the Content-Length it was sent with.
+struct FileBody {
+    file: tokio::fs::File,
+    remaining: u64,
+    buf: Vec<u8>,
+}
+
+impl http_body::Body for FileBody {
+    type Data = bytes::Bytes;
+    type Error = std::io::Error;
+
+    fn poll_frame(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        use std::task::Poll;
+        use tokio::io::AsyncRead;
+        let this = self.get_mut();
+        if this.remaining == 0 {
+            return Poll::Ready(None);
+        }
+        let want = this.buf.len().min(this.remaining as usize);
+        let mut read = tokio::io::ReadBuf::new(&mut this.buf[..want]);
+        match std::pin::Pin::new(&mut this.file).poll_read(cx, &mut read) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Err(e)) => Poll::Ready(Some(Err(e))),
+            Poll::Ready(Ok(())) if read.filled().is_empty() => {
+                Poll::Ready(Some(Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "artifact shorter than its Content-Length",
+                ))))
+            }
+            Poll::Ready(Ok(())) => {
+                this.remaining -= read.filled().len() as u64;
+                let chunk = bytes::Bytes::copy_from_slice(read.filled());
+                Poll::Ready(Some(Ok(http_body::Frame::data(chunk))))
+            }
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.remaining == 0
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        http_body::SizeHint::with_exact(self.remaining)
+    }
 }
 
 #[derive(Deserialize)]
@@ -540,6 +625,7 @@ impl OrchestratorClient {
         stt: Option<crate::stt::Capabilities>,
         tts: Option<crate::tts::Capabilities>,
         image: Option<crate::image::Capabilities>,
+        video: Option<crate::video::Capabilities>,
         se: Option<&crate::se_identity::SeIdentity>,
     ) -> Result<HeartbeatResponse, String> {
         let url = format!("{}/grid/nodes/heartbeat", self.base_url);
@@ -559,12 +645,15 @@ impl OrchestratorClient {
                 tts_node_capabilities(tts)
             } else if engine == Some(crate::image::ENGINE_LABEL) {
                 image_node_capabilities(image)
+            } else if engine == Some(crate::video::ENGINE_LABEL) {
+                video_node_capabilities(video)
             } else {
                 NodeCapabilities {
                     embedding,
                     stt: None,
                     tts: None,
                     image: None,
+                    video: None,
                     streaming,
                     // Honest capability, passed in by the caller from the ENGINE'S OWN answer.
                     // It was briefly hardcoded false for in-process (which then could not do tool
@@ -916,6 +1005,119 @@ impl OrchestratorClient {
         }
     }
 
+    /// One video completion attempt (`video_job.rs` drives the retries). Same endpoint, timeout
+    /// handling and 5xx/4xx split as the image completion; the body only carries hashes.
+    pub async fn complete_video_attempt(
+        &self,
+        job_id: &str,
+        body: &serde_json::Value,
+        timeout: Duration,
+    ) -> Result<(), CompletionAttemptError> {
+        self.complete_image_attempt(job_id, body, timeout).await
+    }
+
+    /// `POST /grid/jobs/<id>/progress` (spec 5.3). Ok(false) only for an explicit
+    /// `{"continue":false}` or a 404/409/410 (the job is gone or not this node's). Every other
+    /// status, a network error or an unreadable body is Err: the caller logs it and keeps going.
+    pub async fn report_video_progress(
+        &self,
+        job_id: &str,
+        stage: &str,
+        step: u32,
+        total: u32,
+    ) -> Result<bool, String> {
+        let url = format!("{}/grid/jobs/{}/progress", self.base_url, enc_seg(job_id));
+        let token = self.get_token()?;
+        let resp = self
+            .client
+            .post(&url)
+            .timeout(Duration::from_secs(10))
+            .header("X-Node-Auth", token)
+            .json(&serde_json::json!({ "stage": stage, "step": step, "total": total }))
+            .send()
+            .await
+            .map_err(|e| format!("progress report failed: {e}"))?;
+        let status = resp.status();
+        if !status.is_success() {
+            // Only "this job is gone" statuses stop the work. Anything else (401 during a token
+            // rotation, 5xx, 429) is logged by the caller and the job keeps going; completion
+            // settles it.
+            if progress_status_stops(status.as_u16()) {
+                return Ok(false);
+            }
+            return Err(format!("progress report failed ({status})"));
+        }
+        let body = Self::read_body_capped(resp).await?;
+        let value: serde_json::Value = serde_json::from_slice(&body)
+            .map_err(|_| "progress response is not JSON".to_string())?;
+        value
+            .get("continue")
+            .and_then(|v| v.as_bool())
+            .ok_or_else(|| "progress response has no continue flag".to_string())
+    }
+
+    /// `PUT /grid/jobs/<id>/video?variant=video|thumbnail` (spec 5.4), streamed from the file
+    /// with an exact Content-Length and the sha256 header. 5xx, 408, 429 and network errors are
+    /// retryable; any other 4xx is permanent.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn upload_video_artifact(
+        &self,
+        job_id: &str,
+        variant: &str,
+        path: &std::path::Path,
+        content_type: &str,
+        bytes: u64,
+        sha256: &str,
+        timeout: Duration,
+    ) -> Result<(), CompletionAttemptError> {
+        let url = format!(
+            "{}/grid/jobs/{}/video?variant={}",
+            self.base_url,
+            enc_seg(job_id),
+            enc_seg(variant)
+        );
+        let token = self
+            .get_token()
+            .map_err(CompletionAttemptError::Permanent)?;
+        let file = tokio::fs::File::open(path).await.map_err(|e| {
+            CompletionAttemptError::Permanent(format!("artifact unavailable: {}", e.kind()))
+        })?;
+        let body = reqwest::Body::wrap(FileBody {
+            file,
+            remaining: bytes,
+            buf: vec![0u8; 256 * 1024],
+        });
+        let resp = self
+            .client
+            .put(&url)
+            .timeout(timeout)
+            .header("X-Node-Auth", token)
+            .header(reqwest::header::CONTENT_TYPE, content_type)
+            .header(reqwest::header::CONTENT_LENGTH, bytes)
+            .header("X-Content-SHA256", sha256)
+            .body(body)
+            .send()
+            .await
+            .map_err(|e| CompletionAttemptError::Retryable(format!("upload failed: {e}")))?;
+        let status = resp.status();
+        if status.is_success() {
+            return Ok(());
+        }
+        let text: String = resp
+            .text()
+            .await
+            .unwrap_or_default()
+            .chars()
+            .take(300)
+            .collect();
+        let message = format!("upload failed ({status}): {text}");
+        if crate::image::completion_status_retryable(status.as_u16()) {
+            Err(CompletionAttemptError::Retryable(message))
+        } else {
+            Err(CompletionAttemptError::Permanent(message))
+        }
+    }
+
     /// Post one sealed stream chunk to the orchestrator, which relays it to the
     /// waiting client over SSE. `ephemeral_public_key` is sent only on seq 0 (the
     /// client derives the stream output key from it). On the final chunk, `usage`
@@ -1077,6 +1279,7 @@ mod heartbeat_wire_tests {
                 stt: None,
                 tts: None,
                 image: None,
+                video: None,
                 streaming: true,
                 streaming_tools: true,
                 context_size: 4096,

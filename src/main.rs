@@ -26,6 +26,8 @@ mod telemetry;
 mod toolcall;
 mod tts;
 mod update;
+mod video;
+mod video_job;
 mod ws;
 
 use clap::{Parser, Subcommand};
@@ -154,6 +156,9 @@ enum Commands {
         #[arg(long)]
         image_model_dir: Option<String>,
 
+        #[command(flatten)]
+        video: VideoArgs,
+
         /// System One sidecar base URL (for Laya/Jev-compatible typed decision models).
         /// When set without --model-path, the node advertises --model-name or convaiinnovations/laya.
         #[arg(long)]
@@ -266,6 +271,94 @@ enum Commands {
         #[command(subcommand)]
         action: PriceAction,
     },
+
+    /// Grid video (text to video on an NVIDIA GPU). See docs/VIDEO.md.
+    Video {
+        #[command(subcommand)]
+        action: VideoAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum VideoAction {
+    /// Check the GPU, driver, engine, encoder and model files, then make the smoke clip.
+    /// Exits non-zero when this machine is not ready to serve video.
+    Doctor {
+        #[command(flatten)]
+        video: VideoArgs,
+    },
+}
+
+/// Grid video flags. Off unless --video-model is given; then every path flag is required.
+#[derive(clap::Args, Clone, Default)]
+struct VideoArgs {
+    /// Serve Grid video with this model: wan2.1-t2v-1.3b or wan2.2-ti2v-5b.
+    #[arg(long)]
+    video_model: Option<String>,
+    /// stable-diffusion.cpp `sd-cli` executable (CUDA build, master-1043-3be2378).
+    #[arg(long, requires = "video_model")]
+    video_engine: Option<String>,
+    /// SHA-256 of --video-engine. Required while this build has no pinned engine hash.
+    #[arg(long, requires = "video_engine", value_parser = parse_sha256)]
+    video_engine_sha256: Option<String>,
+    /// ffmpeg executable used to write the MP4 (run as a separate program).
+    #[arg(long, requires = "video_model")]
+    video_encoder: Option<String>,
+    /// SHA-256 of --video-encoder. Required while this build has no pinned encoder hash.
+    #[arg(long, requires = "video_encoder", value_parser = parse_sha256)]
+    video_encoder_sha256: Option<String>,
+    /// H.264 encoder inside ffmpeg: libx264 (default) or libopenh264.
+    #[arg(long, requires = "video_model")]
+    video_encoder_codec: Option<String>,
+    /// Folder holding the pinned model files for --video-model (see docs/VIDEO.md).
+    #[arg(long, requires = "video_model")]
+    video_model_dir: Option<String>,
+}
+
+impl VideoArgs {
+    /// None when video is off. Errors name the missing flag.
+    fn config(&self, config_dir: &std::path::Path) -> Result<Option<video::VideoConfig>, String> {
+        let Some(model) = &self.video_model else {
+            return Ok(None);
+        };
+        if !video::is_video_model(model) {
+            return Err(format!("--video-model {model:?} is not a Grid video model"));
+        }
+        let need = |v: &Option<String>, flag: &str| {
+            v.clone()
+                .ok_or_else(|| format!("--video-model needs {flag}"))
+        };
+        Ok(Some(video::VideoConfig {
+            model: model.to_ascii_lowercase(),
+            engine: need(&self.video_engine, "--video-engine")?.into(),
+            engine_sha256: self.video_engine_sha256.clone(),
+            encoder: need(&self.video_encoder, "--video-encoder")?.into(),
+            encoder_sha256: self.video_encoder_sha256.clone(),
+            model_dir: need(&self.video_model_dir, "--video-model-dir")?.into(),
+            codec: video::Codec::parse(self.video_encoder_codec.as_deref().unwrap_or("libx264"))?,
+            work_root: config_dir.join("video-work"),
+        }))
+    }
+
+    /// The same flags again, for the background service's `sgl start` line.
+    fn start_args(&self) -> Vec<String> {
+        let mut args = Vec::new();
+        for (flag, value) in [
+            ("--video-model", &self.video_model),
+            ("--video-engine", &self.video_engine),
+            ("--video-engine-sha256", &self.video_engine_sha256),
+            ("--video-encoder", &self.video_encoder),
+            ("--video-encoder-sha256", &self.video_encoder_sha256),
+            ("--video-encoder-codec", &self.video_encoder_codec),
+            ("--video-model-dir", &self.video_model_dir),
+        ] {
+            if let Some(value) = value {
+                args.push(flag.to_string());
+                args.push(value.clone());
+            }
+        }
+        args
+    }
 }
 
 #[derive(Subcommand)]
@@ -354,6 +447,9 @@ enum ServiceAction {
         /// Folder with the pinned flux2-klein-4b-mflux-q4 model files (Grid image worker).
         #[arg(long)]
         image_model_dir: Option<String>,
+
+        #[command(flatten)]
+        video: VideoArgs,
 
         /// System One sidecar base URL (for Laya/Jev-compatible typed decision models).
         #[arg(long)]
@@ -499,6 +595,7 @@ async fn main() {
             tts_model_dir,
             image_python,
             image_model_dir,
+            video,
             systemone_sidecar_url,
             mmproj_path,
             image_max_tokens,
@@ -535,6 +632,21 @@ async fn main() {
                     .ok()
                     .filter(|s| !s.trim().is_empty())
             });
+            let video = match video.config(&config_dir) {
+                Ok(video) => video,
+                Err(e) => {
+                    tracing::error!("Node stopped: {e}");
+                    std::process::exit(1);
+                }
+            };
+            // A video node serves exactly its video model.
+            if let (Some(v), Some(name)) = (&video, &model_name) {
+                if !name.eq_ignore_ascii_case(&v.model) || model_path.is_some() {
+                    tracing::error!("Node stopped: --video-model cannot be combined with another --model-name or --model-path");
+                    std::process::exit(1);
+                }
+            }
+            let model_name = video.as_ref().map(|v| v.model.clone()).or(model_name);
             if let Err(e) = node::start(
                 &config_dir,
                 &cli.orchestrator_url,
@@ -551,6 +663,7 @@ async fn main() {
                 tts_model_dir.as_deref(),
                 image_python.as_deref(),
                 image_model_dir.as_deref(),
+                video,
                 systemone_sidecar_url.as_deref(),
                 mmproj_path.as_deref(),
                 image_max_tokens,
@@ -635,6 +748,30 @@ async fn main() {
                 std::process::exit(1);
             }
         }
+        Commands::Video {
+            action: VideoAction::Doctor { video },
+        } => {
+            let cfg = match video.config(&config_dir) {
+                Ok(Some(cfg)) => cfg,
+                Ok(None) => {
+                    eprintln!(
+                        "Pass --video-model and the other --video-* flags you would start with."
+                    );
+                    std::process::exit(2);
+                }
+                Err(e) => {
+                    eprintln!("{e}");
+                    std::process::exit(2);
+                }
+            };
+            let (lines, ready) = video::doctor(&cfg).await;
+            for line in lines {
+                println!("{line}");
+            }
+            if !ready {
+                std::process::exit(1);
+            }
+        }
         Commands::Attest => {
             if let Err(e) = node::attest(&config_dir, &cli.orchestrator_url).await {
                 // The orchestrator rejects the node's signature when the key on this machine is not the
@@ -668,6 +805,7 @@ async fn main() {
                     tts_model_dir,
                     image_python,
                     image_model_dir,
+                    video,
                     systemone_sidecar_url,
                     mmproj_path,
                     image_max_tokens,
@@ -693,6 +831,13 @@ async fn main() {
                         tts_model_dir,
                         image_python,
                         image_model_dir,
+                        video_args: match video.config(&config_dir) {
+                            Ok(_) => video.start_args(),
+                            Err(e) => {
+                                tracing::error!("Service command failed: {e}");
+                                std::process::exit(1);
+                            }
+                        },
                         systemone_sidecar_url: systemone_sidecar_url.or_else(|| {
                             std::env::var("SGL_SYSTEMONE_SIDECAR_URL")
                                 .ok()

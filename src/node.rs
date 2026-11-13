@@ -1210,6 +1210,7 @@ pub async fn start(
     tts_model_dir: Option<&str>,
     image_python: Option<&str>,
     image_model_dir: Option<&str>,
+    video: Option<crate::video::VideoConfig>,
     systemone_sidecar_url: Option<&str>,
     mmproj_path: Option<&str>,
     image_max_tokens: Option<u32>,
@@ -1296,7 +1297,8 @@ pub async fn start(
             .and(tts_model_dir))
         .or(model_name
             .filter(|n| crate::image::is_image_model(n))
-            .and(image_model_dir));
+            .and(image_model_dir))
+        .or(video.as_ref().and_then(|v| v.model_dir.to_str()));
     if let Some(path) = model_path {
         let name = model_name.map(|s| s.to_string()).unwrap_or_else(|| {
             Path::new(path)
@@ -1416,13 +1418,11 @@ pub async fn start(
             || crate::stt::is_stt_model(&name)
             || crate::tts::is_speech_model(&name)
             || crate::image::is_image_model(&name)
+            || crate::video::is_video_model(&name)
         {
             effective_slots = 1;
         }
-        wedge_ms = wedge_timeout_ms(&model_pb);
-        if crate::image::is_image_model(&name) {
-            wedge_ms = wedge_ms.max(crate::image::WEDGE_MS);
-        }
+        wedge_ms = wedge_timeout_ms(&model_pb).max(crate::video_job::media_wedge_ms(&name));
         // llama-server divides its total `-c` across slots, so pass slots × context_size
         // to keep each slot at the operator's configured per-request context.
         let per_slot_ctx = if gguf_systemone {
@@ -1450,6 +1450,7 @@ pub async fn start(
             tts_model_dir: tts_model_dir.map(PathBuf::from),
             image_python: image_python.map(PathBuf::from),
             image_model_dir: image_model_dir.map(PathBuf::from),
+            video: video.clone().map(Box::new),
             model_path: model_pb,
             model_name: name.clone(),
             port: inference_port,
@@ -1704,20 +1705,17 @@ pub async fn start(
                         "max_concurrent_jobs":1})
                 }) as Arc<dyn Fn() -> serde_json::Value + Send + Sync>
             });
-        let image_heartbeat = engine
-            .as_ref()
-            .filter(|e| e.mode_label() == crate::image::ENGINE_LABEL)
-            .map(|eng| {
-                crate::image_job::ws_heartbeat(
-                    eng.clone(),
-                    models.clone(),
-                    node_enc_pubkey.clone(),
-                    keybind_sig.clone(),
-                    key_version_opt,
-                    rc.load_factor(),
-                    Arc::clone(&active_jobs),
-                )
-            });
+        let image_heartbeat = engine.as_ref().and_then(|eng| {
+            crate::video_job::media_ws_heartbeat(
+                eng,
+                models.clone(),
+                node_enc_pubkey.clone(),
+                keybind_sig.clone(),
+                key_version_opt,
+                rc.load_factor(),
+                Arc::clone(&active_jobs),
+            )
+        });
         tokio::spawn(async move {
             crate::ws::run(
                 base,
@@ -1810,21 +1808,11 @@ pub async fn start(
     let embed_dim: Option<u32> = engine.as_ref().and_then(|e| e.embedding_dim());
     let node_kind: Option<&str> = if systemone_sidecar.is_some() {
         Some("systemone")
-    } else if engine
+    } else if let Some(kind) = engine
         .as_ref()
-        .is_some_and(|e| e.mode_label() == "stt-worker")
+        .and_then(|e| crate::video_job::dedicated_kind(e.mode_label()))
     {
-        Some("transcription")
-    } else if engine
-        .as_ref()
-        .is_some_and(|e| e.mode_label() == "tts-worker")
-    {
-        Some("speech")
-    } else if engine
-        .as_ref()
-        .is_some_and(|e| e.mode_label() == crate::image::ENGINE_LABEL)
-    {
-        Some("image")
+        Some(kind)
     } else if embed_dim.is_some() {
         Some("embedding")
     } else {
@@ -2083,11 +2071,7 @@ pub async fn start(
                         );
                     }
                     Vec::new()
-                } else if eng.mode_label() == "embedding-worker"
-                    || eng.mode_label() == "stt-worker"
-                    || eng.mode_label() == "tts-worker"
-                    || eng.mode_label() == crate::image::ENGINE_LABEL
-                {
+                } else if crate::video_job::is_dedicated_worker(eng.mode_label()) {
                     Vec::new() // dedicated worker readiness has no transient grace period
                 } else {
                     models.clone() // tolerate one transient blip before pulling the model
@@ -2139,6 +2123,8 @@ pub async fn start(
                     key_version_opt,
                 )
             });
+        let video_parts =
+            crate::video_job::rest_snapshot(engine.as_ref(), &models, active_jobs.as_ref());
         let advertised: Vec<String> = if let Some(snapshot) = embedding_snapshot {
             snapshot.available_models
         } else if let Some(snapshot) = stt_snapshot {
@@ -2147,6 +2133,8 @@ pub async fn start(
             snapshot.available_models
         } else if let Some(snapshot) = image_snapshot {
             snapshot.available_models
+        } else if let Some((available, _)) = &video_parts {
+            available.clone()
         } else if empty_quarantined {
             Vec::new()
         } else {
@@ -2165,20 +2153,11 @@ pub async fn start(
             slots_total: effective_slots,
         });
 
-        if node_engine == Some("stt-worker") {
-            if let Some(t) = &mut heartbeat_telemetry {
-                t.runtime = crate::stt::RUNTIME;
-            }
-        }
-        if node_engine == Some("tts-worker") {
-            if let Some(t) = &mut heartbeat_telemetry {
-                t.runtime = crate::tts::RUNTIME;
-            }
-        }
-        if node_engine == Some(crate::image::ENGINE_LABEL) {
-            if let Some(t) = &mut heartbeat_telemetry {
-                t.runtime = crate::image::RUNTIME;
-            }
+        if let (Some(t), Some(runtime)) = (
+            &mut heartbeat_telemetry,
+            node_engine.and_then(crate::video_job::worker_runtime),
+        ) {
+            t.runtime = runtime;
         }
 
         match client
@@ -2204,6 +2183,7 @@ pub async fn start(
                 stt_capabilities,
                 tts_capabilities,
                 image_capabilities,
+                video_parts.and_then(|(_, cap)| cap),
                 se_identity.as_ref(),
             )
             .await
@@ -2449,7 +2429,7 @@ async fn print_media_prices(client: &OrchestratorClient, node_id: &str) {
     if rows.is_empty() {
         return;
     }
-    println!("\nMedia models (price per 1024x1024 image):\n");
+    println!("\nMedia models (image: price per 1024x1024; video: price per example clip):\n");
     for r in rows {
         println!(
             "  {:<20} {:<6} reference {}   yours x{:.2} = {}  [{}]{}",
@@ -2483,7 +2463,7 @@ pub async fn set_media_price(
         .await?;
     let price = parse_post_example(&resp);
     println!(
-        "✅ Price set for {model}: x{:.2}, 1024x1024 now {}. You keep 80% ({}).",
+        "✅ Price set for {model}: x{:.2}, example now {}. You keep 80% ({}).",
         ppm as f64 / 1_000_000.0,
         fmt_micro_usd(price),
         fmt_micro_usd(price.map(|p| p * 4 / 5)),
@@ -2618,6 +2598,9 @@ async fn process_job(
     tracing::info!("Processing job {} (type: {})", job.id, job.job_type);
     if job.job_type == "image" {
         return crate::image_job::process(client, engine, job, node_secret, telemetry).await;
+    }
+    if job.job_type == "video" {
+        return crate::video_job::process(client, engine, job, node_secret, telemetry).await;
     }
 
     let transcription_reservation = if job.job_type == "transcription" {
@@ -2934,6 +2917,7 @@ pub(crate) fn sign_sealed_result_envelope(
         "transcription" => "transcription",
         "speech" => "speech",
         "image" => "image",
+        "video" => "video",
         _ => "sealed",
     };
     crate::crypto::sign_result_envelope(node_secret, job_id, kind, ciphertext)

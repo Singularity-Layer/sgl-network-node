@@ -174,8 +174,14 @@ pub fn check_file_permissions(_path: &Path) -> Result<(), String> {
 /// the plaintext. Message: "sgl-result-v1\n{job_id}\n{kind}\n{sha256_hex(payload)}".
 pub fn sign_result_envelope(secret: &[u8; 32], job_id: &str, kind: &str, payload: &[u8]) -> String {
     use sha2::{Digest, Sha256};
-    let hash = hex::encode(Sha256::digest(payload));
-    let msg = format!("sgl-result-v1\n{job_id}\n{kind}\n{hash}");
+    sign_result_digest(secret, job_id, kind, &hex::encode(Sha256::digest(payload)))
+}
+
+/// `sign_result_envelope` for a payload already hashed (lowercase hex sha256), so a large
+/// result such as a Grid video MP4 is signed from its streaming hash without being held in
+/// memory. Same message, same signature.
+pub fn sign_result_digest(secret: &[u8; 32], job_id: &str, kind: &str, sha256_hex: &str) -> String {
+    let msg = format!("sgl-result-v1\n{job_id}\n{kind}\n{sha256_hex}");
     let sk = SigningKey::from_bytes(secret);
     bs58::encode(sk.sign(msg.as_bytes()).to_bytes()).into_string()
 }
