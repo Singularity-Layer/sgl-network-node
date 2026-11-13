@@ -40,6 +40,7 @@ async fn pinned_qwen_vision_answers_an_image() {
         tts_model_dir: None,
         image_python: None,
         image_model_dir: None,
+        video: None,
         model_path: PathBuf::from(model),
         model_name: "qwen2.5-vl-3b".into(),
         port: 0,

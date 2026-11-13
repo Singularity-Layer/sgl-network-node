@@ -337,6 +337,8 @@ pub struct InferenceEngineConfig {
     pub image_python: Option<PathBuf>,
     /// Local folder holding the pinned flux2-klein-4b-mflux-q4 files.
     pub image_model_dir: Option<PathBuf>,
+    /// Grid video (`--video-*`): pinned sd-cli + ffmpeg + model folder. None = off.
+    pub video: Option<Box<crate::video::VideoConfig>>,
     /// Explicit, pinned llama-server contract. When present, discovery is disabled.
     pub llama_server: Option<ExplicitLlamaServer>,
     pub model_path: PathBuf,
@@ -1374,6 +1376,7 @@ pub enum InferenceEngine {
     Stt(Box<crate::stt::SttEngine>),
     Tts(Box<crate::tts::TtsEngine>),
     Image(Box<crate::image::ImageEngine>),
+    Video(Box<crate::video::VideoEngine>),
     Server(ServerEngine),
     #[cfg(feature = "inprocess")]
     InProcess(crate::inprocess::InProcessEngine),
@@ -1403,6 +1406,7 @@ impl InferenceEngine {
             InferenceEngine::Stt(_) => "stt-worker",
             InferenceEngine::Tts(_) => "tts-worker",
             InferenceEngine::Image(_) => crate::image::ENGINE_LABEL,
+            InferenceEngine::Video(_) => crate::video::ENGINE_LABEL,
             InferenceEngine::Server(_) => "server",
             #[cfg(feature = "inprocess")]
             InferenceEngine::InProcess(_) => "inprocess",
@@ -1426,6 +1430,7 @@ impl InferenceEngine {
             InferenceEngine::Stt(_) => "unknown",
             InferenceEngine::Tts(_) => "metal",
             InferenceEngine::Image(_) => "metal",
+            InferenceEngine::Video(_) => "cuda",
             InferenceEngine::Server(e) => *e.accelerator.lock().unwrap_or_else(|p| p.into_inner()),
             #[cfg(feature = "inprocess")]
             _ => crate::telemetry::inprocess_accelerator(gpu_layers),
@@ -1442,6 +1447,7 @@ impl InferenceEngine {
                 || crate::stt::is_stt_model(&config.model_name)
                 || crate::tts::is_speech_model(&config.model_name)
                 || crate::image::is_image_model(&config.model_name)
+                || crate::video::is_video_model(&config.model_name)
             {
                 return Err(
                     "a pinned llama-server cannot be used with an embedding or voice worker"
@@ -1490,6 +1496,15 @@ impl InferenceEngine {
             return crate::tts::TtsEngine::production(tts_model, model_dir, python)
                 .await
                 .map(|engine| InferenceEngine::Tts(Box::new(engine)));
+        }
+        // Text-to-video (Grid video) runs the pinned sd-cli; never a llama.cpp path.
+        if crate::video::is_video_model(&config.model_name) {
+            let video = config
+                .video
+                .ok_or("video generation requires the --video-* flags")?;
+            return crate::video::VideoEngine::production(*video)
+                .await
+                .map(|engine| InferenceEngine::Video(Box::new(engine)));
         }
         // Text-to-image (Grid image) gets its own supervised mflux worker, also before llama.cpp.
         if crate::image::is_image_model(&config.model_name) {
@@ -1575,6 +1590,7 @@ impl InferenceEngine {
             InferenceEngine::Stt(e) => e.is_healthy(),
             InferenceEngine::Tts(e) => e.is_healthy(),
             InferenceEngine::Image(e) => e.is_healthy(),
+            InferenceEngine::Video(e) => e.is_healthy(),
             InferenceEngine::Server(e) => e.is_healthy().await,
             #[cfg(feature = "inprocess")]
             InferenceEngine::InProcess(e) => e.is_healthy(),
@@ -1591,7 +1607,7 @@ impl InferenceEngine {
             InferenceEngine::MultimodalEmbed(_) => false,
             InferenceEngine::Stt(_) => false,
             InferenceEngine::Tts(_) => false,
-            InferenceEngine::Image(_) => false,
+            InferenceEngine::Image(_) | InferenceEngine::Video(_) => false,
             InferenceEngine::Server(_) => false,
             #[cfg(feature = "inprocess")]
             InferenceEngine::InProcess(e) => e.backend_failed(),
@@ -1606,7 +1622,7 @@ impl InferenceEngine {
             InferenceEngine::MultimodalEmbed(_) => true,
             InferenceEngine::Stt(_) => false,
             InferenceEngine::Tts(_) => false,
-            InferenceEngine::Image(_) => false,
+            InferenceEngine::Image(_) | InferenceEngine::Video(_) => false,
             // Server engine in --embedding mode (the non-`inprocess`/Windows path).
             InferenceEngine::Server(e) => e.is_embedding(),
             #[cfg(feature = "inprocess")]
@@ -1625,7 +1641,7 @@ impl InferenceEngine {
             InferenceEngine::MultimodalEmbed(_) => false,
             InferenceEngine::Stt(_) => false,
             InferenceEngine::Tts(_) => false,
-            InferenceEngine::Image(_) => false,
+            InferenceEngine::Image(_) | InferenceEngine::Video(_) => false,
             InferenceEngine::Server(e) => e.is_vision(),
             #[cfg(all(feature = "inprocess", feature = "vision"))]
             InferenceEngine::InProcess(e) => e.is_vision(),
@@ -1647,7 +1663,7 @@ impl InferenceEngine {
             InferenceEngine::MultimodalEmbed(_) => false,
             InferenceEngine::Stt(_) => false,
             InferenceEngine::Tts(_) => false,
-            InferenceEngine::Image(_) => false,
+            InferenceEngine::Image(_) | InferenceEngine::Video(_) => false,
             InferenceEngine::Server(e) => !e.is_embedding(),
             #[cfg(all(feature = "inprocess", feature = "vision"))]
             InferenceEngine::InProcess(e) => e.tool_format().supports_tools(),
@@ -1665,7 +1681,7 @@ impl InferenceEngine {
             InferenceEngine::MultimodalEmbed(e) => e.capabilities().map(|c| c.embedding_dim),
             InferenceEngine::Stt(_) => None,
             InferenceEngine::Tts(_) => None,
-            InferenceEngine::Image(_) => None,
+            InferenceEngine::Image(_) | InferenceEngine::Video(_) => None,
             InferenceEngine::Server(e) => e.embedding_dim(),
             #[cfg(feature = "inprocess")]
             InferenceEngine::Embed(e) => Some(e.dim()),
@@ -1732,6 +1748,13 @@ impl InferenceEngine {
         }
     }
 
+    pub fn video(&self) -> Option<&crate::video::VideoEngine> {
+        match self {
+            Self::Video(e) => Some(e),
+            _ => None,
+        }
+    }
+
     pub async fn generate_image(
         &self,
         request: crate::image::ImageRequest,
@@ -1780,6 +1803,7 @@ impl InferenceEngine {
             InferenceEngine::Stt(e) => e.stop(),
             InferenceEngine::Tts(e) => e.stop(),
             InferenceEngine::Image(e) => e.stop(),
+            InferenceEngine::Video(e) => e.stop(),
             InferenceEngine::Server(e) => e.stop(),
             #[cfg(feature = "inprocess")]
             InferenceEngine::InProcess(_) => { /* worker stops when the engine is dropped */ }
@@ -1802,7 +1826,9 @@ impl InferenceEngine {
             }
             InferenceEngine::Stt(_) => Err("this node is a transcription node".into()),
             InferenceEngine::Tts(_) => Err("this node is a speech node".into()),
-            InferenceEngine::Image(_) => Err("this node is an image node".into()),
+            InferenceEngine::Image(_) | InferenceEngine::Video(_) => {
+                Err("this node is a media node".into())
+            }
             InferenceEngine::Server(e) => e.embed(inputs, input_type, dimensions).await,
             #[cfg(feature = "inprocess")]
             InferenceEngine::Embed(e) => e.embed(inputs, input_type, dimensions).await,
@@ -1817,6 +1843,7 @@ impl InferenceEngine {
             InferenceEngine::Stt(e) => e.restart().await,
             InferenceEngine::Tts(e) => e.restart().await,
             InferenceEngine::Image(e) => e.restart().await,
+            InferenceEngine::Video(e) => e.restart().await,
             InferenceEngine::Server(e) => e.restart().await,
             // In-process: there is no child process to restart — the engine IS this process,
             // and a wedged native llama.cpp call can never be recovered from Rust. The node
@@ -1853,7 +1880,7 @@ impl InferenceEngine {
             InferenceEngine::MultimodalEmbed(_) => self.restart().await,
             InferenceEngine::Stt(_) => self.restart().await,
             InferenceEngine::Tts(_) => self.restart().await,
-            InferenceEngine::Image(_) => self.restart().await,
+            InferenceEngine::Image(_) | InferenceEngine::Video(_) => self.restart().await,
             InferenceEngine::Server(e) => e.restart_no_swap().await,
             #[cfg(feature = "inprocess")]
             InferenceEngine::InProcess(_) => self.restart().await,
@@ -1878,8 +1905,8 @@ impl InferenceEngine {
                 Err("this node serves transcription, not chat completions".into())
             }
             InferenceEngine::Tts(_) => Err("this node serves speech, not chat completions".into()),
-            InferenceEngine::Image(_) => {
-                Err("this node serves images, not chat completions".into())
+            InferenceEngine::Image(_) | InferenceEngine::Video(_) => {
+                Err("this node serves media, not chat completions".into())
             }
             InferenceEngine::Server(e) => {
                 e.chat_completion(messages, temperature, max_tokens, tools, tool_choice)
@@ -1944,8 +1971,8 @@ impl InferenceEngine {
                 Err("this node serves transcription, not chat completions".into())
             }
             InferenceEngine::Tts(_) => Err("this node serves speech, not chat completions".into()),
-            InferenceEngine::Image(_) => {
-                Err("this node serves images, not chat completions".into())
+            InferenceEngine::Image(_) | InferenceEngine::Video(_) => {
+                Err("this node serves media, not chat completions".into())
             }
             InferenceEngine::Server(e) => {
                 e.chat_completion_stream(messages, tools, tool_choice, temperature, max_tokens, tx)
@@ -2174,6 +2201,7 @@ mod explicit_llama_server_tests {
             tts_model_dir: None,
             image_python: None,
             image_model_dir: None,
+            video: None,
             context_size: 4096,
             batch_size: 1,
             parallel_slots: 1,

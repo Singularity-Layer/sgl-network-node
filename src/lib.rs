@@ -8,6 +8,7 @@ pub mod embedding_input;
 pub mod image;
 pub mod stt;
 pub mod tts;
+pub mod video;
 
 #[cfg(feature = "inprocess")]
 pub mod embed;

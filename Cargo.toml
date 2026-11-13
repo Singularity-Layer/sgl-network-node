@@ -30,6 +30,9 @@ chacha20poly1305 = "0.10"
 sha2 = "0.10"
 hkdf = "0.12"
 hex = "0.4"
+# Streamed upload body for Grid video artifacts (already in the tree via reqwest).
+bytes = "1"
+http-body = "1"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 flate2 = "1"
 tar = "0.4"

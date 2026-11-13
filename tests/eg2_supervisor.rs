@@ -156,6 +156,7 @@ async fn explicit_runtime_requirement_cannot_fall_through_to_chat_or_gguf() {
         tts_model_dir: None,
         image_python: None,
         image_model_dir: None,
+        video: None,
         model_path: "/missing/eg2/snapshot".into(),
         model_name: "embeddinggemma-2".into(),
         port: 8081,
